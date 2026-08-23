@@ -9,10 +9,10 @@ Requirements for initial release. Each maps to roadmap phases.
 
 ### Wire Format & Crypto Primitives
 
-- [ ] **WIRE-01**: Control/data packet parsing and serialization (opcodes, session IDs, packet IDs, ACK arrays) matches the C reference byte-exactly, covered by golden-vector tests
+- [x] **WIRE-01**: Control/data packet parsing and serialization (opcodes, session IDs, packet IDs, ACK arrays) matches the C reference byte-exactly, covered by golden-vector tests
 - [ ] **WIRE-02**: TLS 1.0 PRF (MD5+SHA1 P_hash) implemented with stdlib crypto and verified against reference test vectors
 - [ ] **WIRE-03**: Key Method 2 data-channel key derivation (master secret → key expansion → per-direction cipher/HMAC key slots incl. implicit IV extraction) verified byte-exactly against `ssl.c`/`crypto.c`
-- [ ] **WIRE-04**: tls-crypt wrap/unwrap (HMAC-SHA256 MAC-then-encrypt with AES-256-CTR, tag-as-IV) with key-file parsing and replay protection, verified against `tls_crypt.c` with isolated test vectors
+- [x] **WIRE-04**: tls-crypt wrap/unwrap (HMAC-SHA256 MAC-then-encrypt with AES-256-CTR, tag-as-IV) with key-file parsing and replay protection, verified against `tls_crypt.c` with isolated test vectors
 
 ### Control Channel
 
@@ -30,7 +30,7 @@ Requirements for initial release. Each maps to roadmap phases.
 
 ### Session & Server API
 
-- [ ] **SESS-01**: Embedder can start a server with `ovpn.NewServer(Config{...}).Serve(net.PacketConn)` — TLS config, cipher, tunnel network, tls-crypt key, OnSession callback
+- [x] **SESS-01**: Embedder can start a server with `ovpn.NewServer(Config{...}).Serve(net.PacketConn)` — TLS config, cipher, tunnel network, tls-crypt key, OnSession callback
 - [ ] **SESS-02**: Each connected client yields a `Session` (`io.ReadWriteCloser` for raw IP packets) with its assigned tunnel IP exposed
 - [ ] **SESS-03**: Tunnel IPs are assigned from a configurable `*net.IPNet` of any size (server = first host IP, `topology subnet`, 1 IP per client)
 - [ ] **SESS-04**: Soft reset / key renegotiation works: session survives client-initiated renegotiation (default `reneg-sec 3600`) with key rollover and no traffic interruption beyond the protocol's own switchover
@@ -90,12 +90,12 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| WIRE-01 | Phase 1 | Pending |
-| WIRE-04 | Phase 1 | Pending |
+| WIRE-01 | Phase 1 | Complete |
+| WIRE-04 | Phase 1 | Complete |
 | CTRL-01 | Phase 1 | Pending |
 | CTRL-02 | Phase 1 | Pending |
 | CTRL-03 | Phase 1 | Pending |
-| SESS-01 | Phase 1 | Pending |
+| SESS-01 | Phase 1 | Complete |
 | VRFY-01 | Phase 1 | Pending |
 | WIRE-02 | Phase 2 | Pending |
 | WIRE-03 | Phase 2 | Pending |
@@ -117,6 +117,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | SESS-05 | Phase 4 | Pending |
 
 **Coverage:**
+
 - v1 requirements: 25 total
 - Mapped to phases: 25
 - Unmapped: 0 ✓
