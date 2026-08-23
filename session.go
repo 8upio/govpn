@@ -1,6 +1,7 @@
 package ovpn
 
 import (
+	"crypto/tls"
 	"errors"
 	"io"
 	"net"
@@ -39,6 +40,13 @@ type Session struct {
 	PeerCN string
 
 	clientSessionID wire.SessionID
+
+	// connState is this session's underlying tls.Conn.ConnectionState(),
+	// captured once, right after Handshake() returns nil — see
+	// ConnectionState below. Diagnostic-only: Phase 1 pins MinVersion to
+	// TLS 1.2 in Config.TLSConfig but does not otherwise act on any of
+	// this value's fields.
+	connState tls.ConnectionState
 
 	// wrapper is this session's OWN tls-crypt state — an independent
 	// send-sequence counter and an independent replay window, allocated
@@ -82,6 +90,15 @@ func (s *Session) Read(p []byte) (int, error) {
 // encryption.
 func (s *Session) Write(p []byte) (int, error) {
 	return 0, errors.New("ovpn: data channel not implemented until phase 2")
+}
+
+// ConnectionState returns this session's underlying TLS connection state
+// (negotiated version, cipher suite, peer certificate chain, and
+// everything else crypto/tls itself exposes) as captured once, immediately
+// after Handshake() returned nil. Calling it before OnSession has fired
+// for this session returns the zero value.
+func (s *Session) ConnectionState() tls.ConnectionState {
+	return s.connState
 }
 
 // Close tears down this session's control channel.

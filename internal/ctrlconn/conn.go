@@ -62,8 +62,8 @@ func (timeoutError) Temporary() bool { return true }
 // diagnostic purposes only.
 type sessionAddr wire.SessionID
 
-func (sessionAddr) Network() string   { return "ovpn-ctrl" }
-func (a sessionAddr) String() string  { return fmt.Sprintf("ovpn-ctrl:%x", [wire.SessionIDSize]byte(a)) }
+func (sessionAddr) Network() string  { return "ovpn-ctrl" }
+func (a sessionAddr) String() string { return fmt.Sprintf("ovpn-ctrl:%x", [wire.SessionIDSize]byte(a)) }
 
 // Conn implements net.Conn over one client's OpenVPN control channel. See
 // the package doc for the architectural role this plays.

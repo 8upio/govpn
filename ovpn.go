@@ -349,6 +349,7 @@ func (s *Server) runHandshake(sess *Session) {
 	}
 
 	state := tlsConn.ConnectionState()
+	sess.connState = state
 	if len(state.PeerCertificates) > 0 {
 		sess.PeerCN = state.PeerCertificates[0].Subject.CommonName
 	}
