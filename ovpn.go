@@ -178,7 +178,7 @@ func (s *Server) Close() error {
 	s.mu.Unlock()
 
 	for _, sess := range sessions {
-		_ = sess.conn.Close()
+		_ = sess.Close()
 	}
 	if pc != nil {
 		return pc.Close()
@@ -246,8 +246,10 @@ func (s *Server) handleDatagram(pc net.PacketConn, addr net.Addr, packet []byte)
 			clientSessionID: sid,
 			wrapper:         wrapper,
 			key:             key,
+			srv:             s,
 			inbound:         make(chan wire.ControlPacket, inboundQueueSize),
 			doneCh:          make(chan struct{}),
+			stopCh:          make(chan struct{}),
 		}
 		justCreated = true
 	}
@@ -310,6 +312,9 @@ func (s *Server) handleDatagram(pc net.PacketConn, addr net.Addr, packet []byte)
 	// for each in the order handleDatagram enqueued them.
 	select {
 	case sess.inbound <- cp:
+	case <-sess.stopCh:
+		// Session is mid-teardown (Close was called): don't block trying
+		// to enqueue into a pump that has already stopped ranging.
 	default:
 		// Queue full: drop this datagram exactly as a genuinely lost UDP
 		// packet would be dropped — the reliability layer's own
@@ -320,10 +325,15 @@ func (s *Server) handleDatagram(pc net.PacketConn, addr net.Addr, packet []byte)
 
 // pump serializes delivery of this session's inbound control packets into
 // its control-channel Conn, one at a time, in the order handleDatagram
-// enqueued them.
+// enqueued them, until stopCh is closed by Session.Close.
 func (sess *Session) pump() {
-	for cp := range sess.inbound {
-		sess.conn.Deliver(cp)
+	for {
+		select {
+		case cp := <-sess.inbound:
+			sess.conn.Deliver(cp)
+		case <-sess.stopCh:
+			return
+		}
 	}
 }
 
@@ -343,8 +353,7 @@ func (s *Server) runHandshake(sess *Session) {
 	close(sess.doneCh)
 
 	if err != nil {
-		_ = sess.conn.Close()
-		s.removeSession(sess)
+		_ = sess.Close()
 		return
 	}
 
@@ -366,8 +375,7 @@ func (s *Server) enforceHandshakeWindow(sess *Session) {
 	case <-sess.doneCh:
 		return
 	case <-time.After(reliable.HandshakeWindow):
-		_ = sess.conn.Close()
-		s.removeSession(sess)
+		_ = sess.Close()
 	}
 }
 

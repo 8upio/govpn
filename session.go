@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 
 	"github.com/8upio/govpn/internal/ctrlconn"
 	"github.com/8upio/govpn/internal/tlscrypt"
@@ -76,6 +77,24 @@ type Session struct {
 	// goroutine and the handshake-window timeout can remove it on
 	// failure/timeout.
 	key sessionKey
+
+	// srv is this session's owning Server, used by Close to remove the
+	// session from Server.sessions. It is set once, before the session is
+	// published into Server.sessions, and never mutated afterward.
+	srv *Server
+
+	// stopCh is closed exactly once (guarded by stopOnce) to signal pump
+	// to stop ranging over inbound and to unblock any in-flight send on
+	// inbound in handleDatagram. It is never closed directly by anything
+	// other than Close's stopOnce.Do, and inbound itself is never closed —
+	// closing a channel that another goroutine may still be sending on
+	// would panic, so stopCh (selected on both send and receive sides)
+	// is the teardown signal instead.
+	stopCh chan struct{}
+
+	// stopOnce guards stopCh so repeated or concurrent calls to Close are
+	// safe and idempotent.
+	stopOnce sync.Once
 }
 
 // Read is a placeholder: Phase 1 has no data channel to read raw IP packets
@@ -101,8 +120,19 @@ func (s *Session) ConnectionState() tls.ConnectionState {
 	return s.connState
 }
 
-// Close tears down this session's control channel.
+// Close tears down this session's control channel: it stops the
+// per-session pump goroutine (by closing stopCh, never inbound itself —
+// see stopCh's docs), removes this session from its owning Server's
+// session table so it can be garbage collected, and closes the underlying
+// control-channel Conn. Safe to call more than once (idempotent) and safe
+// to call concurrently.
 func (s *Session) Close() error {
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
+		if s.srv != nil {
+			s.srv.removeSession(s)
+		}
+	})
 	if s.conn == nil {
 		return nil
 	}
