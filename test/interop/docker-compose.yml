@@ -1,0 +1,53 @@
+services:
+  # The library under test: a real embedder of github.com/8upio/govpn
+  # (test/interop/server/main.go), built from the repository root so its
+  # Dockerfile can `go build` this module directly.
+  server:
+    build:
+      context: ../..
+      dockerfile: test/interop/server/Dockerfile
+    container_name: govpn-interop-server
+    networks:
+      interop:
+        aliases:
+          - govpn-interop-server
+    # Runs entirely unprivileged: no `cap_add`, no `privileged: true`, no
+    # `devices:`, and a non-root uid/gid — proving the library's core
+    # deployment premise (must run unprivileged, no CAP_NET_ADMIN, no
+    # /dev/net/tun). Do NOT add capabilities, privileged mode, or a device
+    # mapping here to make a run pass; the client below legitimately needs
+    # NET_ADMIN and a tun device because it is the real OpenVPN client
+    # creating a kernel tun interface — the server never does, and that
+    # asymmetry is the point (T-01-07).
+    user: "65534:65534"
+    volumes:
+      - ./pki:/pki:ro
+    command: ["-pki", "/pki", "-listen", "0.0.0.0:1194"]
+
+  # The real, unmodified OpenVPN 2.6 client under test.
+  client:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: govpn-interop-client
+    networks:
+      - interop
+    depends_on:
+      - server
+    # The real client creates a kernel tun interface — this needs
+    # NET_ADMIN and /dev/net/tun. This is the one deliberate asymmetry with
+    # the server above: do not "simplify" this away by removing it here or
+    # by granting the server the same (T-01-07).
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - ./pki:/pki:ro
+      # Bind-mounted (not a named volume) so the capture survives `docker
+      # compose down` and is retained on a failing run for debugging.
+      - ./captures:/captures
+
+networks:
+  interop:
+    driver: bridge

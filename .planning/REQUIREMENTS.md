@@ -49,7 +49,7 @@ Requirements for initial release. Each maps to roadmap phases.
 
 ### Interop Verification
 
-- [ ] **VRFY-01**: Docker harness: pinned OpenVPN 2.6 client container (self-built Debian image) connects to the library with a generated config (certs, tls-crypt key) — automatable in CI
+- [x] **VRFY-01**: Docker harness: pinned OpenVPN 2.6 client container (self-built Debian image) connects to the library with a generated config (certs, tls-crypt key) — automatable in CI
 - [ ] **VRFY-02**: End-to-end through the real client: ping (ICMP), UDP round-trip, and HTTP page load through the tunnel all succeed
 - [ ] **VRFY-03**: Harness includes a lossy-network scenario (5–10% packet loss/reordering) under which handshake and traffic still succeed
 
@@ -96,7 +96,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CTRL-02 | Phase 1 | Pending |
 | CTRL-03 | Phase 1 | Pending |
 | SESS-01 | Phase 1 | Complete |
-| VRFY-01 | Phase 1 | Pending |
+| VRFY-01 | Phase 1 | Complete |
 | WIRE-02 | Phase 2 | Pending |
 | WIRE-03 | Phase 2 | Pending |
 | CTRL-04 | Phase 2 | Pending |
