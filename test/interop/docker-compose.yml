@@ -44,6 +44,9 @@ services:
       - /dev/net/tun:/dev/net/tun
     volumes:
       - ./pki:/pki:ro
+      # Bind-mounted (not a named volume) so the capture survives `docker
+      # compose down` and is retained on a failing run for debugging.
+      - ./captures:/captures
 
 networks:
   interop:

@@ -10,96 +10,90 @@ package interop
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sync"
 	"testing"
 	"time"
 )
 
+// harnessComposeErr/harnessComposeOut hold the single docker-compose-driven
+// harness run's result, produced once in TestMain and read by both
+// TestRealClientFirstContact and (indirectly, via the pki/captures
+// directories it produces) TestCaptureIsFullyTLSCryptWrapped in
+// capture_test.go.
+//
+// The harness run lives in TestMain rather than inside either individual
+// test function specifically so it only runs once regardless of which
+// test(s) `-run` selects or what order Go picks to run same-package test
+// files in (Go compiles/orders source files alphabetically, and
+// "capture_test.go" sorts before "interop_test.go" — a test-body-local
+// setup in TestRealClientFirstContact would run too late for
+// TestCaptureIsFullyTLSCryptWrapped to depend on it).
+var (
+	harnessComposeErr error
+	harnessComposeOut string
+)
+
 // repoRoot resolves the module root from this test file's own directory
-// (test/interop is always exactly two levels below the repo root), so the
-// test works regardless of the caller's working directory.
-func repoRoot(t *testing.T) string {
-	t.Helper()
+// (test/interop is always exactly two levels below the repo root).
+func repoRoot() (string, error) {
 	wd, err := os.Getwd()
 	if err != nil {
-		t.Fatalf("getwd: %v", err)
+		return "", err
 	}
-	root, err := filepath.Abs(filepath.Join(wd, "..", ".."))
+	return filepath.Abs(filepath.Join(wd, "..", ".."))
+}
+
+func TestMain(m *testing.M) {
+	root, err := repoRoot()
 	if err != nil {
-		t.Fatalf("resolve repo root: %v", err)
+		fmt.Fprintln(os.Stderr, "interop: resolve repo root:", err)
+		os.Exit(1)
 	}
-	return root
-}
+	interopDir := filepath.Join(root, "test", "interop")
 
-// testLineWriter streams a subprocess's combined output into t.Log() one
-// line at a time as it arrives, rather than buffering everything until the
-// process exits — so a hung or slow interop run is still observable in the
-// test log, and the human-check step (reading the opcode sequence) has
-// real output to read even if the automated assertion below is what
-// actually gates pass/fail.
-type testLineWriter struct {
-	t   testing.TB
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
+	// Regenerate the PKI fresh for this run — a stale directory from a
+	// previous run must never be silently reused.
+	genCmd := exec.Command("go", "run", "./cmd/gentestpki", "-out", filepath.Join("test", "interop", "pki"))
+	genCmd.Dir = root
+	if out, err := genCmd.CombinedOutput(); err != nil {
+		fmt.Fprintf(os.Stderr, "interop: gentestpki failed: %v\n%s\n", err, out)
+		os.Exit(1)
+	}
 
-func (w *testLineWriter) Write(p []byte) (int, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.buf.Write(p)
-	for {
-		b := w.buf.Bytes()
-		idx := bytes.IndexByte(b, '\n')
-		if idx < 0 {
-			break
-		}
-		w.t.Log(string(b[:idx]))
-		w.buf.Next(idx + 1)
-	}
-	return len(p), nil
-}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
 
-func (w *testLineWriter) flush() {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.buf.Len() > 0 {
-		w.t.Log(w.buf.String())
-		w.buf.Reset()
-	}
-}
+	upCmd := exec.CommandContext(ctx, "docker", "compose", "-f", "docker-compose.yml", "up",
+		"--build", "--abort-on-container-exit", "--exit-code-from", "server")
+	upCmd.Dir = interopDir
 
-// generatePKI runs cmd/gentestpki fresh for this test run — a stale PKI
-// directory from a previous run must never be silently reused.
-func generatePKI(t *testing.T, root string) {
-	t.Helper()
-	cmd := exec.Command("go", "run", "./cmd/gentestpki", "-out", filepath.Join("test", "interop", "pki"))
-	cmd.Dir = root
-	out, err := cmd.CombinedOutput()
-	if len(out) > 0 {
-		t.Logf("gentestpki:\n%s", out)
-	}
-	if err != nil {
-		t.Fatalf("gentestpki failed: %v", err)
-	}
-}
+	var buf bytes.Buffer
+	// Stream live to the test binary's own stdout (visible regardless of
+	// -v) and simultaneously capture for TestRealClientFirstContact's
+	// per-test log.
+	mw := io.MultiWriter(os.Stdout, &buf)
+	upCmd.Stdout = mw
+	upCmd.Stderr = mw
 
-// composeDown tears the project down unconditionally, including on a
-// failing run — deferred via t.Cleanup so it always executes even if the
-// test fails partway through.
-func composeDown(t *testing.T, interopDir string) {
-	t.Helper()
-	cmd := exec.Command("docker", "compose", "-f", "docker-compose.yml", "down", "--remove-orphans")
-	cmd.Dir = interopDir
-	out, err := cmd.CombinedOutput()
-	if len(out) > 0 {
-		t.Logf("docker compose down:\n%s", out)
+	harnessComposeErr = upCmd.Run()
+	harnessComposeOut = buf.String()
+
+	code := m.Run()
+
+	// Tear down unconditionally, including on a failing run, so the next
+	// run starts clean. The bind-mounted pki/captures directories are not
+	// affected by `down` and remain on disk for post-mortem inspection.
+	downCmd := exec.Command("docker", "compose", "-f", "docker-compose.yml", "down", "--remove-orphans")
+	downCmd.Dir = interopDir
+	if out, err := downCmd.CombinedOutput(); err != nil {
+		fmt.Fprintf(os.Stderr, "interop: docker compose down: %v\n%s\n", err, out)
 	}
-	if err != nil {
-		t.Logf("docker compose down returned an error (non-fatal cleanup): %v", err)
-	}
+
+	os.Exit(code)
 }
 
 // TestRealClientFirstContact is Phase 1 plan 01-02's tracer verification: a
@@ -108,33 +102,13 @@ func composeDown(t *testing.T, interopDir string) {
 // least one P_CONTROL_V1 packet from the same session — proving the real
 // client accepted the server's reset rather than retrying its own. The pass
 // condition is entirely protocol-event-based (test/interop/server's own
-// opcode observation, see its "PASS:" log line and non-zero exit on
-// timeout) — this test never greps OpenVPN client log text, which RESEARCH
-// Open Question 2 and the plan's own prohibitions flag as a vacuous
-// assertion.
+// opcode observation, see its "PASS:" log line in harnessComposeOut below,
+// and its non-zero exit on timeout) — this test never greps OpenVPN client
+// log text, which RESEARCH Open Question 2 and the plan's own prohibitions
+// flag as a vacuous assertion.
 func TestRealClientFirstContact(t *testing.T) {
-	root := repoRoot(t)
-	interopDir := filepath.Join(root, "test", "interop")
-
-	generatePKI(t, root)
-
-	t.Cleanup(func() { composeDown(t, interopDir) })
-
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "docker", "compose", "-f", "docker-compose.yml", "up",
-		"--build", "--abort-on-container-exit", "--exit-code-from", "server")
-	cmd.Dir = interopDir
-
-	w := &testLineWriter{t: t}
-	cmd.Stdout = w
-	cmd.Stderr = w
-
-	err := cmd.Run()
-	w.flush()
-
-	if err != nil {
-		t.Fatalf("docker compose up did not exit cleanly — the server did not observe a P_CONTROL_V1 from the accepted reset session before its deadline: %v", err)
+	t.Log(harnessComposeOut)
+	if harnessComposeErr != nil {
+		t.Fatalf("docker compose up did not exit cleanly — the server did not observe a P_CONTROL_V1 from the accepted reset session before its deadline: %v", harnessComposeErr)
 	}
 }

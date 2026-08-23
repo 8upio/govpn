@@ -17,4 +17,7 @@ RUN apt-get update && \
     apt-get install --no-install-recommends -y openvpn tcpdump iproute2 && \
     rm -rf /var/lib/apt/lists/*
 
-ENTRYPOINT ["openvpn", "--config", "/pki/client.conf"]
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
