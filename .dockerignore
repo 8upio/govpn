@@ -1,0 +1,9 @@
+# Keeps the interop server's Docker build context (test/interop/server's
+# compose context is the repo root) small and free of planning/VCS metadata
+# and per-run generated material that must never enter an image layer.
+.git
+.claude
+.planning
+test/interop/pki
+test/interop/captures
+*.md
