@@ -10,6 +10,7 @@ package interop
 import (
 	"bytes"
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -25,6 +26,13 @@ import (
 	"github.com/8upio/govpn/internal/tlscrypt"
 	"github.com/8upio/govpn/internal/wire"
 )
+
+// updateGolden regenerates testdata/golden from this run's clean-large
+// scenario capture (01-04-PLAN.md Task 2) — a deliberate act via
+// `make golden` / `go test -tags interop -run TestInteropScenarios
+// -update-golden ./test/interop/`, never a side effect of an ordinary
+// `make interop` run.
+var updateGolden = flag.Bool("update-golden", false, "regenerate testdata/golden from this run's clean-large scenario capture")
 
 // scenario names one docker-compose-driven interop run: which certificate
 // profile cmd/gentestpki should generate, whether the lossy overlay
@@ -80,6 +88,11 @@ func repoRoot() (string, error) {
 }
 
 func TestMain(m *testing.M) {
+	// TestMain must parse flags itself before reading -update-golden below
+	// (testing.Main normally parses flags inside m.Run(), too late for
+	// TestMain's own use of them).
+	flag.Parse()
+
 	root, err := repoRoot()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "interop: resolve repo root:", err)
@@ -94,6 +107,20 @@ func TestMain(m *testing.M) {
 
 	for _, sc := range scenarios {
 		scenarioResults[sc.name] = runScenario(root, interopDir, sc)
+	}
+
+	if *updateGolden {
+		res := scenarioResults["clean-large"]
+		if res.composeErr != nil {
+			fmt.Fprintln(os.Stderr, "interop: -update-golden requested but the clean-large scenario did not pass; not regenerating testdata/golden")
+			os.Exit(1)
+		}
+		outDir := filepath.Join(root, "testdata", "golden")
+		if err := ExportGolden(res.capturePath, res.keyPath, outDir); err != nil {
+			fmt.Fprintln(os.Stderr, "interop: export golden vectors:", err)
+			os.Exit(1)
+		}
+		fmt.Println("interop: testdata/golden regenerated from the clean-large scenario capture at", res.capturePath)
 	}
 
 	os.Exit(m.Run())

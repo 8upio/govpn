@@ -1,0 +1,32 @@
+[
+  {
+    "file": "001-client-to-server-client-hard-reset.bin",
+    "direction": "client-\u003eserver",
+    "opcode": 7,
+    "packet_id": 0
+  },
+  {
+    "file": "002-server-to-client-server-hard-reset.bin",
+    "direction": "server-\u003eclient",
+    "opcode": 8,
+    "packet_id": 0
+  },
+  {
+    "file": "003-server-to-client-ack-only.bin",
+    "direction": "server-\u003eclient",
+    "opcode": 5,
+    "packet_id": 0
+  },
+  {
+    "file": "004-server-to-client-max-fragment.bin",
+    "direction": "server-\u003eclient",
+    "opcode": 4,
+    "packet_id": 1
+  },
+  {
+    "file": "005-server-to-client-final-small.bin",
+    "direction": "server-\u003eclient",
+    "opcode": 4,
+    "packet_id": 10
+  }
+]

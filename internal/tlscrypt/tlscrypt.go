@@ -189,6 +189,32 @@ func (w *Wrapper) Wrap(dst, header, plaintext []byte) ([]byte, error) {
 	binary.BigEndian.PutUint32(pid[0:4], seq)
 	binary.BigEndian.PutUint32(pid[4:8], uint32(time.Now().Unix()))
 
+	return w.wrapWithPID(dst, header, pid, plaintext)
+}
+
+// WrapWithPacketID wraps plaintext exactly like Wrap, but using an explicit
+// tls-crypt packet ID (the 4-byte sequence + 4-byte timestamp long form,
+// Pattern 1) instead of the Wrapper's own auto-incrementing sendSeq counter
+// and the current wall-clock time.
+//
+// It exists solely so the golden-vector fast tier
+// (internal/tlscrypt/golden_test.go) can reproduce a real captured OpenVPN
+// 2.6 client datagram's exact tls-crypt packet ID and assert byte-for-byte
+// re-wrap equality against it (01-04-PLAN.md Task 2) — Wrap's own
+// auto-generated seq+time.Now() packet ID can never reproduce a specific
+// historical capture's bytes, since the timestamp component is always
+// "now". WrapWithPacketID does not touch the Wrapper's own sendSeq counter
+// and must never be used for live session traffic, where Wrap's own
+// monotonic sequencing (and the peer's replay window built against it) is
+// load-bearing.
+func (w *Wrapper) WrapWithPacketID(dst, header []byte, pid [PIDSize]byte, plaintext []byte) ([]byte, error) {
+	if len(header) != OffPID {
+		return nil, errors.New("tlscrypt: header must be exactly 9 bytes (opcode+key-id byte + 8-byte session id)")
+	}
+	return w.wrapWithPID(dst, header, pid, plaintext)
+}
+
+func (w *Wrapper) wrapWithPID(dst, header []byte, pid [PIDSize]byte, plaintext []byte) ([]byte, error) {
 	aad := make([]byte, 0, OffTag)
 	aad = append(aad, header...)
 	aad = append(aad, pid[:]...)
