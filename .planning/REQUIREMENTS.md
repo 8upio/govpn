@@ -16,9 +16,9 @@ Requirements for initial release. Each maps to roadmap phases.
 
 ### Control Channel
 
-- [ ] **CTRL-01**: Reliability layer delivers control payloads in order with ACK piggybacking and retransmission, surviving 5–10% synthetic packet loss
-- [ ] **CTRL-02**: Control-channel framing exposed as a `net.Conn` byte stream with fragmentation/reassembly, handling multi-KB TLS records (realistic cert chains)
-- [ ] **CTRL-03**: A real OpenVPN 2.6 client completes the full TLS handshake (HARD_RESET_V2 through TLS established) with certificate-based mutual auth via stdlib `crypto/tls`
+- [x] **CTRL-01**: Reliability layer delivers control payloads in order with ACK piggybacking and retransmission, surviving 5–10% synthetic packet loss
+- [x] **CTRL-02**: Control-channel framing exposed as a `net.Conn` byte stream with fragmentation/reassembly, handling multi-KB TLS records (realistic cert chains)
+- [x] **CTRL-03**: A real OpenVPN 2.6 client completes the full TLS handshake (HARD_RESET_V2 through TLS established) with certificate-based mutual auth via stdlib `crypto/tls`
 - [ ] **CTRL-04**: Key Method 2 exchange over TLS application data completes (random material, options string, peer-info parsing)
 - [ ] **CTRL-05**: PUSH_REQUEST/PUSH_REPLY works: client receives tunnel IP (`topology subnet`), explicit `cipher AES-256-GCM` push, keepalive parameters, and brings its tunnel up
 
@@ -92,9 +92,9 @@ Which phases cover which requirements. Updated during roadmap creation.
 |-------------|-------|--------|
 | WIRE-01 | Phase 1 | Complete |
 | WIRE-04 | Phase 1 | Complete |
-| CTRL-01 | Phase 1 | Pending |
-| CTRL-02 | Phase 1 | Pending |
-| CTRL-03 | Phase 1 | Pending |
+| CTRL-01 | Phase 1 | Complete |
+| CTRL-02 | Phase 1 | Complete |
+| CTRL-03 | Phase 1 | Complete |
 | SESS-01 | Phase 1 | Complete |
 | VRFY-01 | Phase 1 | Complete |
 | WIRE-02 | Phase 2 | Pending |
