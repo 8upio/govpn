@@ -1,7 +1,13 @@
 package ovpn
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"math/big"
 	"net"
 	"sync"
 	"testing"
@@ -18,6 +24,38 @@ func testTLSCryptKey(t testing.TB) []byte {
 		t.Fatalf("generate test tls-crypt key: %v", err)
 	}
 	return key
+}
+
+// testTLSConfig builds a throwaway self-signed server TLS config, just
+// enough for Serve's own up-front validation (Config.TLSConfig must be
+// set) and to give a background handshake goroutine a real certificate to
+// serve. These wire-level tests never drive an actual TLS handshake — that
+// is exercised end-to-end by internal/ctrlconn's TestTLSHandshakeOverCtrlConn
+// and this package's own interop harness (test/interop) — so the cert
+// needs no CA chain or client-auth configuration.
+func testTLSConfig(t testing.TB) *tls.Config {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate test key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "ovpn-test-server"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("create test cert: %v", err)
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: priv}},
+		MinVersion:   tls.VersionTLS12,
+	}
 }
 
 // clientHardReset builds and wraps a synthetic P_CONTROL_HARD_RESET_CLIENT_V2
@@ -83,7 +121,7 @@ func TestHardResetRoundTrip(t *testing.T) {
 	}
 	defer serverPC.Close()
 
-	srv := NewServer(Config{TLSCryptKey: key})
+	srv := NewServer(Config{TLSCryptKey: key, TLSConfig: testTLSConfig(t)})
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(serverPC) }()
 	defer srv.Close()
@@ -135,7 +173,7 @@ func TestConcurrentSessions(t *testing.T) {
 	}
 	defer serverPC.Close()
 
-	srv := NewServer(Config{TLSCryptKey: key})
+	srv := NewServer(Config{TLSCryptKey: key, TLSConfig: testTLSConfig(t)})
 	go func() { _ = srv.Serve(serverPC) }()
 	defer srv.Close()
 
@@ -232,7 +270,7 @@ func TestServeClose(t *testing.T) {
 		t.Fatalf("listen: %v", err)
 	}
 
-	srv := NewServer(Config{TLSCryptKey: key})
+	srv := NewServer(Config{TLSCryptKey: key, TLSConfig: testTLSConfig(t)})
 	done := make(chan error, 1)
 	go func() { done <- srv.Serve(pc) }()
 
