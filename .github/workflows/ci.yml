@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # Gates every commit: stdlib-only, no Docker, fast enough to be the
+  # reflexive check (01-04-PLAN.md Task 3). Includes the golden-vector
+  # tests (internal/wire/golden_test.go, internal/tlscrypt/golden_test.go),
+  # which assert byte-exactness against real OpenVPN 2.6 client bytes
+  # committed in testdata/golden without needing Docker.
+  fast:
+    name: Fast tier (vet, build, race)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      # Explicit `go test -race ./...` (not hidden behind `make test`
+      # below) so this exact command is visible in CI logs and the
+      # project's own CLAUDE.md mandate ("run go test -race on every CI
+      # run, not just occasionally") is unambiguous from this file alone.
+      - name: go test -race ./...
+        run: go test -race ./...
+
+      # Same entry point a developer runs locally (`make test`) — re-runs
+      # the three steps above via the Makefile so CI and a local
+      # `make test` invocation can never silently drift apart.
+      - name: make test (same entry point a developer uses)
+        run: make test
+
+      # Non-blocking for now (01-04-PLAN.md Task 3): golangci-lint bundles
+      # go vet, staticcheck and gosec (CLAUDE.md's recommended static
+      # analysis stack). gosec is expected to flag every crypto/md5 and
+      # crypto/sha1 import as weak crypto (G401/G505) once Phase 2 adds the
+      # Key Method 2 PRF — those are false positives for wire-format
+      # compatibility, not the security boundary (that's TLS +
+      # AES-256-GCM), and must carry an inline `//nolint:gosec` with a
+      # rationale comment rather than a global rule disable (CLAUDE.md).
+      - name: Static analysis (golangci-lint, non-blocking)
+        continue-on-error: true
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m
+
+  # Runs the real, unmodified OpenVPN 2.6 client against the library via
+  # Docker Compose (01-04-PLAN.md Task 1's scenario table: clean-small,
+  # clean-large, lossy-large). Fails outright — never skips, never reports
+  # success — if Docker is unavailable or an image build fails, because a
+  # silently skipped interop job would make this project's central
+  # verification claim (interop-verified against a real OpenVPN 2.6
+  # client, not approximated from memory) unverified without anyone
+  # noticing (T-01-22).
+  interop:
+    name: Interop (real OpenVPN 2.6 client via Docker)
+    # GitHub-hosted macOS runners have no usable Docker daemon (Docker
+    # Desktop is not available on them), even though this harness was
+    # developed and manually verified on a macOS machine running Docker
+    # Desktop's own Linux VM. The interop containers themselves are Linux
+    # containers regardless of host OS (test/interop/Dockerfile,
+    # test/interop/server/Dockerfile), and the lossy scenario specifically
+    # needs `tc` (iproute2) netem and the NET_ADMIN capability inside the
+    # client container, which only a genuinely Linux Docker host provides
+    # reliably in CI. ubuntu-latest is therefore the only GitHub-hosted OS
+    # this job can run on at all, not merely the fastest — ships Docker +
+    # Compose v2 preinstalled with no extra setup step needed.
+    runs-on: ubuntu-latest
+    # Comfortably above the lossy-large scenario's own 8-minute
+    # docker-compose context timeout (test/interop/interop_test.go's
+    # scenarios[] contextTimeout) plus the clean-small/clean-large
+    # scenarios' timeouts and image build time — sized against the
+    # reference's own 60-second handshake window repeated across three
+    # scenarios with build overhead, not tuned to one observed run.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # A missing/unreachable Docker daemon must fail this job loudly, not
+      # skip it — see the job-level comment above (T-01-22).
+      - name: Verify Docker is available
+        run: docker version
+
+      # Same entry point a developer runs locally: generates the PKI,
+      # builds both the pinned client image and the harness server image,
+      # and runs the full scenario table. No `continue-on-error` on this
+      # step — a failure here must fail the job.
+      - name: make interop
+        run: make interop
+
+      # Retained even on success for a passing run's own debuggability;
+      # `if: failure()` uploads them specifically when this job fails, so a
+      # CI failure always leaves a diagnosable artifact rather than only a
+      # truncated log (T-01-22).
+      - name: Upload packet captures and container output on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-captures
+          path: test/interop/captures/
+          if-no-files-found: warn
+          retention-days: 14
