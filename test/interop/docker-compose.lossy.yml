@@ -1,0 +1,24 @@
+# Overlay for the lossy-large interop scenario (01-04-PLAN.md Task 1):
+# `docker compose -f docker-compose.yml -f docker-compose.lossy.yml up`.
+#
+# Sets fixed loss/reorder percentages in the middle of the required 5-10%
+# band on both directions — client-to-server via tc netem
+# (test/interop/entrypoint.sh), server-to-client via the harness server's
+# own PacketConn decorator (test/interop/server/main.go) — and gives the
+# server a deadline generous against the reference's own 60-second
+# handshake window (RESEARCH Pattern 3), sized for retransmission under
+# loss rather than tuned to one observed run's timing.
+#
+# test/interop/interop_test.go's lossy-large scenario parses these same
+# percentages back out of this file and asserts they fall within [5, 10] —
+# "asserted in the test rather than only set in configuration"
+# (01-04-PLAN.md Task 1 acceptance criteria).
+services:
+  client:
+    environment:
+      - NETEM_ENABLED=1
+      - NETEM_LOSS_PCT=7
+      - NETEM_REORDER_PCT=7
+
+  server:
+    command: ["-pki", "/pki", "-listen", "0.0.0.0:1194", "-deadline", "180s", "-drop-rate", "7", "-reorder-rate", "7"]

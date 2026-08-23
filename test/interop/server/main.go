@@ -24,6 +24,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"os"
 	"sync"
@@ -43,15 +44,19 @@ func main() {
 	pkiDir := flag.String("pki", "/pki", "directory containing ca.crt, server.crt, server.key, tls-crypt.key")
 	listenAddr := flag.String("listen", "0.0.0.0:1194", "UDP address to listen on")
 	deadline := flag.Duration("deadline", 30*time.Second, "how long to wait for the real client to complete the TLS handshake before exiting non-zero")
+	dropRate := flag.Float64("drop-rate", 0, "server-to-client synthetic packet loss, as a percentage (0-100); 0 disables the decorator's drop behavior (01-04-PLAN.md Task 1)")
+	reorderRate := flag.Float64("reorder-rate", 0, "server-to-client synthetic packet reordering, as a percentage (0-100) of non-dropped datagrams delayed before transmission")
+	reorderDelay := flag.Duration("reorder-delay", 10*time.Millisecond, "delay applied to a datagram selected for reordering by -reorder-rate")
+	seed := flag.Int64("seed", 1, "seed for the server-to-client loss/reorder decorator's PRNG, so a failing lossy run is reproducible")
 	flag.Parse()
 
-	if err := run(*pkiDir, *listenAddr, *deadline); err != nil {
+	if err := run(*pkiDir, *listenAddr, *deadline, *dropRate, *reorderRate, *reorderDelay, *seed); err != nil {
 		fmt.Fprintln(os.Stderr, "interop-server:", err)
 		os.Exit(1)
 	}
 }
 
-func run(pkiDir, listenAddr string, deadline time.Duration) error {
+func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorderRatePct float64, reorderDelay time.Duration, seed int64) error {
 	tlsCfg, tlsCryptKey, err := loadConfig(pkiDir)
 	if err != nil {
 		return fmt.Errorf("load PKI material: %w", err)
@@ -62,7 +67,13 @@ func run(pkiDir, listenAddr string, deadline time.Duration) error {
 		return fmt.Errorf("listen udp %s: %w", listenAddr, err)
 	}
 
-	obs := newObservingConn(pc)
+	var transport net.PacketConn = pc
+	if dropRatePct > 0 || reorderRatePct > 0 {
+		log.Printf("lossy decorator active: drop=%.1f%% reorder=%.1f%% reorder-delay=%s seed=%d", dropRatePct, reorderRatePct, reorderDelay, seed)
+		transport = newLossyPacketConn(pc, dropRatePct/100, reorderRatePct/100, reorderDelay, seed)
+	}
+
+	obs := newObservingConn(transport)
 
 	sessions := make(chan *ovpn.Session, 1)
 	srv := ovpn.NewServer(ovpn.Config{
@@ -128,7 +139,27 @@ func loadConfig(pkiDir string) (*tls.Config, []byte, error) {
 		return nil, nil, fmt.Errorf("no certificates found in %s/ca.crt", pkiDir)
 	}
 
-	serverCert, err := tls.LoadX509KeyPair(pkiDir+"/server.crt", pkiDir+"/server.key")
+	// The "large" cert profile (cmd/gentestpki -profile large) writes the
+	// leaf to server.crt and the intermediate CA to a separate
+	// intermediate.crt (01-04-PLAN.md Task 1) so the server presents the
+	// full leaf+intermediate chain — tls.X509KeyPair accepts multiple
+	// concatenated CERTIFICATE PEM blocks, leaf first, exactly this shape.
+	// The "small" profile never writes intermediate.crt, so this is a
+	// no-op concatenation for that profile.
+	certPEM, err := os.ReadFile(pkiDir + "/server.crt")
+	if err != nil {
+		return nil, nil, err
+	}
+	if intPEM, err := os.ReadFile(pkiDir + "/intermediate.crt"); err == nil {
+		certPEM = append(append([]byte{}, certPEM...), intPEM...)
+	} else if !os.IsNotExist(err) {
+		return nil, nil, err
+	}
+	keyPEM, err := os.ReadFile(pkiDir + "/server.key")
+	if err != nil {
+		return nil, nil, err
+	}
+	serverCert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -210,4 +241,81 @@ func (o *observingConn) lastObservedSummary() string {
 		return "nothing"
 	}
 	return o.lastObserved
+}
+
+// lossyPacketConn is the server-to-client half of 01-04-PLAN.md Task 1's
+// bidirectional loss injection: a seeded, reproducible drop-and-reorder
+// decorator around the net.PacketConn the harness passes to ovpn.Serve —
+// the client-to-server half is injected independently by
+// test/interop/entrypoint.sh's tc netem on the client container's egress.
+//
+// The decorator only injects drop/delay on WriteTo (server -> client);
+// ReadFrom is a pure pass-through. Injecting loss on ReadFrom too would
+// duplicate what the client's own netem egress already does to the same
+// client-to-server datagrams — the whole point of injecting independently
+// per direction, with a different mechanism per direction (T-01-21), is
+// that each side's own decorator owns exactly one direction.
+//
+// It runs entirely in userspace, in this harness process — it needs no
+// elevated privilege the server container doesn't already have, which is
+// the point (the server must stay unprivileged even in the lossy scenario,
+// T-01-21).
+type lossyPacketConn struct {
+	net.PacketConn
+
+	DropRate     float64 // [0,1]: fraction of WriteTo datagrams silently dropped
+	ReorderRate  float64 // [0,1]: fraction of surviving datagrams delayed before send
+	ReorderDelay time.Duration
+
+	mu  sync.Mutex
+	rng *rand.Rand //nolint:gosec // G404: simulated network loss for a test harness, not security-relevant randomness (crypto/rand governs session IDs and key material elsewhere in this project).
+
+	wg sync.WaitGroup
+}
+
+func newLossyPacketConn(pc net.PacketConn, dropRate, reorderRate float64, reorderDelay time.Duration, seed int64) *lossyPacketConn {
+	return &lossyPacketConn{
+		PacketConn:   pc,
+		DropRate:     dropRate,
+		ReorderRate:  reorderRate,
+		ReorderDelay: reorderDelay,
+		rng:          rand.New(rand.NewSource(seed)), //nolint:gosec // G404: see field doc above.
+	}
+}
+
+// WriteTo drops the datagram (reporting a successful write of its full
+// length, exactly as a real UDP send that never reaches the peer would
+// still report success locally) with probability DropRate, otherwise
+// transmits it — after a delay with probability ReorderRate, so it can
+// arrive out of order relative to later, non-delayed datagrams.
+func (l *lossyPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	l.mu.Lock()
+	drop := l.rng.Float64() < l.DropRate
+	reorder := !drop && l.ReorderRate > 0 && l.rng.Float64() < l.ReorderRate
+	l.mu.Unlock()
+
+	if drop {
+		return len(p), nil
+	}
+
+	if reorder {
+		payload := append([]byte(nil), p...)
+		l.wg.Add(1)
+		go func() {
+			defer l.wg.Done()
+			time.Sleep(l.ReorderDelay)
+			_, _ = l.PacketConn.WriteTo(payload, addr)
+		}()
+		return len(p), nil
+	}
+
+	return l.PacketConn.WriteTo(p, addr)
+}
+
+// Close waits for any in-flight delayed (reordered) writes to finish before
+// closing the underlying connection, so a shutdown doesn't leak goroutines
+// or silently drop an already-accepted delayed write.
+func (l *lossyPacketConn) Close() error {
+	l.wg.Wait()
+	return l.PacketConn.Close()
 }
