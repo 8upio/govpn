@@ -54,20 +54,20 @@ func TestCaptureIsFullyTLSCryptWrapped(t *testing.T) {
 	// is the SERVER-direction wrapper's decrypt slot, and vice versa.
 	//
 	// Constructing a fresh Wrapper per payload deliberately gives each
-	// payload its own virgin anti-replay window. Phase 1's harness server
-	// intentionally stops after answering the reset (RESEARCH Pitfall 5 /
-	// Open Question 2): it never ACKs the client's subsequent P_CONTROL_V1,
-	// so the real client's own reliability layer legitimately retransmits
-	// that SAME already-tls-crypt-wrapped buffer — byte-identical,
-	// including its tls-crypt packet ID — every few seconds until the
-	// capture is stopped. A single persistent Wrapper would correctly (by
-	// tls-crypt's own design) reject the second copy as a replay, which is
-	// exactly what a real, protocol-complete server's tls-crypt layer would
-	// also do once it had ACKed the first copy — but this test is not
-	// checking anti-replay enforcement (internal/tlscrypt/tlscrypt_test.go
-	// already covers that byte-exactly); it is checking that every captured
-	// datagram, including a legitimate retransmission, authenticates and
-	// decrypts correctly under the harness key in its correct direction.
+	// payload its own virgin anti-replay window. As of plan 01-03 the
+	// server's own reliability layer ACKs control traffic all the way
+	// through a completed TLS handshake, so legitimate retransmissions of
+	// the SAME already-tls-crypt-wrapped buffer are now the exception
+	// rather than the rule (they can still happen transiently — e.g. the
+	// client's very first hard reset racing the server's reply). A single
+	// persistent Wrapper would correctly (by tls-crypt's own design) reject
+	// a genuine retransmission's second copy as a replay — that is exactly
+	// what a real, protocol-complete server's tls-crypt layer would also do
+	// once it had ACKed the first copy — but this test is not checking
+	// anti-replay enforcement (internal/tlscrypt/tlscrypt_test.go already
+	// covers that byte-exactly); it is checking that every captured
+	// datagram, including any retransmission, authenticates and decrypts
+	// correctly under the harness key in its correct direction.
 	var clientToServer int
 	for i, p := range payloads {
 		if len(p.Payload) < tlscrypt.OffCT {

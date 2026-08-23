@@ -15,6 +15,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -96,19 +99,83 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// TestRealClientFirstContact is Phase 1 plan 01-02's tracer verification: a
-// real, unmodified OpenVPN 2.6 client's P_CONTROL_HARD_RESET_CLIENT_V2 is
-// authenticated and answered by the library, and the client then sends at
-// least one P_CONTROL_V1 packet from the same session — proving the real
-// client accepted the server's reset rather than retrying its own. The pass
-// condition is entirely protocol-event-based (test/interop/server's own
-// opcode observation, see its "PASS:" log line in harnessComposeOut below,
-// and its non-zero exit on timeout) — this test never greps OpenVPN client
-// log text, which RESEARCH Open Question 2 and the plan's own prohibitions
-// flag as a vacuous assertion.
-func TestRealClientFirstContact(t *testing.T) {
+// tlsVersionRawRe extracts the numeric TLS version test/interop/server's
+// PASS line prints (tls_version_raw=0xNNNN), so this test can assert
+// numerically that the negotiated version is at least TLS 1.2 rather than
+// string-matching a version name that could drift with Go's own
+// tls.VersionName formatting.
+var tlsVersionRawRe = regexp.MustCompile(`tls_version_raw=0x([0-9a-fA-F]{4})`)
+
+// tlsVersion12 is tls.VersionTLS12's numeric value (0x0303), duplicated
+// here rather than importing crypto/tls just for one constant.
+const tlsVersion12 = 0x0303
+
+// TestRealClientCompletesTLSHandshake is Phase 1 plan 01-03's Task 3
+// verification: a real, unmodified OpenVPN 2.6 client completes the full
+// TLS handshake against the library with mutual certificate authentication.
+// The pass condition is Config.OnSession having fired (test/interop/
+// server's own "PASS:" log line, printed only after it also survives
+// postHandshakeSurvival past the handshake without erroring on the
+// client's post-handshake Key Method 2 application data) and its non-zero
+// exit on timeout naming the last protocol state reached.
+//
+// Every assertion below matches on the generated CommonName strings
+// cmd/gentestpki produced (govpn-interop-server / govpn-interop-client)
+// rather than on any guessed OpenVPN client log wording — RESEARCH's own
+// stated principle for keeping this honest without depending on the real
+// client's exact phrasing. The exact matched client line, at the time this
+// plan was written, looks like:
+//
+//	client-1  | ... VERIFY OK: depth=0, CN=govpn-interop-server
+//
+// If a future OpenVPN client version changes that wording, tighten the
+// match here rather than loosening it to something that could pass
+// vacuously.
+func TestRealClientCompletesTLSHandshake(t *testing.T) {
 	t.Log(harnessComposeOut)
 	if harnessComposeErr != nil {
-		t.Fatalf("docker compose up did not exit cleanly — the server did not observe a P_CONTROL_V1 from the accepted reset session before its deadline: %v", harnessComposeErr)
+		t.Fatalf("docker compose up did not exit cleanly — the server did not observe a completed, stable TLS handshake before its deadline: %v", harnessComposeErr)
+	}
+
+	if !strings.Contains(harnessComposeOut, "PASS: session established") {
+		t.Fatal("server did not print its PASS line (handshake completed AND survived the post-handshake window) — see log above")
+	}
+
+	// The server printed the verified CLIENT CommonName gentestpki
+	// generated.
+	const wantClientCN = "peer_cn=govpn-interop-client"
+	if !strings.Contains(harnessComposeOut, wantClientCN) {
+		t.Fatalf("server output does not contain %q — see log above", wantClientCN)
+	}
+
+	// The real client's own output contains the SERVER's generated
+	// CommonName — the client can only print this after it has parsed and
+	// verified the server's certificate chain (this is the direct
+	// expression of Phase 1 success criterion 2).
+	const wantServerCN = "CN=govpn-interop-server"
+	if !strings.Contains(harnessComposeOut, wantServerCN) {
+		t.Fatalf("client output does not contain %q — see log above", wantServerCN)
+	}
+
+	m := tlsVersionRawRe.FindStringSubmatch(harnessComposeOut)
+	if m == nil {
+		t.Fatal("server output does not contain a parsable tls_version_raw= field — see log above")
+	}
+	raw, err := strconv.ParseUint(m[1], 16, 16)
+	if err != nil {
+		t.Fatalf("parse tls_version_raw=%s: %v", m[1], err)
+	}
+	if raw < tlsVersion12 {
+		t.Fatalf("negotiated TLS version 0x%04x is below TLS 1.2 (0x%04x)", raw, tlsVersion12)
+	}
+	t.Logf("negotiated TLS version: 0x%04x", raw)
+
+	// The server explicitly logs that it survived the post-handshake
+	// window before printing PASS (test/interop/server/main.go); if the
+	// client's Key Method 2 application data had disturbed the session,
+	// Serve would have exited during that window and PASS would never
+	// have printed above.
+	if !strings.Contains(harnessComposeOut, "surviving") {
+		t.Fatal("server output does not show it entered the post-handshake survival window — see log above")
 	}
 }
