@@ -20,25 +20,54 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/8upio/govpn/internal/ctrlconn"
+	"github.com/8upio/govpn/internal/tlscrypt"
+	"github.com/8upio/govpn/internal/wire"
 )
 
-// harnessComposeErr/harnessComposeOut hold the single docker-compose-driven
-// harness run's result, produced once in TestMain and read by both
-// TestRealClientFirstContact and (indirectly, via the pki/captures
-// directories it produces) TestCaptureIsFullyTLSCryptWrapped in
-// capture_test.go.
-//
-// The harness run lives in TestMain rather than inside either individual
-// test function specifically so it only runs once regardless of which
-// test(s) `-run` selects or what order Go picks to run same-package test
-// files in (Go compiles/orders source files alphabetically, and
-// "capture_test.go" sorts before "interop_test.go" — a test-body-local
-// setup in TestRealClientFirstContact would run too late for
-// TestCaptureIsFullyTLSCryptWrapped to depend on it).
-var (
-	harnessComposeErr error
-	harnessComposeOut string
-)
+// scenario names one docker-compose-driven interop run: which certificate
+// profile cmd/gentestpki should generate, whether the lossy overlay
+// (docker-compose.lossy.yml) applies, and how long to allow the whole
+// `docker compose up` to run before giving up.
+type scenario struct {
+	name           string
+	profile        string
+	lossy          bool
+	largeCert      bool
+	contextTimeout time.Duration
+}
+
+// scenarios covers, at minimum, the clean-small/clean-large/lossy-large
+// table 01-04-PLAN.md Task 1 requires. contextTimeout values are sized
+// generously against the reference's own 60-second handshake window
+// (RESEARCH Pattern 3) rather than tuned to one observed run's timing —
+// lossy-large's is intentionally the largest, since retransmission under
+// loss is exactly what it needs room for.
+var scenarios = []scenario{
+	{name: "clean-small", profile: "small", lossy: false, largeCert: false, contextTimeout: 2 * time.Minute},
+	{name: "clean-large", profile: "large", lossy: false, largeCert: true, contextTimeout: 3 * time.Minute},
+	{name: "lossy-large", profile: "large", lossy: true, largeCert: true, contextTimeout: 8 * time.Minute},
+}
+
+// scenarioResult is one scenario's completed run: docker compose's combined
+// output, its error (nil on a clean exit), and where this scenario's own
+// packet capture and tls-crypt key were preserved to (both the pki
+// directory and captures/interop.pcap are overwritten by the next
+// scenario's run, so each scenario's artifacts are renamed out of the way
+// immediately after that scenario's `up` completes).
+type scenarioResult struct {
+	composeOut     string
+	composeErr     error
+	capturePath    string
+	keyPath        string
+	privilegeCheck string // `docker inspect` output, captured while the server container still exists
+}
+
+// scenarioResults is populated once, in TestMain, before any Test function
+// runs — see repoRoot's doc comment on why setup lives in TestMain rather
+// than in any individual test body.
+var scenarioResults = map[string]scenarioResult{}
 
 // repoRoot resolves the module root from this test file's own directory
 // (test/interop is always exactly two levels below the repo root).
@@ -58,45 +87,110 @@ func TestMain(m *testing.M) {
 	}
 	interopDir := filepath.Join(root, "test", "interop")
 
-	// Regenerate the PKI fresh for this run — a stale directory from a
-	// previous run must never be silently reused.
-	genCmd := exec.Command("go", "run", "./cmd/gentestpki", "-out", filepath.Join("test", "interop", "pki"))
-	genCmd.Dir = root
-	if out, err := genCmd.CombinedOutput(); err != nil {
-		fmt.Fprintf(os.Stderr, "interop: gentestpki failed: %v\n%s\n", err, out)
+	if err := os.MkdirAll(filepath.Join(interopDir, "captures"), 0o755); err != nil {
+		fmt.Fprintln(os.Stderr, "interop: create captures dir:", err)
 		os.Exit(1)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	for _, sc := range scenarios {
+		scenarioResults[sc.name] = runScenario(root, interopDir, sc)
+	}
+
+	os.Exit(m.Run())
+}
+
+// runScenario regenerates the PKI for sc.profile, preserves the resulting
+// tls-crypt key, runs `docker compose up` (with the lossy overlay if
+// sc.lossy) to completion or sc.contextTimeout, preserves the resulting
+// packet capture under a scenario-specific name (so the next scenario's run
+// doesn't overwrite it before it can be inspected), and tears the compose
+// project down unconditionally — including on a failing run, so the next
+// scenario starts from a clean container/network state.
+func runScenario(root, interopDir string, sc scenario) scenarioResult {
+	genCmd := exec.Command("go", "run", "./cmd/gentestpki", "-out", filepath.Join("test", "interop", "pki"), "-profile", sc.profile)
+	genCmd.Dir = root
+	if out, genErr := genCmd.CombinedOutput(); genErr != nil {
+		return scenarioResult{composeOut: string(out), composeErr: fmt.Errorf("gentestpki -profile %s: %w", sc.profile, genErr)}
+	}
+
+	keyPath := filepath.Join(interopDir, "captures", sc.name+"-tls-crypt.key")
+	if cpErr := copyFile(filepath.Join(interopDir, "pki", "tls-crypt.key"), keyPath); cpErr != nil {
+		return scenarioResult{composeErr: fmt.Errorf("preserve tls-crypt key for scenario %s: %w", sc.name, cpErr)}
+	}
+
+	composeFiles := []string{"-f", "docker-compose.yml"}
+	if sc.lossy {
+		composeFiles = append(composeFiles, "-f", "docker-compose.lossy.yml")
+	}
+
+	upArgs := append(append([]string{"compose"}, composeFiles...), "up", "--build", "--abort-on-container-exit", "--exit-code-from", "server")
+
+	ctx, cancel := context.WithTimeout(context.Background(), sc.contextTimeout)
 	defer cancel()
 
-	upCmd := exec.CommandContext(ctx, "docker", "compose", "-f", "docker-compose.yml", "up",
-		"--build", "--abort-on-container-exit", "--exit-code-from", "server")
+	upCmd := exec.CommandContext(ctx, "docker", upArgs...)
 	upCmd.Dir = interopDir
 
 	var buf bytes.Buffer
-	// Stream live to the test binary's own stdout (visible regardless of
-	// -v) and simultaneously capture for TestRealClientFirstContact's
-	// per-test log.
 	mw := io.MultiWriter(os.Stdout, &buf)
 	upCmd.Stdout = mw
 	upCmd.Stderr = mw
+	upErr := upCmd.Run()
+	composeOut := fmt.Sprintf("=== scenario %s ===\n%s", sc.name, buf.String())
 
-	harnessComposeErr = upCmd.Run()
-	harnessComposeOut = buf.String()
-
-	code := m.Run()
-
-	// Tear down unconditionally, including on a failing run, so the next
-	// run starts clean. The bind-mounted pki/captures directories are not
-	// affected by `down` and remain on disk for post-mortem inspection.
-	downCmd := exec.Command("docker", "compose", "-f", "docker-compose.yml", "down", "--remove-orphans")
-	downCmd.Dir = interopDir
-	if out, err := downCmd.CombinedOutput(); err != nil {
-		fmt.Fprintf(os.Stderr, "interop: docker compose down: %v\n%s\n", err, out)
+	// The runtime privilege check (T-01-07/T-01-21) must run WHILE the
+	// server container still exists — `down` below removes it, and a
+	// Test function running later would find nothing left to inspect.
+	// This is the harness's own re-run of plan 01-02's check, applied to
+	// every scenario including the lossy one, whose decorator is the one
+	// piece of loss-injection logic living inside the server process
+	// itself (T-01-21).
+	privOut, privErr := exec.Command("docker", "inspect",
+		"-f", "{{.HostConfig.Privileged}} {{len .HostConfig.CapAdd}} {{len .HostConfig.Devices}}",
+		"govpn-interop-server").CombinedOutput()
+	privilegeCheck := strings.TrimSpace(string(privOut))
+	if privErr != nil {
+		privilegeCheck = fmt.Sprintf("docker inspect failed: %v: %s", privErr, privOut)
 	}
 
-	os.Exit(code)
+	capturePath := filepath.Join(interopDir, "captures", sc.name+".pcap")
+	src := filepath.Join(interopDir, "captures", "interop.pcap")
+	if renameErr := os.Rename(src, capturePath); renameErr != nil {
+		if upErr == nil {
+			upErr = fmt.Errorf("preserve capture for scenario %s: %w", sc.name, renameErr)
+		}
+	}
+
+	downArgs := append(append([]string{"compose"}, composeFiles...), "down", "--remove-orphans")
+	downCmd := exec.Command("docker", downArgs...)
+	downCmd.Dir = interopDir
+	if dOut, dErr := downCmd.CombinedOutput(); dErr != nil {
+		fmt.Fprintf(os.Stderr, "interop: docker compose down (%s): %v\n%s\n", sc.name, dErr, dOut)
+	}
+
+	return scenarioResult{
+		composeOut:     composeOut,
+		composeErr:     upErr,
+		capturePath:    capturePath,
+		keyPath:        keyPath,
+		privilegeCheck: privilegeCheck,
+	}
+}
+
+func copyFile(src, dst string) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, 0o644)
+}
+
+func readTLSCryptKey(path string) ([]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return tlscrypt.ParseStaticKeyV1(data)
 }
 
 // tlsVersionRawRe extracts the numeric TLS version test/interop/server's
@@ -110,54 +204,74 @@ var tlsVersionRawRe = regexp.MustCompile(`tls_version_raw=0x([0-9a-fA-F]{4})`)
 // here rather than importing crypto/tls just for one constant.
 const tlsVersion12 = 0x0303
 
-// TestRealClientCompletesTLSHandshake is Phase 1 plan 01-03's Task 3
-// verification: a real, unmodified OpenVPN 2.6 client completes the full
-// TLS handshake against the library with mutual certificate authentication.
-// The pass condition is Config.OnSession having fired (test/interop/
-// server's own "PASS:" log line, printed only after it also survives
-// postHandshakeSurvival past the handshake without erroring on the
-// client's post-handshake Key Method 2 application data) and its non-zero
-// exit on timeout naming the last protocol state reached.
+// TestInteropScenarios is 01-04-PLAN.md Task 1's verification: a real,
+// unmodified OpenVPN 2.6 client completes the full TLS handshake against
+// the library across the scenario table above — including a 5-10% lossy,
+// reordering link carrying a multi-kilobyte certificate chain fragmented
+// over several control packets — without the server container ever gaining
+// a privilege it would not have in production.
 //
 // Every assertion below matches on the generated CommonName strings
 // cmd/gentestpki produced (govpn-interop-server / govpn-interop-client)
 // rather than on any guessed OpenVPN client log wording — RESEARCH's own
 // stated principle for keeping this honest without depending on the real
-// client's exact phrasing. The exact matched client line, at the time this
-// plan was written, looks like:
-//
-//	client-1  | ... VERIFY OK: depth=0, CN=govpn-interop-server
-//
-// If a future OpenVPN client version changes that wording, tighten the
-// match here rather than loosening it to something that could pass
-// vacuously.
-func TestRealClientCompletesTLSHandshake(t *testing.T) {
-	t.Log(harnessComposeOut)
-	if harnessComposeErr != nil {
-		t.Fatalf("docker compose up did not exit cleanly — the server did not observe a completed, stable TLS handshake before its deadline: %v", harnessComposeErr)
+// client's exact phrasing.
+func TestInteropScenarios(t *testing.T) {
+	for _, sc := range scenarios {
+		sc := sc
+		t.Run(sc.name, func(t *testing.T) {
+			res, ok := scenarioResults[sc.name]
+			if !ok {
+				t.Fatalf("no result recorded for scenario %q (TestMain setup failure?)", sc.name)
+			}
+			t.Log(res.composeOut)
+
+			assertHandshakeCompleted(t, res)
+			assertServerStaysUnprivileged(t, res)
+
+			if sc.largeCert {
+				assertCertificateFlightFragmented(t, res)
+			}
+			if sc.lossy {
+				assertLossyLoadFactorsInBand(t)
+				logRetransmissionEvidence(t, res)
+			}
+		})
+	}
+}
+
+// assertHandshakeCompleted is the completed-handshake condition plan 01-03
+// established, applied to every scenario: the server's PASS line printed
+// (handshake completed AND survived the post-handshake window), both sides
+// report the peer's verified CommonName, and the negotiated TLS version is
+// at least 1.2.
+func assertHandshakeCompleted(t *testing.T, res scenarioResult) {
+	t.Helper()
+
+	if res.composeErr != nil {
+		t.Fatalf("docker compose up did not exit cleanly — the server did not observe a completed, stable TLS handshake before its deadline: %v", res.composeErr)
 	}
 
-	if !strings.Contains(harnessComposeOut, "PASS: session established") {
+	if !strings.Contains(res.composeOut, "PASS: session established") {
 		t.Fatal("server did not print its PASS line (handshake completed AND survived the post-handshake window) — see log above")
 	}
 
-	// The server printed the verified CLIENT CommonName gentestpki
-	// generated.
 	const wantClientCN = "peer_cn=govpn-interop-client"
-	if !strings.Contains(harnessComposeOut, wantClientCN) {
+	if !strings.Contains(res.composeOut, wantClientCN) {
 		t.Fatalf("server output does not contain %q — see log above", wantClientCN)
 	}
 
 	// The real client's own output contains the SERVER's generated
 	// CommonName — the client can only print this after it has parsed and
-	// verified the server's certificate chain (this is the direct
-	// expression of Phase 1 success criterion 2).
+	// verified the server's certificate chain (Phase 1 success criterion
+	// 2), regardless of whether that chain is one hop (small profile) or
+	// leaf+intermediate (large profile).
 	const wantServerCN = "CN=govpn-interop-server"
-	if !strings.Contains(harnessComposeOut, wantServerCN) {
+	if !strings.Contains(res.composeOut, wantServerCN) {
 		t.Fatalf("client output does not contain %q — see log above", wantServerCN)
 	}
 
-	m := tlsVersionRawRe.FindStringSubmatch(harnessComposeOut)
+	m := tlsVersionRawRe.FindStringSubmatch(res.composeOut)
 	if m == nil {
 		t.Fatal("server output does not contain a parsable tls_version_raw= field — see log above")
 	}
@@ -170,12 +284,175 @@ func TestRealClientCompletesTLSHandshake(t *testing.T) {
 	}
 	t.Logf("negotiated TLS version: 0x%04x", raw)
 
-	// The server explicitly logs that it survived the post-handshake
-	// window before printing PASS (test/interop/server/main.go); if the
-	// client's Key Method 2 application data had disturbed the session,
-	// Serve would have exited during that window and PASS would never
-	// have printed above.
-	if !strings.Contains(harnessComposeOut, "surviving") {
+	if !strings.Contains(res.composeOut, "surviving") {
 		t.Fatal("server output does not show it entered the post-handshake survival window — see log above")
 	}
+}
+
+// assertServerStaysUnprivileged is plan 01-02's runtime privilege check,
+// re-asserted in every scenario including the lossy one — the
+// server-to-client loss decorator lives entirely in this harness's own
+// userspace PacketConn wrapper (test/interop/server/main.go) precisely so
+// the server container never needs a capability it wouldn't have in
+// production (T-01-21). The `docker inspect` itself runs inside
+// runScenario, while the server container still exists (before `down`
+// tears it down) — by the time this Test function runs, the container is
+// already gone, so the captured string is asserted here instead of
+// re-inspecting a container that no longer exists.
+func assertServerStaysUnprivileged(t *testing.T, res scenarioResult) {
+	t.Helper()
+	if res.privilegeCheck != "false 0 0" {
+		t.Fatalf("server container privilege check = %q, want \"false 0 0\"", res.privilegeCheck)
+	}
+}
+
+// assertCertificateFlightFragmented is 01-04-PLAN.md Task 1's fragmentation
+// proof: count the consecutive server-to-client P_CONTROL_V1 payloads
+// carrying the maximum control payload size (internal/ctrlconn.MaxPayload)
+// and require at least two, so a regression that stopped fragmenting (or
+// silently truncated the certificate chain) would fail rather than pass. No
+// exact fragment count is asserted — retransmission makes it vary,
+// especially in the lossy scenario.
+func assertCertificateFlightFragmented(t *testing.T, res scenarioResult) {
+	t.Helper()
+
+	key, err := readTLSCryptKey(res.keyPath)
+	if err != nil {
+		t.Fatalf("read tls-crypt key %s: %v", res.keyPath, err)
+	}
+	packets, err := decodeCapture(res.capturePath, key, tunnelPort)
+	if err != nil {
+		t.Fatalf("decode capture %s: %v", res.capturePath, err)
+	}
+
+	maxConsecutive, current := 0, 0
+	for _, p := range packets {
+		isMaxFragment := p.Direction == DirServerToClient &&
+			p.Control.Opcode == wire.OpControlV1 &&
+			len(p.Control.Payload) == ctrlconn.MaxPayload
+		if isMaxFragment {
+			current++
+			if current > maxConsecutive {
+				maxConsecutive = current
+			}
+		} else {
+			current = 0
+		}
+	}
+
+	if maxConsecutive < 2 {
+		t.Fatalf("only %d consecutive maximum-size (%d-byte) server-to-client control fragments observed in %s, want at least 2 — the large certificate flight may not have fragmented as expected", maxConsecutive, ctrlconn.MaxPayload, res.capturePath)
+	}
+	t.Logf("observed %d consecutive maximum-size (%d-byte) server-to-client control fragments", maxConsecutive, ctrlconn.MaxPayload)
+}
+
+// netemLossPctRe/dropRateRe/reorderRateRe extract the loss/reorder
+// percentages actually wired into docker-compose.lossy.yml, so
+// assertLossyLoadFactorsInBand checks the configuration in force for this
+// run rather than a value merely duplicated in Go source that could drift
+// from the YAML silently.
+var (
+	netemLossPctRe = regexp.MustCompile(`NETEM_LOSS_PCT=(\d+(?:\.\d+)?)`)
+	dropRateRe     = regexp.MustCompile(`"-drop-rate",\s*"(\d+(?:\.\d+)?)"`)
+	reorderRateRe  = regexp.MustCompile(`"-reorder-rate",\s*"(\d+(?:\.\d+)?)"`)
+)
+
+// assertLossyLoadFactorsInBand is 01-04-PLAN.md Task 1's acceptance
+// criterion that the lossy scenario's configured loss is between 5 and 10
+// percent inclusive on BOTH the client egress (netem) and the server
+// decorator, asserted in the test rather than only set in configuration.
+func assertLossyLoadFactorsInBand(t *testing.T) {
+	t.Helper()
+
+	root, err := repoRoot()
+	if err != nil {
+		t.Fatalf("resolve repo root: %v", err)
+	}
+	overlay, err := os.ReadFile(filepath.Join(root, "test", "interop", "docker-compose.lossy.yml"))
+	if err != nil {
+		t.Fatalf("read docker-compose.lossy.yml: %v", err)
+	}
+	text := string(overlay)
+
+	clientLoss := extractPercent(t, text, netemLossPctRe, "client NETEM_LOSS_PCT")
+	serverDrop := extractPercent(t, text, dropRateRe, "server -drop-rate")
+	serverReorder := extractPercent(t, text, reorderRateRe, "server -reorder-rate")
+
+	assertInBand(t, "client-egress loss (NETEM_LOSS_PCT)", clientLoss)
+	assertInBand(t, "server decorator drop rate (-drop-rate)", serverDrop)
+	t.Logf("server decorator reorder rate (-reorder-rate) = %.1f%%", serverReorder)
+}
+
+func extractPercent(t *testing.T, text string, re *regexp.Regexp, label string) float64 {
+	t.Helper()
+	m := re.FindStringSubmatch(text)
+	if m == nil {
+		t.Fatalf("docker-compose.lossy.yml does not set %s", label)
+	}
+	v, err := strconv.ParseFloat(m[1], 64)
+	if err != nil {
+		t.Fatalf("parse %s value %q: %v", label, m[1], err)
+	}
+	return v
+}
+
+func assertInBand(t *testing.T, label string, pct float64) {
+	t.Helper()
+	if pct < 5 || pct > 10 {
+		t.Fatalf("%s = %.1f%%, want between 5 and 10 percent inclusive", label, pct)
+	}
+	t.Logf("%s = %.1f%% (within [5,10])", label, pct)
+}
+
+// logRetransmissionEvidence is the automated stand-in for this task's
+// <verify> human-check ("confirm the handshake completed through genuine
+// retransmission — there are duplicate reliability packet IDs on the wire
+// and the session still reached TLS established") in an autonomous,
+// non-interactive execution: it counts duplicate reliability packet IDs
+// (the same PacketID appearing more than once for the same direction and
+// opcode — a genuine retransmission, not a coincidence) in the lossy
+// scenario's capture and logs the count.
+//
+// This is deliberately non-fatal (t.Log only, never t.Fatal): the client's
+// own tc netem loss has no seed/reproducibility control (unlike the
+// server-to-client decorator's -seed flag) — a run where every datagram
+// happens to arrive on the first try at 7% loss is astronomically unlikely
+// across a full handshake but not impossible, and this check exists to
+// surface evidence for a human/CI-log reader, not to gate the build on
+// kernel PRNG behavior this harness cannot control.
+func logRetransmissionEvidence(t *testing.T, res scenarioResult) {
+	t.Helper()
+
+	key, err := readTLSCryptKey(res.keyPath)
+	if err != nil {
+		t.Logf("retransmission evidence: read tls-crypt key %s: %v", res.keyPath, err)
+		return
+	}
+	packets, err := decodeCapture(res.capturePath, key, tunnelPort)
+	if err != nil {
+		t.Logf("retransmission evidence: decode capture %s: %v", res.capturePath, err)
+		return
+	}
+
+	seen := map[Direction]map[wire.PacketID]int{
+		DirClientToServer: {},
+		DirServerToClient: {},
+	}
+	duplicates := 0
+	for _, p := range packets {
+		if p.Control.Opcode == wire.OpAckV1 {
+			continue // ack-only packets carry no own reliability packet ID
+		}
+		counts := seen[p.Direction]
+		counts[p.Control.PacketID]++
+		if counts[p.Control.PacketID] > 1 {
+			duplicates++
+		}
+	}
+
+	if duplicates == 0 {
+		t.Logf("retransmission evidence: no duplicate reliability packet IDs observed in %s — either no synthetic loss struck a packet this run, or every retransmission also happened to be lost (both possible at 7%% loss, just increasingly unlikely)", res.capturePath)
+		return
+	}
+	t.Logf("retransmission evidence: %d duplicate reliability packet ID occurrences observed in %s — the handshake completed through genuine retransmission, not by chance", duplicates, res.capturePath)
 }

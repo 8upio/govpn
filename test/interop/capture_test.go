@@ -4,32 +4,34 @@ package interop
 
 import (
 	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/8upio/govpn/internal/tlscrypt"
 	"github.com/8upio/govpn/internal/wire"
 )
 
-// tunnelPort must match the UDP port test/interop/docker-compose.yml's
-// server service listens on and cmd/gentestpki's generated client.conf
-// targets.
-const tunnelPort = 1194
-
 // TestCaptureIsFullyTLSCryptWrapped is Phase 1 plan 01-02's Task 2
 // verification: an independent packet capture taken on the wire during a
 // real client run, parsed with a stdlib-only reader (no gopacket), proves
 // that every control-channel datagram on the tunnel port authenticates and
 // decrypts under the harness tls-crypt key in its correct direction —
-// Phase 1 success criterion 3. It depends on TestRealClientFirstContact
-// having produced test/interop/captures/interop.pcap and
-// test/interop/pki/tls-crypt.key in this same run of `make interop` /
-// `go test -tags interop ./test/interop/...`.
+// Phase 1 success criterion 3. It runs against the "clean-small" scenario's
+// preserved capture and tls-crypt key (01-04-PLAN.md Task 1 restructured
+// the single-run harness into a scenario table driven from TestMain;
+// clean-small is the fastest scenario and the direct successor of this
+// test's original single-run fixture).
 func TestCaptureIsFullyTLSCryptWrapped(t *testing.T) {
-	capturePath := filepath.Join("captures", "interop.pcap")
-	f, err := os.Open(capturePath)
+	res, ok := scenarioResults["clean-small"]
+	if !ok {
+		t.Fatal("no result recorded for scenario \"clean-small\" (TestMain setup failure?)")
+	}
+	if res.composeErr != nil {
+		t.Fatalf("clean-small scenario did not pass, capture may be incomplete: %v", res.composeErr)
+	}
+
+	f, err := os.Open(res.capturePath)
 	if err != nil {
-		t.Fatalf("open capture (run the full interop suite, e.g. `make interop`, so TestRealClientFirstContact produces it first): %v", err)
+		t.Fatalf("open capture %s: %v", res.capturePath, err)
 	}
 	defer f.Close()
 
@@ -38,13 +40,9 @@ func TestCaptureIsFullyTLSCryptWrapped(t *testing.T) {
 		t.Fatalf("parse capture: %v", err)
 	}
 
-	keyPEM, err := os.ReadFile(filepath.Join("pki", "tls-crypt.key"))
+	key, err := readTLSCryptKey(res.keyPath)
 	if err != nil {
-		t.Fatalf("read tls-crypt key: %v", err)
-	}
-	key, err := tlscrypt.ParseStaticKeyV1(keyPEM)
-	if err != nil {
-		t.Fatalf("parse tls-crypt key: %v", err)
+		t.Fatalf("read tls-crypt key %s: %v", res.keyPath, err)
 	}
 
 	// A fresh Wrapper per payload, not one long-lived Wrapper per direction.

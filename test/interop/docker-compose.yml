@@ -22,7 +22,10 @@ services:
     user: "65534:65534"
     volumes:
       - ./pki:/pki:ro
-    command: ["-pki", "/pki", "-listen", "0.0.0.0:1194"]
+    # -deadline/-drop-rate/-reorder-rate/-seed default to the clean-link,
+    # no-loss behavior; docker-compose.lossy.yml overrides this command for
+    # the lossy scenario (01-04-PLAN.md Task 1).
+    command: ["-pki", "/pki", "-listen", "0.0.0.0:1194", "-deadline", "${SERVER_DEADLINE:-30s}", "-drop-rate", "${DROP_RATE:-0}", "-reorder-rate", "${REORDER_RATE:-0}"]
 
   # The real, unmodified OpenVPN 2.6 client under test.
   client:
@@ -47,6 +50,13 @@ services:
       # Bind-mounted (not a named volume) so the capture survives `docker
       # compose down` and is retained on a failing run for debugging.
       - ./captures:/captures
+    # NETEM_ENABLED/NETEM_LOSS_PCT/NETEM_REORDER_PCT default to disabled
+    # (clean-link behavior); docker-compose.lossy.yml overrides these for
+    # the lossy scenario (01-04-PLAN.md Task 1). See entrypoint.sh.
+    environment:
+      - NETEM_ENABLED=${NETEM_ENABLED:-0}
+      - NETEM_LOSS_PCT=${NETEM_LOSS_PCT:-0}
+      - NETEM_REORDER_PCT=${NETEM_REORDER_PCT:-0}
 
 networks:
   interop:
