@@ -363,8 +363,23 @@ func (s *Server) runHandshake(sess *Session) {
 		sess.PeerCN = state.PeerCertificates[0].Subject.CommonName
 	}
 	if s.cfg.OnSession != nil {
-		s.cfg.OnSession(sess)
+		s.callOnSession(sess)
 	}
+}
+
+// callOnSession invokes Config.OnSession with panic recovery: this runs on
+// a per-session goroutine (see runHandshake), so an unrecovered panic in
+// caller-supplied code would otherwise propagate up and crash the entire
+// embedding process, taking down every other in-flight session along with
+// it. A panicking OnSession is a bug in the embedder's callback, not a
+// reason to bring down the host process for a library explicitly designed
+// to be embedded "in any Go program" — so it is recovered and swallowed
+// here rather than allowed to escape.
+func (s *Server) callOnSession(sess *Session) {
+	defer func() {
+		recover() //nolint:errcheck // intentionally swallowed, see callOnSession's doc comment
+	}()
+	s.cfg.OnSession(sess)
 }
 
 // enforceHandshakeWindow tears sess down and releases its state if the
