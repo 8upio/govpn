@@ -202,15 +202,23 @@ func (s *Server) handleDatagram(pc net.PacketConn, addr net.Addr, packet []byte)
 	if !exists {
 		// A hard-reset-client-v2 with key ID 0 from an unknown pair
 		// creates a new session; anything else with no matching session
-		// has nowhere to be routed and is dropped. Note: no per-session
-		// state (Wrapper, Session) is allocated yet at this point — that
-		// only happens below, and only after Unwrap+ParseControlPacket
-		// both succeed, so a spoofed-source flood of garbage claiming
-		// this opcode still cannot allocate unbounded session state
-		// (RESEARCH Security Domain, T-01-01).
+		// has nowhere to be routed and is dropped, before any allocation
+		// at all.
 		if opcode != wire.OpControlHardResetClientV2 || keyID != 0 {
 			return
 		}
+		// A candidate Wrapper+Session pair is constructed here because
+		// tls-crypt's Unwrap needs keyed state to even attempt
+		// authentication — this is unavoidable regardless of
+		// implementation strategy. What matters for T-01-01 (DoS via a
+		// spoofed-source flood of garbage claiming this opcode) is that
+		// these candidate objects are never persisted into s.sessions
+		// below unless Unwrap AND ParseControlPacket both succeed: an
+		// unbounded flood of forged HARD_RESET_CLIENT_V2 datagrams can
+		// force transient, per-packet allocation (garbage collected
+		// immediately, no different in kind from the per-datagram
+		// goroutine and buffer copy already made above), but can never
+		// grow the server's persistent session table.
 		wrapper, err := tlscrypt.NewWrapper(s.cfg.TLSCryptKey, true)
 		if err != nil {
 			return
