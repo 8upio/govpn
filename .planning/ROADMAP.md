@@ -35,12 +35,12 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. A packet capture shows every control packet tls-crypt wrapped; tls-crypt wrap/unwrap and control-packet parse→serialize round-trip byte-exactly against isolated vectors taken from the C reference (`tls_crypt.c`, `ssl_pkt.c`)
   4. The handshake still completes with a realistic multi-KB certificate chain (fragmented across several control packets) and with 5–10% synthetic packet loss injected on the link
 
-**Plans**: 4 plans
+**Plans**: 1/4 plans executed
 
 Plans:
 **Wave 1**
 
-- [ ] 01-01-PLAN.md — Tracer: real UDP → tls-crypt → wire → HARD_RESET answered, plus isolated WIRE-01/WIRE-04 vectors
+- [x] 01-01-PLAN.md — Tracer: real UDP → tls-crypt → wire → HARD_RESET answered, plus isolated WIRE-01/WIRE-04 vectors
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
@@ -107,7 +107,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Handshake | 0/4 | Planned | - |
+| 1. Handshake | 1/4 | In Progress|  |
 | 2. Tunnel Up | 0/TBD | Not started | - |
 | 3. In-Process Termination | 0/TBD | Not started | - |
 | 4. Durable Sessions | 0/TBD | Not started | - |
