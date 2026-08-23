@@ -90,13 +90,37 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| (populated during roadmap creation) | | |
+| WIRE-01 | Phase 1 | Pending |
+| WIRE-04 | Phase 1 | Pending |
+| CTRL-01 | Phase 1 | Pending |
+| CTRL-02 | Phase 1 | Pending |
+| CTRL-03 | Phase 1 | Pending |
+| SESS-01 | Phase 1 | Pending |
+| VRFY-01 | Phase 1 | Pending |
+| WIRE-02 | Phase 2 | Pending |
+| WIRE-03 | Phase 2 | Pending |
+| CTRL-04 | Phase 2 | Pending |
+| CTRL-05 | Phase 2 | Pending |
+| DATA-01 | Phase 2 | Pending |
+| DATA-02 | Phase 2 | Pending |
+| DATA-03 | Phase 2 | Pending |
+| SESS-02 | Phase 2 | Pending |
+| SESS-03 | Phase 2 | Pending |
+| VRFY-03 | Phase 2 | Pending |
+| NET-01 | Phase 3 | Pending |
+| NET-02 | Phase 3 | Pending |
+| NET-03 | Phase 3 | Pending |
+| NET-04 | Phase 3 | Pending |
+| XMPL-01 | Phase 3 | Pending |
+| VRFY-02 | Phase 3 | Pending |
+| SESS-04 | Phase 4 | Pending |
+| SESS-05 | Phase 4 | Pending |
 
 **Coverage:**
-- v1 requirements: 24 total
-- Mapped to phases: 0
-- Unmapped: 24 ⚠️
+- v1 requirements: 25 total
+- Mapped to phases: 25
+- Unmapped: 0 ✓
 
 ---
 *Requirements defined: 2026-08-22*
-*Last updated: 2026-08-22 after initial definition*
+*Last updated: 2026-08-22 after roadmap creation (traceability mapped)*
