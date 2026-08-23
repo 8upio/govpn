@@ -31,7 +31,13 @@ Decimal phases appear between their surrounding integers in numeric order.
   2. The real client completes the full handshake — HARD_RESET_V2 through TLS established — and both sides report the peer's verified certificate CN
   3. A packet capture shows every control packet tls-crypt wrapped; tls-crypt wrap/unwrap and control-packet parse→serialize round-trip byte-exactly against isolated vectors taken from the C reference (`tls_crypt.c`, `ssl_pkt.c`)
   4. The handshake still completes with a realistic multi-KB certificate chain (fragmented across several control packets) and with 5–10% synthetic packet loss injected on the link
-**Plans**: TBD
+**Plans**: 4 plans
+
+Plans:
+- [ ] 01-01-PLAN.md — Tracer: real UDP → tls-crypt → wire → HARD_RESET answered, plus isolated WIRE-01/WIRE-04 vectors
+- [ ] 01-02-PLAN.md — Docker interop harness: pinned OpenVPN 2.6 client reaches the library; capture proves tls-crypt wrapping
+- [ ] 01-03-PLAN.md — Reliability layer + control-channel `net.Conn` + `crypto/tls`: real client reaches TLS established
+- [ ] 01-04-PLAN.md — Lossy link + multi-KB cert chain, real-client golden vectors, CI
 
 ### Phase 2: Tunnel Up
 **Goal**: The client brings its tunnel interface up with a pushed IP and cipher, and encrypted IP packets round-trip between the client and the embedder's `Session`
@@ -77,7 +83,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Handshake | 0/TBD | Not started | - |
+| 1. Handshake | 0/4 | Planned | - |
 | 2. Tunnel Up | 0/TBD | Not started | - |
 | 3. In-Process Termination | 0/TBD | Not started | - |
 | 4. Durable Sessions | 0/TBD | Not started | - |
