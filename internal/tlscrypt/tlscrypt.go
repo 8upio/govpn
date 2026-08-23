@@ -139,6 +139,12 @@ type Wrapper struct {
 	mu      sync.Mutex
 	sendSeq uint32 // this side's own monotonic tls-crypt packet-ID sequence counter
 
+	// sendRolloverAt is the unix-second timestamp of this Wrapper's last
+	// sendSeq rollover (0xFFFFFFFF -> 0), or 0 if it has never rolled over.
+	// Used by Wrap to mirror the reference's rollover gate — see Wrap's doc
+	// comment.
+	sendRolloverAt int64
+
 	replay replayWindow
 }
 
@@ -181,6 +187,25 @@ func (w *Wrapper) Wrap(dst, header, plaintext []byte) ([]byte, error) {
 	}
 
 	w.mu.Lock()
+	if w.sendSeq == 0xFFFFFFFF {
+		// The reference (packet_id_send_update, called from
+		// tls_crypt_wrap via packet_id_write, tls_crypt.c:164-168) only
+		// permits the packet-ID sequence to roll over from UINT32_MAX back
+		// to 0 when using the long-form (sequence + timestamp) wire format
+		// — which tls-crypt's Wrap always does, see pid[4:8] below — AND
+		// wall-clock time has moved forward since the last rollover;
+		// otherwise it fails the wrap with "TLS-CRYPT ERROR: packet ID
+		// roll over." rather than silently emitting a wrapped-around,
+		// no-longer-monotonic sequence number. Mirror that fail-closed
+		// gate here instead of wrapping around unconditionally.
+		now := time.Now().Unix()
+		if w.sendRolloverAt != 0 && now <= w.sendRolloverAt {
+			w.mu.Unlock()
+			return nil, errors.New("tlscrypt: packet ID roll over")
+		}
+		w.sendRolloverAt = now
+		w.sendSeq = 0
+	}
 	w.sendSeq++
 	seq := w.sendSeq
 	w.mu.Unlock()
