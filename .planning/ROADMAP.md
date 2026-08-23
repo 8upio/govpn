@@ -9,6 +9,7 @@ Four vertical slices take govpn from an empty module to a real, unmodified OpenV
 ## Phases
 
 **Phase Numbering:**
+
 - Integer phases (1, 2, 3): Planned milestone work
 - Decimal phases (2.1, 2.2): Urgent insertions (marked with INSERTED)
 
@@ -22,58 +23,81 @@ Decimal phases appear between their surrounding integers in numeric order.
 ## Phase Details
 
 ### Phase 1: Handshake
+
 **Goal**: A real, unmodified OpenVPN 2.6 client connects to a Go program embedding the library and reaches "TLS established" — over tls-crypt, with certificate-based mutual auth
 **Mode:** mvp
 **Depends on**: Nothing (first phase)
 **Requirements**: WIRE-01, WIRE-04, CTRL-01, CTRL-02, CTRL-03, SESS-01, VRFY-01
 **Success Criteria** (what must be TRUE):
+
   1. An embedder can start a server with `ovpn.NewServer(Config{...}).Serve(pc)` over UDP, and one command stands up a pinned OpenVPN 2.6 client container (self-built `debian:bookworm-slim`) that connects to it with generated certs and a tls-crypt key
   2. The real client completes the full handshake — HARD_RESET_V2 through TLS established — and both sides report the peer's verified certificate CN
   3. A packet capture shows every control packet tls-crypt wrapped; tls-crypt wrap/unwrap and control-packet parse→serialize round-trip byte-exactly against isolated vectors taken from the C reference (`tls_crypt.c`, `ssl_pkt.c`)
   4. The handshake still completes with a realistic multi-KB certificate chain (fragmented across several control packets) and with 5–10% synthetic packet loss injected on the link
+
 **Plans**: 4 plans
 
 Plans:
+**Wave 1**
+
 - [ ] 01-01-PLAN.md — Tracer: real UDP → tls-crypt → wire → HARD_RESET answered, plus isolated WIRE-01/WIRE-04 vectors
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 01-02-PLAN.md — Docker interop harness: pinned OpenVPN 2.6 client reaches the library; capture proves tls-crypt wrapping
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [ ] 01-03-PLAN.md — Reliability layer + control-channel `net.Conn` + `crypto/tls`: real client reaches TLS established
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
 - [ ] 01-04-PLAN.md — Lossy link + multi-KB cert chain, real-client golden vectors, CI
 
 ### Phase 2: Tunnel Up
+
 **Goal**: The client brings its tunnel interface up with a pushed IP and cipher, and encrypted IP packets round-trip between the client and the embedder's `Session`
 **Mode:** mvp
 **Depends on**: Phase 1
 **Requirements**: WIRE-02, WIRE-03, CTRL-04, CTRL-05, DATA-01, DATA-02, DATA-03, SESS-02, SESS-03, VRFY-03
 **Success Criteria** (what must be TRUE):
+
   1. The client logs "Initialization Sequence Completed" after receiving a PUSH_REPLY with a tunnel IP from the configured `Config.Network` (`topology subnet`, server = first host IP, 1 IP per client), an explicit `cipher AES-256-GCM`, and keepalive parameters
   2. The embedder's `OnSession` callback receives a `Session` (`io.ReadWriteCloser`) exposing that assigned tunnel IP; a ping from the client arrives as a raw IP packet on `Read`, and the reply written back reaches the client — an encrypted round-trip in both directions
   3. TLS 1.0 PRF and Key Method 2 expansion (per-direction cipher/HMAC slots and the implicit-IV extraction) pass golden-vector tests derived from `ssl.c`/`crypto.c` before any live data-channel traffic runs
   4. Replayed and out-of-window data packets are dropped, and keepalive/ping magic packets are answered inside the library — the Session consumer never sees one
   5. The harness runs a lossy scenario (5–10% packet loss and reordering) in which handshake and ping round-trip both still succeed
+
 **Plans**: TBD
 
 ### Phase 3: In-Process Termination
+
 **Goal**: Tunnel traffic terminates entirely in-process — clients ping the server, exchange UDP, and load a web page — in an ordinary container with no TUN device and no `CAP_NET_ADMIN`
 **Mode:** mvp
 **Depends on**: Phase 2 (the netstack itself can be built in parallel against a fake `Session`, which is what proves the `Session` boundary is clean)
 **Requirements**: NET-01, NET-02, NET-03, NET-04, XMPL-01, VRFY-02
 **Success Criteria** (what must be TRUE):
+
   1. The real client can `ping` the server's tunnel IP and gets replies from the built-in ICMP echo responder
   2. `ListenUDP(port)` returns a `net.PacketConn` that unmodified socket-based code uses to round-trip a datagram with a tunnel client; listeners open on arbitrary ports at runtime and sessions attach/detach with correct IP→session routing (RTP-style workloads)
   3. `ListenTCP(port)` returns a `net.Listener` that stdlib `http.Serve` accepts on, and the example web server — one command to run — serves an interactive landing page plus 3–5 subpages that load in a browser inside the client container and are unreachable from outside the tunnel
   4. One automated harness run verifies ICMP, a UDP round-trip, and an HTTP page load through the tunnel from the real client, with no `/dev/net/tun` and no `CAP_NET_ADMIN` in the server container
+
 **Plans**: TBD
 **UI hint**: yes
 
 ### Phase 4: Durable Sessions
+
 **Goal**: A connected client stays usable for hours and leaves cleanly — key renegotiation does not break traffic, and dead sessions do not accumulate
 **Mode:** mvp
 **Depends on**: Phase 2 (uses the Phase 3 example as the traffic source for soak runs)
 **Requirements**: SESS-04, SESS-05
 **Success Criteria** (what must be TRUE):
+
   1. A client renegotiates its keys (default `reneg-sec 3600`, exercised in the harness with a shortened interval) and its HTTP and UDP traffic keeps flowing across the key rollover — the embedder's `Session` stays open, no reconnect
   2. A client sending explicit-exit-notify ends its session immediately, and the embedder observes the `Session` closing rather than waiting for a timeout
   3. Silent sessions time out and are reaped, and `Session.Close()` tears down all state — a soak run over many connect/disconnect cycles shows goroutine and memory counts flat
+
 **Plans**: TBD
 
 ## Progress
