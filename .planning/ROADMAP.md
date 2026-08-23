@@ -35,7 +35,7 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. A packet capture shows every control packet tls-crypt wrapped; tls-crypt wrap/unwrap and control-packet parse→serialize round-trip byte-exactly against isolated vectors taken from the C reference (`tls_crypt.c`, `ssl_pkt.c`)
   4. The handshake still completes with a realistic multi-KB certificate chain (fragmented across several control packets) and with 5–10% synthetic packet loss injected on the link
 
-**Plans**: 2/4 plans executed
+**Plans**: 3/4 plans executed
 
 Plans:
 **Wave 1**
@@ -48,7 +48,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 01-03-PLAN.md — Reliability layer + control-channel `net.Conn` + `crypto/tls`: real client reaches TLS established
+- [x] 01-03-PLAN.md — Reliability layer + control-channel `net.Conn` + `crypto/tls`: real client reaches TLS established
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
@@ -107,7 +107,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Handshake | 2/4 | In Progress|  |
+| 1. Handshake | 3/4 | In Progress|  |
 | 2. Tunnel Up | 0/TBD | Not started | - |
 | 3. In-Process Termination | 0/TBD | Not started | - |
 | 4. Durable Sessions | 0/TBD | Not started | - |
