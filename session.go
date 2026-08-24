@@ -456,15 +456,24 @@ func (s *Session) Close() error {
 			dataWrapper := s.dataWrapper
 			s.mu.Unlock()
 
-			if assignedIP != nil && s.srv.pool != nil {
-				s.srv.pool.release(assignedIP, peerID)
-			}
+			// Remove the dataSessions routing entry BEFORE releasing
+			// peerID back to the pool (WR-04): pool.release makes peerID
+			// immediately reusable by the next ipPool.allocate() call, so
+			// releasing first would open a window where a brand-new
+			// session could claim peerID and publish itself into
+			// dataSessions before this session's own entry is removed —
+			// making the routing-table cleanup below depend on the
+			// `existing == s` equality check to save it, rather than being
+			// structurally impossible by construction.
 			if dataWrapper != nil {
 				s.srv.mu.Lock()
 				if existing, ok := s.srv.dataSessions[peerID]; ok && existing == s {
 					delete(s.srv.dataSessions, peerID)
 				}
 				s.srv.mu.Unlock()
+			}
+			if assignedIP != nil && s.srv.pool != nil {
+				s.srv.pool.release(assignedIP, peerID)
 			}
 			s.srv.removeSession(s)
 		}

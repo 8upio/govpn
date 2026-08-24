@@ -1843,3 +1843,98 @@ func TestPerformPushExchangeFieldWritesRaceSafeAgainstClose(t *testing.T) {
 		<-writerDone
 	}
 }
+
+// TestCloseRemovesRoutingEntryBeforeReleasingPeerID is WR-04's regression
+// test: Close must remove the srv.dataSessions routing entry before
+// releasing peerID back to the pool, not after — releasing first makes
+// peerID immediately reusable by the next ipPool.allocate() call, opening a
+// window where a brand-new session could claim peerID and publish itself
+// into dataSessions before the closing session's own routing entry is
+// removed.
+//
+// This is made deterministic (not a timing-dependent race) by holding
+// srv.mu ourselves before starting Close on another goroutine: whichever
+// order Close's release-vs-delete steps run in, the delete step needs
+// srv.mu, so Close necessarily blocks trying to acquire it while we hold
+// it. On the FIXED order (delete before release), that block happens
+// *before* Close ever calls release — so peerID can never become
+// allocatable while we hold srv.mu, for any wait duration, structurally,
+// not probabilistically. On the buggy order (release before delete),
+// release only needs the pool's own mutex, entirely independent of srv.mu,
+// so it completes almost immediately regardless of whether we hold srv.mu
+// — making peerID allocatable while dataSessions[peerID] still routes to
+// the closing session.
+func TestCloseRemovesRoutingEntryBeforeReleasingPeerID(t *testing.T) {
+	_, network, err := net.ParseCIDR("10.50.0.0/30") // exactly one allocatable client address/peer-id
+	if err != nil {
+		t.Fatalf("parse network: %v", err)
+	}
+	pool, err := newIPPool(network)
+	if err != nil {
+		t.Fatalf("newIPPool: %v", err)
+	}
+	ip, peerID, err := pool.allocate()
+	if err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+
+	wrapper, err := datachan.NewWrapper(testSymmetricDataKeys(t), peerID, 0)
+	if err != nil {
+		t.Fatalf("NewWrapper: %v", err)
+	}
+
+	srv := &Server{
+		pool:         pool,
+		sessions:     make(map[sessionKey]*Session),
+		dataSessions: make(map[uint32]*Session),
+	}
+	sess := &Session{
+		srv:         srv,
+		stopCh:      make(chan struct{}),
+		assignedIP:  ip,
+		peerID:      peerID,
+		dataWrapper: wrapper,
+	}
+	srv.mu.Lock()
+	srv.dataSessions[peerID] = sess
+	srv.mu.Unlock()
+
+	// Hold srv.mu across the whole check window (see doc comment above for
+	// why this makes the assertion structural rather than timing-luck
+	// based).
+	srv.mu.Lock()
+
+	closeDone := make(chan struct{})
+	go func() {
+		defer close(closeDone)
+		sess.Close()
+	}()
+
+	violation := false
+	deadline := time.Now().Add(150 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		_, gotPeerID, err := pool.allocate()
+		if err != nil {
+			time.Sleep(2 * time.Millisecond)
+			continue
+		}
+		if gotPeerID != peerID {
+			t.Fatalf("attacker allocate() returned peer-id %d, want %d (test setup bug)", gotPeerID, peerID)
+		}
+		// Read directly (not through srv.mu) — safe here specifically
+		// because we are the one holding srv.mu, so Close's own
+		// dataSessions write cannot be concurrently in flight.
+		if existing, ok := srv.dataSessions[peerID]; ok && existing == sess {
+			violation = true
+		}
+		pool.release(ip, peerID) // restore pool state; Close's own release below is idempotent either way
+		break
+	}
+
+	srv.mu.Unlock()
+	<-closeDone
+
+	if violation {
+		t.Fatal("peerID became allocatable while dataSessions[peerID] still routed to the closing session — the routing entry must be removed before peerID is released back to the pool")
+	}
+}
