@@ -254,6 +254,7 @@ func TestInteropScenarios(t *testing.T) {
 			t.Log(res.composeOut)
 
 			assertHandshakeCompleted(t, res)
+			assertKeyExchangeCompleted(t, res)
 			assertServerStaysUnprivileged(t, res)
 
 			if sc.largeCert {
@@ -313,6 +314,41 @@ func assertHandshakeCompleted(t *testing.T, res scenarioResult) {
 
 	if !strings.Contains(res.composeOut, "surviving") {
 		t.Fatal("server output does not show it entered the post-handshake survival window — see log above")
+	}
+}
+
+// clientKeyNegotiationFailedRe matches the reference client's own
+// key-negotiation-timeout log line (ssl.c:2919, "TLS Error: TLS key
+// negotiation failed to occur within %d seconds (check your network
+// connectivity)") — asserted absent, not present, so a regression that
+// silently breaks Key Method 2 for the real client (while still leaving
+// the server's own PASS line looking fine) still fails this test.
+var clientKeyNegotiationFailedRe = regexp.MustCompile(`TLS key negotiation failed to occur within`)
+
+// assertKeyExchangeCompleted is 02-01-PLAN.md Task 3's verification: a real
+// OpenVPN 2.6.14 client's Key Method 2 message parses, the server's own
+// message is accepted, and the client proceeds to request its tunnel
+// configuration — proven by an assertion in the scenario table, not by
+// reading a log by hand. Follows assertHandshakeCompleted's own shape
+// (regexp/substring match over the captured combined output, fatal on
+// mismatch, no t.Skip).
+func assertKeyExchangeCompleted(t *testing.T, res scenarioResult) {
+	t.Helper()
+
+	if res.composeErr != nil {
+		// assertHandshakeCompleted already fails loudly on this; avoid a
+		// second, redundant fatal here obscuring the first.
+		return
+	}
+
+	if !strings.Contains(res.composeOut, "km2=ok") {
+		t.Fatal("server output does not contain \"km2=ok\" — the Key Method 2 exchange did not complete — see log above")
+	}
+	if !strings.Contains(res.composeOut, "push_request=seen") {
+		t.Fatal("server output does not contain \"push_request=seen\" — the real client did not progress past key negotiation to request its tunnel configuration within the post-handshake survival window — see log above")
+	}
+	if clientKeyNegotiationFailedRe.MatchString(res.composeOut) {
+		t.Fatal("client output reports a TLS key negotiation failure — see log above")
 	}
 }
 

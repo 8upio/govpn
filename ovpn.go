@@ -14,10 +14,12 @@ package ovpn
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"runtime/debug"
 	"sync"
@@ -403,8 +405,48 @@ func (s *Server) runHandshake(sess *Session) {
 		return
 	}
 
+	// Observe whether the client progresses past key negotiation and
+	// begins asking for its tunnel configuration — an interop diagnostic
+	// (Task 3), not yet a protocol responsibility of this plan (plan
+	// 02-02 owns answering PUSH_REQUEST with PUSH_REPLY). Runs
+	// concurrently with OnSession firing below, since a real client's
+	// PUSH_REQUEST may arrive during, not before, the post-handshake
+	// window.
+	go s.watchForPushRequest(sess, tlsConn)
+
 	if s.cfg.OnSession != nil {
 		s.callOnSession(sess)
+	}
+}
+
+// pushRequestWatchTimeout bounds watchForPushRequest's read so a client
+// that never sends PUSH_REQUEST (or a non-interop embedding) doesn't leak
+// this goroutine forever. Sized generously above
+// test/interop/server's postHandshakeSurvival (2s) so a real client's own
+// PUSH_REQUEST timer has comfortable room to fire within it.
+const pushRequestWatchTimeout = 10 * time.Second
+
+// watchForPushRequest reads the next protocol message off sess.tlsReader,
+// after the Key Method 2 exchange has completed, and records whether it is
+// the client's literal PUSH_REQUEST bytes (RESEARCH Pattern 6:
+// "PUSH_REQUEST" plus one trailing NUL, 13 bytes total — plain,
+// NUL-terminated ASCII, a different wire framing than Key Method 2's own
+// length-prefixed fields). This plan does not answer it — plan 02-02 owns
+// PUSH_REPLY — reading and discarding it here is safe: the reference
+// client retransmits PUSH_REQUEST on its own timer (push.c), so plan
+// 02-02's reply path will still see one. Nothing else reads from
+// sess.tlsReader after the Key Method 2 exchange in this plan, so this is
+// the sole reader.
+func (s *Server) watchForPushRequest(sess *Session, tlsConn *tls.Conn) {
+	_ = tlsConn.SetReadDeadline(time.Now().Add(pushRequestWatchTimeout))
+	defer func() { _ = tlsConn.SetReadDeadline(time.Time{}) }()
+
+	buf := make([]byte, len(pushRequestLiteral))
+	if _, err := io.ReadFull(sess.tlsReader, buf); err != nil {
+		return
+	}
+	if bytes.Equal(buf, pushRequestLiteral) {
+		sess.pushRequested.Store(true)
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 
 	"github.com/8upio/govpn/internal/ctrlconn"
 	"github.com/8upio/govpn/internal/keyderiv"
@@ -120,9 +121,23 @@ type Session struct {
 
 	// pushRequested records whether this session's client has sent its
 	// PUSH_REQUEST (observed, read and discarded — plan 02-02 owns
-	// answering it with PUSH_REPLY). Diagnostic only in this plan (Task 3's
-	// interop gate).
-	pushRequested bool
+	// answering it with PUSH_REPLY). Set from a background goroutine
+	// watching sess.tlsReader concurrently with Config.OnSession firing
+	// (the request may arrive during, not before, the post-handshake
+	// window), so it is an atomic.Bool rather than a plain bool — see
+	// watchForPushRequest in ovpn.go. Diagnostic only in this plan (Task
+	// 3's interop gate); exposed to embedders via PushRequestSeen.
+	pushRequested atomic.Bool
+}
+
+// PushRequestSeen reports whether this session's client has sent its
+// PUSH_REQUEST (RESEARCH Pattern 6) since the Key Method 2 exchange
+// completed. It is diagnostic-only in this plan — the server does not yet
+// answer PUSH_REQUEST with PUSH_REPLY (plan 02-02) — and exists so the
+// interop harness can observe that the real client progressed past key
+// negotiation and began asking for its tunnel configuration.
+func (s *Session) PushRequestSeen() bool {
+	return s.pushRequested.Load()
 }
 
 // Read is a placeholder: Phase 1 has no data channel to read raw IP packets
