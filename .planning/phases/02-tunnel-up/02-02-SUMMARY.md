@@ -241,3 +241,7 @@ None - no external service configuration required. Docker Desktop must be runnin
 ---
 *Phase: 02-tunnel-up*
 *Completed: 2026-08-24*
+
+## Self-Check: PASSED
+
+All 4 created files (`push.go`, `push_test.go`, `ippool.go`, `ippool_test.go`) confirmed present on disk; all 5 commits (`d8c3213`, `5869732`, `38afa0e`, `d839d7f`, `f9dd17e`) confirmed present in `git log --oneline --all`.
