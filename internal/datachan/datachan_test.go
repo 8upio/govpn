@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/8upio/govpn/internal/keyderiv"
+	"github.com/8upio/govpn/internal/tlscrypt"
 	"github.com/8upio/govpn/internal/wire"
 )
 
@@ -298,5 +301,182 @@ func TestOpenAbsorbsPingWithoutDeliveringPlaintext(t *testing.T) {
 	}
 	if !bytes.Equal(got, real) {
 		t.Errorf("Open(non-ping) = %x, want %x", got, real)
+	}
+}
+
+// TestAuthFailureDoesNotTouchWindow is the state-assertion proof (not a
+// comment) that Open's ordering — AEAD success strictly gates
+// replay.accept — actually holds: a tampered packet at packet ID 7 fails
+// with ErrAuth, and the SAME, untampered packet ID 7 is still accepted
+// afterward, proving the failed attempt never advanced or marked the
+// window (T-02-15).
+func TestAuthFailureDoesNotTouchWindow(t *testing.T) {
+	keys := testDataKeys(t)
+	w, err := NewWrapper(keys, 1, 0)
+	if err != nil {
+		t.Fatalf("NewWrapper: %v", err)
+	}
+	w.sendSeq = 6 // so the next Seal assigns packet ID 7
+
+	sealed, err := w.Seal(nil, []byte("packet seven"))
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	if got := binary.BigEndian.Uint32(sealed[offPacketID:offTag]); got != 7 {
+		t.Fatalf("test setup bug: sealed packet ID = %d, want 7", got)
+	}
+
+	tampered := append([]byte(nil), sealed...)
+	tampered[offTag] ^= 0xFF
+	if _, err := w.Open(nil, tampered); !errors.Is(err, ErrAuth) {
+		t.Fatalf("Open(tampered packet ID 7) = %v, want ErrAuth", err)
+	}
+
+	plaintext, err := w.Open(nil, sealed)
+	if err != nil {
+		t.Fatalf("Open(untampered packet ID 7, after the rejected tamper attempt) = %v, want success — the failed attempt must not have marked the window", err)
+	}
+	if string(plaintext) != "packet seven" {
+		t.Errorf("plaintext = %q, want %q", plaintext, "packet seven")
+	}
+}
+
+// TestDataChannelWindowIndependentOfTLSCrypt mirrors
+// internal/reliable's own TestReliabilityAndTLSCryptWindowsAreIndependent:
+// a datachan.Wrapper and a tlscrypt.Wrapper driven with overlapping
+// sequence numbers do not interfere — neither rejects a packet because the
+// other saw that number (02-RESEARCH.md Pitfall 5).
+func TestDataChannelWindowIndependentOfTLSCrypt(t *testing.T) {
+	dataWrapper, err := NewWrapper(testDataKeys(t), 1, 0)
+	if err != nil {
+		t.Fatalf("NewWrapper: %v", err)
+	}
+
+	tlsCryptKey := make([]byte, 256)
+	if _, err := rand.Read(tlsCryptKey); err != nil {
+		t.Fatalf("generate tls-crypt key: %v", err)
+	}
+	sender, err := tlscrypt.NewWrapper(tlsCryptKey, true)
+	if err != nil {
+		t.Fatalf("tlscrypt sender: %v", err)
+	}
+	receiver, err := tlscrypt.NewWrapper(tlsCryptKey, false)
+	if err != nil {
+		t.Fatalf("tlscrypt receiver: %v", err)
+	}
+	header := make([]byte, 0, 9)
+	header = append(header, 0x20)
+	header = append(header, make([]byte, 8)...)
+
+	for i := 1; i <= 2; i++ {
+		tlsWire, err := sender.Wrap(nil, header, []byte("tls-crypt packet"))
+		if err != nil {
+			t.Fatalf("tlscrypt Wrap %d: %v", i, err)
+		}
+		if _, _, err := receiver.Unwrap(nil, tlsWire); err != nil {
+			t.Fatalf("tlscrypt Unwrap %d (would fail if the data-channel window shared state with tls-crypt's): %v", i, err)
+		}
+
+		sealed, err := dataWrapper.Seal(nil, []byte("data channel packet"))
+		if err != nil {
+			t.Fatalf("Seal %d: %v", i, err)
+		}
+		if _, err := dataWrapper.Open(nil, sealed); err != nil {
+			t.Fatalf("Open %d (would fail if the data-channel window shared state with tls-crypt's): %v", i, err)
+		}
+	}
+}
+
+// TestTamperHasTeeth mirrors internal/tlscrypt/golden_test.go's own
+// TestGoldenVectorTamperHasTeeth pattern: flipping one bit in the tag
+// region of a valid packet makes Open fail, and the observed failure is
+// logged (t.Logf), so a reader can see the assertion actually fired rather
+// than trusting that it would have.
+func TestTamperHasTeeth(t *testing.T) {
+	keys := testDataKeys(t)
+	w, err := NewWrapper(keys, 1, 0)
+	if err != nil {
+		t.Fatalf("NewWrapper: %v", err)
+	}
+	sealed, err := w.Seal(nil, []byte("tamper has teeth"))
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	if _, err := w.Open(nil, sealed); err != nil {
+		t.Fatalf("untampered packet failed to open: %v", err)
+	}
+
+	tampered := append([]byte(nil), sealed...)
+	tampered[offTag] ^= 0xFF
+
+	w2, err := NewWrapper(keys, 1, 0)
+	if err != nil {
+		t.Fatalf("NewWrapper: %v", err)
+	}
+	if _, err := w2.Open(nil, tampered); err == nil {
+		t.Fatal("expected Open to fail on a tampered tag byte, but it succeeded — the byte-exactness assertions elsewhere in this file would silently accept corrupted traffic")
+	} else {
+		t.Logf("observed expected failure on a tampered tag byte: %v", err)
+	}
+}
+
+// TestConcurrentSealNeverDuplicatesPacketID asserts 500 goroutines calling
+// Seal under -race produce 500 distinct packet IDs — GCM's entire
+// nonce-uniqueness guarantee rests on this counter.
+func TestConcurrentSealNeverDuplicatesPacketID(t *testing.T) {
+	w, err := NewWrapper(testDataKeys(t), 1, 0)
+	if err != nil {
+		t.Fatalf("NewWrapper: %v", err)
+	}
+
+	const n = 500
+	ids := make([]uint32, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sealed, err := w.Seal(nil, []byte("x"))
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			ids[i] = binary.BigEndian.Uint32(sealed[offPacketID:offTag])
+		}()
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("Seal (goroutine %d): %v", i, err)
+		}
+	}
+
+	seen := make(map[uint32]bool, n)
+	for _, id := range ids {
+		if seen[id] {
+			t.Fatalf("duplicate packet ID %d observed across %d concurrent Seal calls", id, n)
+		}
+		seen[id] = true
+	}
+	if len(seen) != n {
+		t.Fatalf("observed %d distinct packet IDs, want %d", len(seen), n)
+	}
+}
+
+// TestPacketIDFailsClosedAtMax asserts a Wrapper whose counter is already
+// at 0xFFFFFFFF returns ErrPacketIDExhausted on the next Seal rather than
+// wrapping to 0 and reusing a GCM nonce.
+func TestPacketIDFailsClosedAtMax(t *testing.T) {
+	w, err := NewWrapper(testDataKeys(t), 1, 0)
+	if err != nil {
+		t.Fatalf("NewWrapper: %v", err)
+	}
+	w.sendSeq = 0xFFFFFFFF
+
+	if _, err := w.Seal(nil, []byte("one too many")); !errors.Is(err, ErrPacketIDExhausted) {
+		t.Fatalf("Seal at counter ceiling = %v, want ErrPacketIDExhausted", err)
 	}
 }

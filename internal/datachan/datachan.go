@@ -106,6 +106,8 @@ type Wrapper struct {
 
 	mu      sync.Mutex
 	sendSeq uint32 // last packet ID assigned; 0 means "none yet" (first is 1)
+
+	replay replayWindow // 64-wide sliding anti-replay window (replay.go, DATA-02)
 }
 
 // NewWrapper builds a Wrapper from keys (keyderiv.Key2.ServerSlots()'s
@@ -211,14 +213,13 @@ func (w *Wrapper) SealPing(dst []byte) ([]byte, error) {
 // payload appended to dst. It rejects anything shorter than the
 // header+tag prefix with ErrShort before any indexing, recomposes Go's
 // expected ciphertext||tag order from the wire's tag||ciphertext order,
-// and returns ErrAuth (no plaintext) on any authentication failure. A
-// decrypted ping (D-11) is absorbed here: ErrPingAbsorbed is returned
-// instead of the plaintext, and it is never mistaken for a fresh IP packet
-// by any caller checking err == nil.
-//
-// The 64-wide sliding replay window is Task 2's job (replay.go) — until
-// then this accepts every authenticated packet ID unconditionally, exactly
-// as this plan's own action text directs.
+// and returns ErrAuth (no plaintext) on any authentication failure. Only
+// after that AEAD check succeeds is the 64-wide sliding replay window
+// (replay.go, DATA-02) consulted — an ErrAuth return leaves it
+// byte-for-byte unchanged (T-02-15): an unauthenticated packet can never
+// advance or mark a victim's window. A decrypted ping (D-11) is absorbed
+// here: ErrPingAbsorbed is returned instead of the plaintext, and it is
+// never mistaken for a fresh IP packet by any caller checking err == nil.
 func (w *Wrapper) Open(dst, packet []byte) ([]byte, error) {
 	if len(packet) < offCiphertext {
 		return nil, ErrShort
@@ -245,7 +246,10 @@ func (w *Wrapper) Open(dst, packet []byte) ([]byte, error) {
 	if err != nil {
 		return nil, ErrAuth
 	}
-	_ = seq // consulted by Task 2's replay window; unused until then
+
+	if !w.replay.accept(seq) {
+		return nil, ErrReplay
+	}
 
 	decrypted := plaintext[prefixLen:]
 	if len(decrypted) == len(pingMagicTask1) && [16]byte(decrypted) == pingMagicTask1 {
