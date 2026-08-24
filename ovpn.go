@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/8upio/govpn/internal/ctrlconn"
+	"github.com/8upio/govpn/internal/datachan"
 	"github.com/8upio/govpn/internal/keyderiv"
 	"github.com/8upio/govpn/internal/reliable"
 	"github.com/8upio/govpn/internal/tlscrypt"
@@ -103,6 +104,19 @@ const (
 	// reliability layer's own retransmission, exactly as a genuinely lost
 	// UDP datagram would) rather than backing up Serve.
 	inboundQueueSize = 32
+
+	// ipInboundQueueSize bounds each session's inbound raw-IP-packet queue
+	// (D-14), matching inboundQueueSize above: a slow or stalled embedder
+	// reading from Session.Read must not block the shared UDP read loop, so
+	// a full queue drops the newest decrypted IP packet like a congested
+	// link (D-06) rather than backing up handleDatagram.
+	ipInboundQueueSize = 32
+
+	// dataChannelKeyID is the TLS key slot ID written into every data
+	// packet's header. Always 0 in v1: there is no renegotiation
+	// (SESS-04, Phase 4), so every session ever has exactly one data-
+	// channel key slot.
+	dataChannelKeyID = 0
 )
 
 // serverKM2Options is the options string this server sends in its own Key
@@ -151,6 +165,15 @@ type Server struct {
 	pc       net.PacketConn
 	closed   bool
 	sessions map[sessionKey]*Session
+
+	// dataSessions routes P_DATA_V1/P_DATA_V2 datagrams to their Session,
+	// keyed on the 24-bit peer-id ipPool.allocate() hands out (D-16,
+	// Pitfall 3) — data packets carry no 8-byte session ID at the offset
+	// sessions above is keyed on, so they need their own routing table.
+	// Guarded by mu, exactly like sessions. A peer-id is only ever a
+	// routing hint here, never a trust signal: the packet is only treated
+	// as that session's traffic once its own AEAD tag verifies (T-02-12).
+	dataSessions map[uint32]*Session
 }
 
 // NewServer builds a Server from cfg. It does not start listening — call
@@ -160,6 +183,7 @@ func NewServer(cfg Config) *Server {
 		cfg:             cfg,
 		handshakeWindow: reliable.HandshakeWindow,
 		sessions:        make(map[sessionKey]*Session),
+		dataSessions:    make(map[uint32]*Session),
 	}
 }
 
@@ -268,6 +292,17 @@ func (s *Server) handleDatagram(pc net.PacketConn, addr net.Addr, packet []byte)
 	if !wire.ValidOpcode(opcode) {
 		return
 	}
+
+	// Data packets (P_DATA_V1/P_DATA_V2) carry a 3-byte peer-id at this
+	// offset, not an 8-byte session ID — this branch MUST run before the
+	// control-opcode parse below, which would otherwise splice peer-id
+	// bytes together with packet-id/tag bytes into a sessionKey that can
+	// never match any control-channel session (Pitfall 3, D-16).
+	if opcode == wire.OpDataV1 || opcode == wire.OpDataV2 {
+		s.handleDataDatagram(opcode, packet)
+		return
+	}
+
 	var sid wire.SessionID
 	copy(sid[:], packet[1:1+wire.SessionIDSize])
 
@@ -389,6 +424,35 @@ func (s *Server) handleDatagram(pc net.PacketConn, addr net.Addr, packet []byte)
 	}
 }
 
+// handleDataDatagram routes an already-triaged (length-bounded,
+// opcode-valid) P_DATA_V1/P_DATA_V2 datagram to its session's decrypt path,
+// keyed on the 24-bit peer-id at bytes 1..3 (Pitfall 3, D-16) — never by
+// the sessionKey{addr,sid} table above, which these packets have no
+// session-ID field for. A miss (unknown peer-id, or a peer-id with no live
+// data-channel wrapper yet) drops the packet before any allocation
+// (T-02-17, mirroring handleDatagram's own cheap-rejection discipline for
+// forged control packets). P_DATA_V1 is not implemented this phase
+// (RESEARCH.md, out of scope) — dropped explicitly rather than mis-parsed
+// as V2.
+func (s *Server) handleDataDatagram(opcode wire.Opcode, packet []byte) {
+	if opcode != wire.OpDataV2 {
+		return
+	}
+	if len(packet) < 4 {
+		return
+	}
+	peerID := uint32(packet[1])<<16 | uint32(packet[2])<<8 | uint32(packet[3])
+
+	s.mu.Lock()
+	sess, ok := s.dataSessions[peerID]
+	s.mu.Unlock()
+	if !ok {
+		return
+	}
+
+	sess.handleDataPacket(packet)
+}
+
 // pump serializes delivery of this session's inbound control packets into
 // its control-channel Conn, one at a time, in the order handleDatagram
 // enqueued them, until stopCh is closed by Session.Close.
@@ -494,6 +558,24 @@ func (s *Server) performPushExchange(sess *Session, w io.Writer) error {
 			}
 			sess.assignedIP = ip
 			sess.peerID = peerID
+
+			// The data-channel Wrapper is constructed here, at the same
+			// point the tunnel IP/peer-id are assigned and before
+			// PUSH_REPLY is written — so it is live before OnSession ever
+			// fires (D-08) and before the peer-id this datagram was routed
+			// on could possibly reach the client. sess.dataKeys.ServerSlots
+			// already applies the data channel's own key-direction
+			// inversion (Pitfall 1) — do not re-derive it here.
+			dataWrapper, err := datachan.NewWrapper(sess.dataKeys.ServerSlots(), peerID, dataChannelKeyID)
+			if err != nil {
+				return fmt.Errorf("ovpn: build data-channel wrapper: %w", err)
+			}
+			sess.dataWrapper = dataWrapper
+			sess.ipInbound = make(chan []byte, ipInboundQueueSize)
+
+			s.mu.Lock()
+			s.dataSessions[peerID] = sess
+			s.mu.Unlock()
 		}
 
 		reply := buildPushReply(sess.assignedIP, s.cfg.Network, sess.peerID, cipher)

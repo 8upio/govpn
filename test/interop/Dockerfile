@@ -7,14 +7,22 @@ FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639
 # debian:bookworm-slim` (manifest-list digest, multi-arch — safe to build on
 # both amd64 CI runners and arm64 developer machines).
 
-# Resolved openvpn/tcpdump/iproute2 package versions as of 2026-08-23
-# (`apt-cache policy` against this exact base digest) — recorded here so a
-# future version drift shows up in a diff of this file, not silently:
-#   openvpn   2.6.14-0+deb12u2
-#   tcpdump   4.99.3-1
-#   iproute2  6.1.0-3
+# Resolved openvpn/tcpdump/iproute2/iputils-ping package versions as of
+# 2026-08-23 (`apt-cache policy` against this exact base digest) —
+# recorded here so a future version drift shows up in a diff of this
+# file, not silently:
+#   openvpn       2.6.14-0+deb12u2
+#   tcpdump       4.99.3-1
+#   iproute2      6.1.0-3
+#   iputils-ping  3:20221126-1+deb12u1
+#
+# iputils-ping is added for 02-03-PLAN.md Task 1's live data-channel round
+# trip: the entrypoint pings the server's pushed tunnel IP once the real
+# client's tun0 interface is up, proving Session.Read/Write carry genuine
+# encrypted IP traffic, not merely that the control-channel handshake
+# completed.
 RUN apt-get update && \
-    apt-get install --no-install-recommends -y openvpn tcpdump iproute2 && \
+    apt-get install --no-install-recommends -y openvpn tcpdump iproute2 iputils-ping && \
     rm -rf /var/lib/apt/lists/*
 
 COPY entrypoint.sh /entrypoint.sh

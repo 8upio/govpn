@@ -2,6 +2,7 @@ package ovpn
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -20,6 +21,8 @@ import (
 	"time"
 
 	"github.com/8upio/govpn/internal/ctrlconn"
+	"github.com/8upio/govpn/internal/datachan"
+	"github.com/8upio/govpn/internal/keyderiv"
 	"github.com/8upio/govpn/internal/tlscrypt"
 	"github.com/8upio/govpn/internal/wire"
 )
@@ -568,10 +571,14 @@ func TestPerformPushExchangeAnswersBufferedRetransmitWithSameIP(t *testing.T) {
 		t.Fatalf("newIPPool: %v", err)
 	}
 
-	srv := &Server{pool: pool, cfg: Config{Network: network}}
+	srv := &Server{pool: pool, cfg: Config{Network: network}, dataSessions: make(map[uint32]*Session)}
 
 	input := pushRequestLiteral + "\x00" + pushRequestLiteral + "\x00"
-	sess := &Session{tlsReader: bufio.NewReader(strings.NewReader(input))}
+	dataKeys, err := keyderiv.NewKey2(make([]byte, 256))
+	if err != nil {
+		t.Fatalf("NewKey2: %v", err)
+	}
+	sess := &Session{tlsReader: bufio.NewReader(strings.NewReader(input)), dataKeys: dataKeys}
 
 	var out strings.Builder
 	if err := srv.performPushExchange(sess, &out); err != nil {
@@ -1329,5 +1336,116 @@ func TestOnSessionPanicRecovered(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("OnSessionPanic was never called")
+	}
+}
+
+// TestSessionReadWriteDatagramSemantics is 02-03-PLAN.md Task 1's D-05
+// proof: Session.Write seals exactly one full IP packet per call (the peer
+// decrypts it to the exact bytes given to Write, not a stream fragment),
+// and Session.Read delivers exactly one full IP packet per call — a
+// too-small buffer returns an error and RETAINS the packet (this
+// Session's own documented D-05 choice, session.go's pendingRead doc
+// comment) rather than truncating it or silently losing it, and a
+// subsequent Read with a large-enough buffer still receives it, in full.
+func TestSessionReadWriteDatagramSemantics(t *testing.T) {
+	var raw [256]byte
+	for i := range raw {
+		raw[i] = byte(i)
+	}
+	key2, err := keyderiv.NewKey2(raw[:])
+	if err != nil {
+		t.Fatalf("NewKey2: %v", err)
+	}
+	serverKeys := key2.ServerSlots()
+	// clientKeys is the mirror image of serverKeys (matching how a real
+	// peer's own key-direction assignment inverts the server's, Pitfall
+	// 1) — this test's own encrypt/decrypt pairing, not
+	// keyderiv.keyDirection(false) itself, since that's internal/keyderiv's
+	// own already-tested concern.
+	clientKeys := keyderiv.DataKeys{
+		EncryptCipher:     serverKeys.DecryptCipher,
+		EncryptImplicitIV: serverKeys.DecryptImplicitIV,
+		DecryptCipher:     serverKeys.EncryptCipher,
+		DecryptImplicitIV: serverKeys.EncryptImplicitIV,
+	}
+
+	const peerID = 7
+	serverWrapper, err := datachan.NewWrapper(serverKeys, peerID, 0)
+	if err != nil {
+		t.Fatalf("NewWrapper (server): %v", err)
+	}
+	clientWrapper, err := datachan.NewWrapper(clientKeys, peerID, 0)
+	if err != nil {
+		t.Fatalf("NewWrapper (client): %v", err)
+	}
+
+	serverPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("server listen: %v", err)
+	}
+	defer serverPC.Close()
+	clientPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("client listen: %v", err)
+	}
+	defer clientPC.Close()
+
+	sess := &Session{
+		srv:         &Server{pc: serverPC},
+		RemoteAddr:  clientPC.LocalAddr(),
+		dataWrapper: serverWrapper,
+		ipInbound:   make(chan []byte, ipInboundQueueSize),
+		stopCh:      make(chan struct{}),
+	}
+
+	// --- Write: seals exactly one packet per call, sent to RemoteAddr. ---
+	writePayload := bytes.Repeat([]byte{0x99}, 500)
+	n, err := sess.Write(writePayload)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if n != len(writePayload) {
+		t.Fatalf("Write returned %d, want %d", n, len(writePayload))
+	}
+
+	buf := make([]byte, 2048)
+	if err := clientPC.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	rn, _, err := clientPC.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("client read: %v", err)
+	}
+	clientDecoded, err := clientWrapper.Open(nil, buf[:rn])
+	if err != nil {
+		t.Fatalf("client Open of the packet Write sent: %v", err)
+	}
+	if !bytes.Equal(clientDecoded, writePayload) {
+		t.Error("client did not decrypt Write's exact payload")
+	}
+
+	// --- Read: the client seals a 500-byte packet, sess's own decrypt
+	// path (handleDataPacket) delivers it whole in one Read. ---
+	sealedFromClient, err := clientWrapper.Seal(nil, writePayload)
+	if err != nil {
+		t.Fatalf("client Seal: %v", err)
+	}
+	sess.handleDataPacket(sealedFromClient)
+
+	small := make([]byte, 100)
+	if _, err := sess.Read(small); err == nil {
+		t.Fatal("Read into a too-small buffer succeeded, want an error")
+	}
+
+	big := make([]byte, 500)
+	rcount, err := sess.Read(big)
+	if err != nil {
+		t.Fatalf("Read after a too-small Read retained the packet: %v", err)
+	}
+	if rcount != 500 {
+		t.Fatalf("Read returned %d bytes, want exactly 500", rcount)
+	}
+	if !bytes.Equal(big[:rcount], writePayload) {
+		t.Error("retained packet was not delivered intact by the next Read")
 	}
 }
