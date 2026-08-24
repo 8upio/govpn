@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"math/big"
 	"net"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -288,5 +289,150 @@ func TestServeClose(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Serve did not return after Close")
+	}
+}
+
+// TestSessionCloseStopsPumpAndRemovesFromSessions is a regression test for
+// CR-01 (01-REVIEW.md): Session.Close() must remove the session from
+// Server.sessions and must stop the per-session pump/runHandshake/
+// enforceHandshakeWindow goroutines, not merely close the underlying
+// control-channel Conn.
+func TestSessionCloseStopsPumpAndRemovesFromSessions(t *testing.T) {
+	key := testTLSCryptKey(t)
+
+	serverPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("server listen: %v", err)
+	}
+	defer serverPC.Close()
+
+	srv := NewServer(Config{TLSCryptKey: key, TLSConfig: testTLSConfig(t)})
+	go func() { _ = srv.Serve(serverPC) }()
+	defer srv.Close()
+
+	clientPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("client listen: %v", err)
+	}
+	defer clientPC.Close()
+
+	clientWrap, err := tlscrypt.NewWrapper(key, false)
+	if err != nil {
+		t.Fatalf("client wrapper: %v", err)
+	}
+
+	runtime.GC()
+	baseline := runtime.NumGoroutine()
+
+	clientSID := wire.SessionID{9, 9, 9, 9, 9, 9, 9, 9}
+	packet := clientHardReset(t, clientWrap, clientSID)
+	if _, err := clientPC.WriteTo(packet, serverPC.LocalAddr()); err != nil {
+		t.Fatalf("write hard reset: %v", err)
+	}
+	readAndParseReply(t, clientPC, clientWrap)
+
+	// The hard reset above has already caused handleDatagram to create the
+	// session and start its pump/runHandshake/enforceHandshakeWindow
+	// goroutines (ovpn.go's "if justCreated" branch). The TLS handshake
+	// itself never completes in this test — there is no real TLS client on
+	// the other end, exactly as in TestHardResetRoundTrip — so
+	// Config.OnSession is never invoked; grab the *Session straight from
+	// the server's session table instead.
+	var sess *Session
+	deadline := time.Now().Add(2 * time.Second)
+	for sess == nil && time.Now().Before(deadline) {
+		srv.mu.Lock()
+		for _, s := range srv.sessions {
+			sess = s
+		}
+		srv.mu.Unlock()
+		if sess == nil {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	if sess == nil {
+		t.Fatal("expected a session to have been created in Server.sessions")
+	}
+
+	if err := sess.Close(); err != nil {
+		t.Fatalf("session close: %v", err)
+	}
+
+	srv.mu.Lock()
+	_, stillPresent := srv.sessions[sess.key]
+	srv.mu.Unlock()
+	if stillPresent {
+		t.Error("session still present in Server.sessions after Close()")
+	}
+
+	// pump, runHandshake, and enforceHandshakeWindow should all exit
+	// shortly after Close() (Close's stopCh close unblocks pump directly;
+	// closing sess.conn unblocks the in-flight Handshake() call, which in
+	// turn closes doneCh and unblocks enforceHandshakeWindow). Poll for
+	// goroutine count to return to its pre-session baseline rather than
+	// asserting instantaneously, since goroutine teardown is asynchronous.
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		runtime.GC()
+		if n := runtime.NumGoroutine(); n <= baseline {
+			break
+		} else if time.Now().After(deadline) {
+			t.Errorf("goroutine count did not return to baseline after Close(): got %d, want <= %d", n, baseline)
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestOnSessionPanicRecovered is a regression test for WR-01/WR-03
+// (01-REVIEW.md): a panicking Config.OnSession callback must not crash the
+// process, and — since WR-03's fix — the recovered panic value must be
+// surfaced to Config.OnSessionPanic rather than silently swallowed.
+func TestOnSessionPanicRecovered(t *testing.T) {
+	key := testTLSCryptKey(t)
+
+	serverPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("server listen: %v", err)
+	}
+	defer serverPC.Close()
+
+	panicked := make(chan any, 1)
+	srv := NewServer(Config{
+		TLSCryptKey: key,
+		TLSConfig:   testTLSConfig(t),
+		OnSession: func(sess *Session) {
+			panic("boom: simulated OnSession bug")
+		},
+		OnSessionPanic: func(sess *Session, recovered any, stack []byte) {
+			panicked <- recovered
+		},
+	})
+	// Directly exercise callOnSession rather than driving a full TLS
+	// handshake: OnSession only fires post-handshake, and this test's only
+	// concern is that a panic inside it is recovered and routed to
+	// OnSessionPanic, not the handshake machinery itself (covered by
+	// TestHardResetRoundTrip and the interop suite).
+	sess := &Session{}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.callOnSession(sess)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("callOnSession did not return — panic was not recovered")
+	}
+
+	select {
+	case r := <-panicked:
+		if r != "boom: simulated OnSession bug" {
+			t.Errorf("recovered value = %v, want %q", r, "boom: simulated OnSession bug")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("OnSessionPanic was never called")
 	}
 }
