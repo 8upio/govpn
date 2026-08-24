@@ -2,7 +2,7 @@
 phase: 01-handshake
 reviewed: 2026-08-23T00:00:00Z
 depth: standard
-files_reviewed: 20
+files_reviewed: 33
 files_reviewed_list:
   - .dockerignore
   - .github/workflows/ci.yml
@@ -39,10 +39,10 @@ files_reviewed_list:
   - testdata/golden/README.md
   - testdata/golden/manifest.json
 findings:
-  critical: 1
-  warning: 2
-  info: 3
-  total: 6
+  critical: 0
+  warning: 4
+  info: 4
+  total: 8
 status: issues_found
 ---
 
@@ -50,200 +50,124 @@ status: issues_found
 
 **Reviewed:** 2026-08-23
 **Depth:** standard
-**Files Reviewed:** 33 (20 required-reading source files plus their directly-associated test/build files already covered by the same read)
+**Files Reviewed:** 33
 **Status:** issues_found
 
 ## Summary
 
-The wire/tlscrypt/reliable layers are careful, well-tested ports of the OpenVPN C reference — I cross-checked `internal/reliable/reliable.go`'s `Next`/`Ack`/`Due`/`Put`/`Get` and `internal/tlscrypt/tlscrypt.go`'s wrap/unwrap construction directly against `/Users/svenloth/dev/openvpn-reference/src/openvpn/reliable.c` and `tls_crypt.c` line-for-line, including the wraparound-unsafe `<` comparison in `Reliable.Ack` (this is *not* a bug — the C reference does the exact same non-wraparound-safe comparison at `reliable.c:437`). `internal/wire`'s parser never indexes without a length check first, and the golden-vector tests genuinely round-trip real captured client bytes.
+This is iteration 2 of the review loop, verifying commits a5b470e (CR-01), 0de8176 (WR-01), and be919ca (WR-02) against the findings from iteration 1.
 
-The one real defect is architectural, not cryptographic: `ovpn.go`'s per-session `pump()` goroutine and `Server.sessions` map entry are never released for the ordinary lifetime of a session — `Session.Close()` (the library's own public teardown API) does not unwind either of them. For an embeddable, long-running library this is a genuine resource-leak/availability bug, not a mere inefficiency, because it defeats the documented contract of `Close()` and is triggerable by completely ordinary client connect/disconnect traffic (no attack required to hit it, though it also makes a trivial DoS lever). See CR-01.
+**CR-01 (session/goroutine leak) — fixed correctly.** I traced `Session.Close()` → `stopOnce.Do` → `close(stopCh)` + `srv.removeSession(s)` → `conn.Close()` end to end against every call site (`Server.Close()`, `runHandshake`'s error path, `enforceHandshakeWindow`'s timeout path, and the new `pump()`/`handleDatagram` select-on-`stopCh` pairing). The fix correctly avoids the "close a channel others may still send on" hazard by never closing `inbound` itself, uses `sync.Once` to make teardown idempotent and race-safe across the three call sites that can now all reach `Close()` concurrently, and `ctrlconn.Conn.Close()` (the thing `Session.Close()` ultimately calls into) was already idempotent before this fix. `go test -race -count=1 ./...` passes. No deadlock: every call site releases `Server.mu` before calling into `Session.Close()`/`removeSession`. No new nil-pointer paths: `sess.conn` and `sess.stopCh` are always populated before any goroutine that could observe them is started, exactly as the original CR-01 fix suggestion specified. This is correct and complete.
 
-Two further issues are secondary in severity: an unrecovered panic in the client-supplied `OnSession` callback can take down the whole embedding process (WR-01), and `internal/tlscrypt.Wrapper.Wrap` silently wraps its packet-ID sequence counter around 2^32 instead of erroring the way `tls_crypt_wrap` in the reference does (WR-02) — practically unreachable in a real session's lifetime, but a genuine spec-fidelity gap given how much the rest of this codebase prides itself on byte-exactness. A few Info-level items round out the findings.
+**WR-01 (unrecovered panic in `Config.OnSession`) — fixed correctly, but the recover is a bare swallow.** `callOnSession`'s `defer func() { recover() }()` does stop a panicking callback from taking down the whole process — verified by reading the code and confirming `runHandshake` now routes through it. However, the panic value is discarded with no logging, no error surfaced to `Config`, and no way for the embedder to observe that a callback panicked at all. See WR-03 below — this doesn't invalidate the fix (a silent swallow is strictly better than a process crash) but it is a regression in observability worth tightening.
 
-## Critical Issues
+**WR-02 (tls-crypt packet-ID rollover) — the rollover gate itself is correct, but I found a separate, more concrete defect in the same function while verifying it.** The new gate in `Wrapper.Wrap` (`internal/tlscrypt/tlscrypt.go:190-208`) correctly mirrors `packet_id_send_update`'s fail-closed rollover check (`packet_id.c:323-344`) for the `sendSeq == 0xFFFFFFFF` case. But two lines later, `Wrap` still populates the wire packet-ID's timestamp field with `time.Now().Unix()` on *every single call* (`tlscrypt.go:215`), where the C reference writes a value that is frozen for the life of the key (`p->time`, set once and only ever touched again at a rollover). Cross-referencing `packet_id_test`'s `seq_backtrack` branch (`packet_id.c:214-269`) shows this isn't cosmetic: a genuine OpenVPN 2.6 client receiving this server's tls-crypt-wrapped traffic treats every packet whose `pin->time` exceeds its own stored `p->time` as an unconditional accept that resets its replay window — which, given this server increments the wire timestamp roughly once per wall-clock second, happens constantly. That defeats the reference's own sequence-based anti-replay backtrack window for traffic sent by this library. See WR-04 below.
 
-### CR-01: `Session.Close()` does not remove the session from `Server.sessions` or stop the per-session `pump()` goroutine — every session leaks a goroutine and a map entry for the life of the process
-
-**File:** `session.go:104-110`, `ovpn.go:196-329` (specifically `ovpn.go:249` and `ovpn.go:321-328`)
-
-**Issue:**
-
-`session.go`'s `Close()` is documented as "tears down this session's control channel":
-
-```go
-func (s *Session) Close() error {
-    if s.conn == nil {
-        return nil
-    }
-    return s.conn.Close()
-}
-```
-
-It only closes the `ctrlconn.Conn` (which does correctly stop `Conn`'s own internal `retransmitLoop` via `closeCh` — that part is fine). It never:
-
-1. Calls back into `Server.removeSession` to delete the entry from `Server.sessions` (`ovpn.go:374-380`) — `Session` doesn't even hold a reference to its owning `*Server` to be able to do so.
-2. Closes or otherwise signals `sess.inbound` (`ovpn.go:249`, a `chan wire.ControlPacket`), which is what the per-session `pump()` goroutine ranges over forever:
-
-```go
-func (sess *Session) pump() {
-    for cp := range sess.inbound {
-        sess.conn.Deliver(cp)
-    }
-}
-```
-
-Nothing in the codebase ever calls `close(sess.inbound)` (confirmed by `grep -rn inbound`), so this `range` loop — and the goroutine running it — never terminates. It is started once per session in `ovpn.go:295` (`go sess.pump()`) for *every* session that completes the initial hard-reset exchange, whether the handshake subsequently succeeds, fails, times out, or the application later calls `Session.Close()`.
-
-`Server.removeSession` (`ovpn.go:374-380`) is only ever invoked from two places: `runHandshake` on a *failed* `Handshake()` (`ovpn.go:345-349`) and `enforceHandshakeWindow` on a *timeout* (`ovpn.go:364-372`). There is no code path that removes a session from `Server.sessions` after a **successful** handshake, ever — not even when the application later calls `Session.Close()`. Combined with the goroutine leak above, a long-running embedding process that serves many short-lived clients (the exact deployment shape this library is designed for — see PROJECT.md's "embeddable in any Go program" core value) accumulates one live goroutine plus one retained `Session`/`*ctrlconn.Conn`/map-entry per client, forever, with no way for the application to reclaim it via the public API.
-
-This is squarely a correctness bug (the documented behavior of `Close()` is not what the code does), and it is also a resource-exhaustion/availability concern distinct from an "inefficient algorithm": nothing bounds how many of these leak, and it is reachable by ordinary connect/disconnect churn, not just adversarial input.
-
-**Fix:**
-
-Give `Session` a way to signal its owning `Server` and unblock `pump` without racing a concurrent send on `sess.inbound` (closing a channel that other goroutines may still be sending on panics). A `stop` channel selected on both sides avoids that hazard:
-
-```go
-// session.go
-type Session struct {
-    ...
-    srv    *Server
-    stopCh chan struct{}
-    stopOnce sync.Once
-}
-
-func (s *Session) Close() error {
-    s.stopOnce.Do(func() {
-        close(s.stopCh)
-        if s.srv != nil {
-            s.srv.removeSession(s)
-        }
-    })
-    if s.conn == nil {
-        return nil
-    }
-    return s.conn.Close()
-}
-```
-
-```go
-// ovpn.go
-sess = &Session{
-    ...
-    srv:     s,
-    stopCh:  make(chan struct{}),
-    inbound: make(chan wire.ControlPacket, inboundQueueSize),
-}
-...
-func (sess *Session) pump() {
-    for {
-        select {
-        case cp := <-sess.inbound:
-            sess.conn.Deliver(cp)
-        case <-sess.stopCh:
-            return
-        }
-    }
-}
-```
-
-And update `handleDatagram`'s enqueue to also select on `stopCh` so a send to a session mid-teardown doesn't block forever:
-
-```go
-select {
-case sess.inbound <- cp:
-case <-sess.stopCh:
-default:
-}
-```
-
-Also route `runHandshake`'s failure path and `enforceHandshakeWindow`'s timeout path through the same `Session.Close()` (or have them call `sess.stopOnce`/`removeSession` directly) so there is exactly one teardown path instead of two independent ones that both need to remember to do all three things (stop conn, stop pump, remove from map).
+I also confirmed the three Info items from iteration 1 (dead `rootCert`, string-concatenated paths instead of `filepath.Join`, `flushAckOnly`'s benign empty-ACK race) are all still present, unchanged — carried forward below as IN-01/IN-02/IN-03.
 
 ## Warnings
 
-### WR-01: `Config.OnSession` is invoked without panic recovery, so a panicking caller callback crashes the entire embedding process
+### WR-03: `callOnSession`'s panic recovery is a silent swallow — no observability into a caller callback that panicked
 
-**File:** `ovpn.go:356-358`
+**File:** `ovpn.go:378-383`
 
-**Issue:** `runHandshake` calls the user-supplied callback directly on a bare goroutine:
+**Issue:** The fix correctly prevents an `OnSession` panic from crashing the process:
 
 ```go
-if s.cfg.OnSession != nil {
-    s.cfg.OnSession(sess)
+func (s *Server) callOnSession(sess *Session) {
+	defer func() {
+		recover() //nolint:errcheck // intentionally swallowed, see callOnSession's doc comment
+	}()
+	s.cfg.OnSession(sess)
 }
 ```
 
-There is no `recover()` around this call. Since this runs on a goroutine spawned per-session (`ovpn.go:296`, `go s.runHandshake(sess)`), an unrecovered panic inside `OnSession` (e.g. a nil-pointer dereference in application code reacting to a new session) will propagate up through the goroutine and crash the entire process — taking down every other in-flight session on the same embedding server, not just the one that triggered it. For a library explicitly designed to be embedded "in any Go program" (PROJECT.md), one caller mistake in a single connection callback should not be able to bring down the whole host process.
+But the recovered value is thrown away entirely. There is no logging, no counter, no callback the embedder can register to be told "your `OnSession` panicked for session X" — for a library with no logging story at all today, this means a caller who ships a nil-pointer bug in their `OnSession` callback will simply see that session silently vanish, with zero diagnostic trail, ever. This is a step better than the pre-fix behavior (crashing the whole process) but trades a loud, debuggable failure for a completely silent one, which is its own maintainability problem — especially for a library explicitly designed to be embedded in long-running production processes.
 
-**Fix:**
+**Fix:** Either accept an optional error/panic hook on `Config` and call it with the recovered value, or at minimum log via `log.Printf`/`runtime/debug.Stack()` so the embedder isn't debugging a mysteriously-disappearing session with no trace at all:
+
 ```go
-func (s *Server) runHandshake(sess *Session) {
-    tlsConn := tls.Server(sess.conn, s.cfg.TLSConfig)
-    err := tlsConn.Handshake()
-    close(sess.doneCh)
-
-    if err != nil {
-        _ = sess.conn.Close()
-        s.removeSession(sess)
-        return
-    }
-
-    state := tlsConn.ConnectionState()
-    sess.connState = state
-    if len(state.PeerCertificates) > 0 {
-        sess.PeerCN = state.PeerCertificates[0].Subject.CommonName
-    }
-    if s.cfg.OnSession != nil {
-        func() {
-            defer func() {
-                if r := recover(); r != nil {
-                    // log/route to an error handler; at minimum don't take
-                    // the whole process down for one session's callback.
-                }
-            }()
-            s.cfg.OnSession(sess)
-        }()
-    }
+func (s *Server) callOnSession(sess *Session) {
+	defer func() {
+		if r := recover(); r != nil {
+			if s.cfg.OnSessionPanic != nil {
+				s.cfg.OnSessionPanic(sess, r, debug.Stack())
+			}
+		}
+	}()
+	s.cfg.OnSession(sess)
 }
 ```
 
-### WR-02: `tlscrypt.Wrapper.Wrap`'s packet-ID sequence counter silently wraps around instead of erroring, unlike the reference's `tls_crypt_wrap`
+### WR-04: `Wrapper.Wrap` writes a live `time.Now()` into the tls-crypt long-form packet ID on every packet instead of the reference's frozen per-key timestamp, weakening a genuine OpenVPN client's anti-replay window against this server's own traffic
 
-**File:** `internal/tlscrypt/tlscrypt.go:178-193`
+**File:** `internal/tlscrypt/tlscrypt.go:213-215`
 
-**Issue:** The reference's `tls_crypt_wrap` (`tls_crypt.c:151-159`) explicitly checks for packet-ID rollover and fails the wrap (`"TLS-CRYPT ERROR: packet ID roll over."`) rather than emitting a wrapped packet with a wrapped-around, no-longer-monotonic sequence number:
+**Issue:**
 
 ```go
+var pid [PIDSize]byte
+binary.BigEndian.PutUint32(pid[0:4], seq)
+binary.BigEndian.PutUint32(pid[4:8], uint32(time.Now().Unix()))
+```
+
+The reference's `packet_id_send_update` (`packet_id.c:323-344`, called from `packet_id_write` at `tls_crypt.c:164`) sets `p->time` exactly once, the first time the sequence is ever used (`if (!p->time) { p->time = now; }`), and only touches it again on a rollover. That same `p->time` value — not a fresh `time.Now()` — is what gets written into *every* outgoing packet's long-form timestamp field for the rest of that key's lifetime. This project's `Wrap` instead calls `time.Now().Unix()` fresh on every single call, so the wire timestamp changes roughly once per wall-clock second regardless of how many packets are sent.
+
+This matters because a real OpenVPN 2.6 client's `packet_id_test` (`packet_id.c:214-269`, `seq_backtrack` branch, which is the default mode used for control-channel/tls-crypt UDP traffic per `DEFAULT_SEQ_BACKTRACK`/`--replay-window`) branches on `pin->time` vs. its own stored `p->time`:
+- `pin->time == p->time`: normal sequence-window backtrack check (the intended replay defense).
+- `pin->time > p->time` ("time moved forward"): **unconditionally accepted**, and the window is reset to the new time/id baseline.
+
+Since this server's outgoing timestamp increases roughly every second, a genuine OpenVPN client receiving this server's tls-crypt traffic spends most of its time in the "time moved forward → accept unconditionally, reset window" branch rather than the intended sequence-backtrack check — defeating the reference's own anti-replay window for packets this library sends, on every wall-clock-second boundary. This does not break interop (nothing gets wrongly rejected) and does not bypass the HMAC-SHA256 authentication that is the primary defense, but it is a real, provable divergence from the reference's documented anti-replay behavior, and it is currently untested: the golden-vector tests exercise `WrapWithPacketID` (which takes an explicit `pid` and bypasses this code path entirely — see its own doc comment acknowledging "Wrap's own auto-generated seq+time.Now() packet ID can never reproduce a specific historical capture's bytes"), so nothing in the test suite exercises live `Wrap`'s timestamp behavior against reference semantics.
+
+**Fix:** Track a single frozen send-timestamp field (set once on first use, updated only at rollover — the direct Go equivalent of `p->time`), not `time.Now()` per call:
+
+```go
+type Wrapper struct {
+	...
+	sendSeq  uint32
+	sendTime int64 // frozen at first Wrap call; only updated at rollover — mirrors packet_id_send.time
+
+	sendRolloverAt int64
+	replay replayWindow
+}
+
 func (w *Wrapper) Wrap(dst, header, plaintext []byte) ([]byte, error) {
-    ...
-    w.mu.Lock()
-    w.sendSeq++
-    seq := w.sendSeq
-    w.mu.Unlock()
-    ...
+	...
+	w.mu.Lock()
+	if w.sendTime == 0 {
+		w.sendTime = time.Now().Unix()
+	}
+	if w.sendSeq == 0xFFFFFFFF {
+		now := time.Now().Unix()
+		if w.sendRolloverAt != 0 && now <= w.sendRolloverAt {
+			w.mu.Unlock()
+			return nil, errors.New("tlscrypt: packet ID roll over")
+		}
+		w.sendRolloverAt = now
+		w.sendTime = now
+		w.sendSeq = 0
+	}
+	w.sendSeq++
+	seq, ts := w.sendSeq, w.sendTime
+	w.mu.Unlock()
+
+	var pid [PIDSize]byte
+	binary.BigEndian.PutUint32(pid[0:4], seq)
+	binary.BigEndian.PutUint32(pid[4:8], uint32(ts))
+	...
 }
 ```
 
-`w.sendSeq` is a `uint32`; after `0xFFFFFFFF` it silently rolls over to `0` with no error returned, unlike every other place in this codebase (e.g. `writeStaticKeyV1`'s length check, `NewWrapper`'s key-length check) where the Go port deliberately preserves the reference's fail-closed behavior. In practice a control channel would need ~4 billion packets in one session's lifetime to hit this, so it's not currently exploitable, but it is a real, silent deviation from the reference's documented wire-safety guarantee (a wrapped-around sequence number breaks the receiver's replay-window assumptions), and this project's own stated correctness bar is byte- and behavior-exactness against the C reference.
+### WR-05: CR-01/WR-01/WR-02 shipped without any regression test
 
-**Fix:**
-```go
-func (w *Wrapper) Wrap(dst, header, plaintext []byte) ([]byte, error) {
-    if len(header) != OffPID {
-        return nil, errors.New("tlscrypt: header must be exactly 9 bytes (opcode+key-id byte + 8-byte session id)")
-    }
+**File:** `ovpn.go`, `session.go`, `internal/tlscrypt/tlscrypt.go` (fix commits a5b470e, 0de8176, be919ca)
 
-    w.mu.Lock()
-    if w.sendSeq == 0xFFFFFFFF {
-        w.mu.Unlock()
-        return nil, errors.New("tlscrypt: packet ID roll over")
-    }
-    w.sendSeq++
-    seq := w.sendSeq
-    w.mu.Unlock()
-    ...
-}
-```
+**Issue:** None of the three fix commits touch a `_test.go` file. There is no test asserting `Session.Close()` actually removes the session from `Server.sessions` or stops the `pump()` goroutine (e.g. a goroutine-count assertion around `Close()`), no test asserting a panicking `OnSession` doesn't crash the test process, and no test driving `Wrapper.sendSeq` to `0xFFFFFFFF` to assert the rollover gate actually returns an error. `go test -race -count=1 ./...` still passes, but that's expected — it was never exercising any of this code before either. For a project whose own stated correctness bar is "verified... not approximated from memory" and whose CLAUDE.md calls out `go test -race` as mandatory specifically because this codebase's stateful, timer-driven code "hides data races," landing three non-trivial concurrency/lifecycle fixes with zero accompanying tests leaves all three regressable by a future refactor with no CI signal.
+
+**Fix:** Add at minimum:
+- A test that calls `Session.Close()` on an established session and asserts (via `runtime.NumGoroutine()` delta, or by injecting a way to observe `pump`'s exit, or simplest: asserting the session is gone from a testable view of `Server.sessions`) that the session is actually removed and the pump goroutine actually exits.
+- A test that sets `Config.OnSession` to a function that panics and asserts `Serve`/the test process survives and returns normally.
+- A test in `internal/tlscrypt` that constructs a `Wrapper`, forces `sendSeq` to `0xFFFFFFFF` (exported test hook or same-package white-box test), and asserts the next `Wrap` call returns the rollover error rather than a wrapped-around sequence number.
 
 ## Info
 
@@ -251,15 +175,15 @@ func (w *Wrapper) Wrap(dst, header, plaintext []byte) ([]byte, error) {
 
 **File:** `cmd/gentestpki/main.go:100-171`
 
-**Issue:** `rootCert` is declared, assigned in both the `profileSmall` and `profileLarge` branches (`rootCert = caCert`), and then only ever referenced via the blank-identifier discard `_ = rootCert` (line 171) to satisfy the compiler's unused-variable check. Every certificate-issuing call in both branches uses the locally-scoped `caCert`/`rootCert`-equivalent variable directly (e.g. `generateECDSALeaf("govpn-interop-server", caCert, caKey, ...)`), never `rootCert` itself.
+**Issue:** `rootCert` is declared, assigned in both the `profileSmall` and `profileLarge` branches, and only ever referenced via `_ = rootCert` (line 171) to satisfy the compiler. Still present, unchanged since iteration 1.
 
 **Fix:** Remove the `rootCert` variable and its assignments entirely; nothing reads it.
 
 ### IN-02: `test/interop/server/main.go`'s `loadConfig` builds paths with string concatenation instead of `filepath.Join`
 
-**File:** `test/interop/server/main.go:132-184`
+**File:** `test/interop/server/main.go:133-184`
 
-**Issue:** Every path in `loadConfig` is built as `pkiDir + "/ca.crt"`, `pkiDir + "/server.crt"`, etc., rather than `filepath.Join(pkiDir, "ca.crt")`. This is inconsistent with the rest of the codebase (e.g. `cmd/gentestpki/main.go` uses `filepath.Join` throughout) and is fragile if `pkiDir` is ever supplied with a trailing slash or on a platform where `/` isn't the path separator (not a real concern for this Linux-only Docker harness today, but a needless inconsistency).
+**Issue:** Every path in `loadConfig` is built as `pkiDir + "/ca.crt"` etc. rather than `filepath.Join(pkiDir, "ca.crt")`, inconsistent with `cmd/gentestpki/main.go`'s use of `filepath.Join`. Still present, unchanged since iteration 1.
 
 **Fix:** Use `filepath.Join(pkiDir, "ca.crt")` etc. throughout.
 
@@ -267,22 +191,17 @@ func (w *Wrapper) Wrap(dst, header, plaintext []byte) ([]byte, error) {
 
 **File:** `internal/ctrlconn/conn.go:196-205`
 
-**Issue:** `flushAckOnly` checks `c.acks.Peek()` (true) and then calls `buildControlPacket`, which internally calls `c.acks.Drain()`. Between the `Peek()` and the `Drain()`, a concurrent `Write`'s own call to `buildControlPacket` (piggybacking ACKs on outgoing data) can drain the same pending ACKs first, leaving `flushAckOnly`'s own `Drain()` to return an empty slice — resulting in a wire `P_ACK_V1` packet transmitted with a zero-length ack array, wasting a datagram. This is low-impact (documented as acceptable behavior in the surrounding comment) and does not violate correctness, but it's worth tightening for cleanliness: skip transmission entirely if `buildControlPacket`'s drained ack count is empty.
+**Issue:** `flushAckOnly` checks `c.acks.Peek()` and then calls `buildControlPacket`, which internally calls `c.acks.Drain()`; a concurrent `Write` can drain the same pending ACKs first, leaving `flushAckOnly` to transmit a `P_ACK_V1` packet with a zero-length ack array. Low-impact, documented as acceptable in the surrounding comment. Still present, unchanged since iteration 1.
 
-**Fix:**
-```go
-func (c *Conn) flushAckOnly() {
-    if !c.acks.Peek() {
-        return
-    }
-    wireBytes, acked, err := c.buildControlPacketN(wire.OpAckV1, 0, nil)
-    if err != nil || acked == 0 {
-        return
-    }
-    _ = c.transmit(wireBytes)
-}
-```
-(or equivalent: have `buildControlPacket` report how many acks it actually drained, and skip the transmit if zero.)
+**Fix:** Have `buildControlPacket` report how many acks it actually drained and skip the transmit if zero.
+
+### IN-04: `test/interop/decode.go` and `test/interop/pcap.go` are missing the `//go:build interop` tag their only callers carry
+
+**File:** `test/interop/decode.go:1`, `test/interop/pcap.go:1`
+
+**Issue:** Every file in `test/interop` that calls `decodeCapture`/`ReadUDPPayloads` (`capture_test.go`, `golden_export.go`, `interop_test.go`) is gated behind `//go:build interop`, but `decode.go` and `pcap.go` themselves are not. The result is that `go vet ./...` / `staticcheck ./...` (run without `-tags interop`, i.e. the default/fast tier) compile these two files with no callers in that build, and `staticcheck` correctly flags `tunnelPort`, `decodedPacket`, and `decodeCapture` as unused (`U1000`) — a false-positive-looking dead-code warning that will keep resurfacing in default-tier static analysis and obscure genuine dead-code findings in the same package.
+
+**Fix:** Add `//go:build interop` to both files for consistency with the rest of the package, or intentionally document why they're meant to compile in both tiers if that's deliberate.
 
 ---
 
