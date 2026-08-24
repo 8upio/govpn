@@ -16,7 +16,7 @@ Four vertical slices take govpn from an empty module to a real, unmodified OpenV
 Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Handshake** - A real OpenVPN 2.6 client in Docker completes the TLS handshake against the library (completed 2026-08-24)
-- [ ] **Phase 2: Tunnel Up** - Client gets its IP, keys derive byte-exactly, and an encrypted ping round-trips
+- [x] **Phase 2: Tunnel Up** - Client gets its IP, keys derive byte-exactly, and an encrypted ping round-trips (completed 2026-08-25)
 - [ ] **Phase 3: In-Process Termination** - Ping, UDP and an HTTP page load through the tunnel via the userspace netstack
 - [ ] **Phase 4: Durable Sessions** - Sessions survive renegotiation and end cleanly without leaks
 
@@ -125,7 +125,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Handshake | 4/4 | Complete    | 2026-08-24 |
-| 2. Tunnel Up | 4/4 | In Progress|  |
+| 2. Tunnel Up | 4/4 | Complete    | 2026-08-25 |
 | 3. In-Process Termination | 0/TBD | Not started | - |
 | 4. Durable Sessions | 0/TBD | Not started | - |
 

@@ -20,19 +20,19 @@ Requirements for initial release. Each maps to roadmap phases.
 - [x] **CTRL-02**: Control-channel framing exposed as a `net.Conn` byte stream with fragmentation/reassembly, handling multi-KB TLS records (realistic cert chains)
 - [x] **CTRL-03**: A real OpenVPN 2.6 client completes the full TLS handshake (HARD_RESET_V2 through TLS established) with certificate-based mutual auth via stdlib `crypto/tls`
 - [x] **CTRL-04**: Key Method 2 exchange over TLS application data completes (random material, options string, peer-info parsing)
-- [ ] **CTRL-05**: PUSH_REQUEST/PUSH_REPLY works: client receives tunnel IP (`topology subnet`), explicit `cipher AES-256-GCM` push, keepalive parameters, and brings its tunnel up
+- [x] **CTRL-05**: PUSH_REQUEST/PUSH_REPLY works: client receives tunnel IP (`topology subnet`), explicit `cipher AES-256-GCM` push, keepalive parameters, and brings its tunnel up
 
 ### Data Channel
 
 - [x] **DATA-01**: P_DATA_V2 packets (24-bit peer-id) encrypt/decrypt with AES-256-GCM using correct nonce construction (packet-ID ‖ implicit IV) and header-as-AAD
 - [x] **DATA-02**: Data-channel replay protection (packet-ID window) drops replayed/out-of-window packets
-- [ ] **DATA-03**: Keepalive/ping magic packets are answered and filtered inside the library — never surfaced to the Session consumer
+- [x] **DATA-03**: Keepalive/ping magic packets are answered and filtered inside the library — never surfaced to the Session consumer
 
 ### Session & Server API
 
 - [x] **SESS-01**: Embedder can start a server with `ovpn.NewServer(Config{...}).Serve(net.PacketConn)` — TLS config, cipher, tunnel network, tls-crypt key, OnSession callback
-- [ ] **SESS-02**: Each connected client yields a `Session` (`io.ReadWriteCloser` for raw IP packets) with its assigned tunnel IP exposed
-- [ ] **SESS-03**: Tunnel IPs are assigned from a configurable `*net.IPNet` of any size (server = first host IP, `topology subnet`, 1 IP per client)
+- [x] **SESS-02**: Each connected client yields a `Session` (`io.ReadWriteCloser` for raw IP packets) with its assigned tunnel IP exposed
+- [x] **SESS-03**: Tunnel IPs are assigned from a configurable `*net.IPNet` of any size (server = first host IP, `topology subnet`, 1 IP per client)
 - [ ] **SESS-04**: Soft reset / key renegotiation works: session survives client-initiated renegotiation (default `reneg-sec 3600`) with key rollover and no traffic interruption beyond the protocol's own switchover
 - [ ] **SESS-05**: Sessions end cleanly: explicit-exit-notify is handled, idle sessions time out and are reaped, `Session.Close()` tears down state without goroutine leaks
 
@@ -100,12 +100,12 @@ Which phases cover which requirements. Updated during roadmap creation.
 | WIRE-02 | Phase 2 | Complete |
 | WIRE-03 | Phase 2 | Complete |
 | CTRL-04 | Phase 2 | Complete |
-| CTRL-05 | Phase 2 | Pending |
+| CTRL-05 | Phase 2 | Complete |
 | DATA-01 | Phase 2 | Complete |
 | DATA-02 | Phase 2 | Complete |
-| DATA-03 | Phase 2 | Pending |
-| SESS-02 | Phase 2 | Pending |
-| SESS-03 | Phase 2 | Pending |
+| DATA-03 | Phase 2 | Complete |
+| SESS-02 | Phase 2 | Complete |
+| SESS-03 | Phase 2 | Complete |
 | VRFY-03 | Phase 2 | Complete |
 | NET-01 | Phase 3 | Pending |
 | NET-02 | Phase 3 | Pending |
