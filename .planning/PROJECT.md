@@ -18,14 +18,14 @@ A real, unmodified OpenVPN 2.6 client can connect to a Go process embedding this
 - ✓ Certificate-based client auth (server cert + client CA via `Config.TLSConfig`) — Phase 1 (mutual TLS with CA-verified peer CN)
 - ✓ `srv.Serve(net.PacketConn)` server loop over UDP — Phase 1
 - ✓ Interop harness: pinned Docker OpenVPN 2.6 client, pcap assertions, golden vectors, loss injection, CI wiring — Phase 1
+- ✓ Data-channel key derivation (Key Method 2 PRF expansion), byte-exact against the C reference (`ssl.c`/`crypto.c` vectors) — Phase 2
+- ✓ Data-channel encryption/decryption with AES-256-GCM (classic non-epoch packet-id, replay window, fail-closed nonce counter) — Phase 2
+- ✓ Session management: per-client `Session` as `io.ReadWriteCloser` for raw IP packets, `OnSession` at tunnel-up, `AssignedIP()` exposed — Phase 2
+- ✓ Virtual tunnel-IP assignment from `Config.Network` (`topology subnet`, server = first host IP, sequential pool, release-on-close) — Phase 2 (real client logs "Initialization Sequence Completed"; encrypted pings round-trip through Session.Read/Write)
 
 ### Active
 
 **Core library (`ovpn`)**
-- [ ] Data-channel key derivation (Key Method 2 PRF expansion), verified byte-exact against the OpenVPN C reference (`ssl.c` / `crypto.c`)
-- [ ] Data-channel encryption/decryption with AES-256-GCM (fixed cipher, no NCP)
-- [ ] Session management: per-client `Session` as `io.ReadWriteCloser` for raw IP packets, `OnSession` callback, assigned tunnel IP exposed (Phase 1 delivered `Session` + `OnSession` for the control channel; IP-packet I/O is Phase 2)
-- [ ] Virtual tunnel-IP assignment from configurable `Config.Network` (`*net.IPNet`, any size up to /16-scale), server = first host IP; `topology subnet` pushed to clients (only topology supported)
 
 **Userspace netstack (subpackage)**
 - [ ] UDP support: `ListenUDP(port) (net.PacketConn, error)` — parse/build IP+UDP headers, demux by destination, existing socket-based code works unchanged
@@ -103,4 +103,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-08-24 after Phase 1 (Handshake) — real OpenVPN 2.6.14 client reaches TLS established over tls-crypt with mutual cert auth*
+*Last updated: 2026-08-25 after Phase 2 (Tunnel Up) — real client brings its tunnel up and encrypted IP packets round-trip through the embedder's Session*

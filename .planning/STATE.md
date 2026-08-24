@@ -63,6 +63,9 @@ Progress: [░░░░░░░░░░] 0%
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- Phase 2: Data-channel key direction is the mirror-opposite of tlscrypt's slot convention; P_DATA AEAD tag precedes ciphertext on the wire (explicit reorder around Go's Seal/Open)
+- Phase 2: handleDatagram branches on opcode class before length triage (data-channel min < 49-byte control min — CR-01); data packets route via peer-id-keyed dataSessions
+- Phase 2: Lock nesting order is sess.mu → srv.mu (WR-05 fix); allocate-then-publish in performPushExchange is atomic vs Close
 - Phase 1: Per-session tls-crypt Wrapper (mirrors C's per-tls_session tls_wrap_ctx) — a shared wrapper's replay window rejects concurrent clients
 - Phase 1: tls-crypt long-form packet-ID timestamp frozen per key (packet_id.c semantics); rollover gate fails closed
 - Phase 1: Server.handshakeWindow test-injectable (default 60s reference --hand-window)
@@ -78,7 +81,7 @@ None yet.
 
 ### Blockers/Concerns
 
-- [Phase 2]: Key Method 2 byte offsets and classic vs epoch packet-ID format must be verified against C source before data-channel code (see ROADMAP.md Research Flags)
+- (resolved in Phase 2) Key Method 2 byte offsets verified against C source in 02-RESEARCH.md before data-channel code
 
 ## Deferred Items
 
@@ -89,5 +92,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-08-24
-Stopped at: Session resumed, continuing autonomous run at Phase 2 planning
+Stopped at: Phase 2 complete (verified, validated, secured), ready to plan Phase 3
 Resume file: None
