@@ -203,6 +203,26 @@ type Session struct {
 	pendingRead []byte
 }
 
+// closing reports whether Close has already started (or finished) tearing
+// this session down, by checking whether stopCh is closed. Used by WR-05's
+// fix in ovpn.go (performPushExchange, runHandshake) to detect
+// enforceHandshakeWindow's timeout goroutine having raced ahead of the
+// bring-up sequence, so state is never published (or handed to
+// Config.OnSession) for a session that's already dead. Safe to call from
+// any goroutine without additional synchronization — receiving from a
+// closed channel is one of the few operations the Go memory model
+// guarantees is itself a synchronizing action (see stopCh's own docs; pump,
+// Read, and runKeepalive already rely on the identical select-on-stopCh
+// pattern with no separate lock).
+func (s *Session) closing() bool {
+	select {
+	case <-s.stopCh:
+		return true
+	default:
+		return false
+	}
+}
+
 // PushRequestSeen reports whether this session's client has sent its
 // PUSH_REQUEST and been answered with a PUSH_REPLY (RESEARCH Pattern 6).
 // Exists so an embedder or the interop harness can observe that the real
@@ -444,17 +464,29 @@ func (s *Session) Close() error {
 	s.stopOnce.Do(func() {
 		close(s.stopCh)
 		if s.srv != nil {
-			// Snapshot assignedIP/peerID/dataWrapper under mu (WR-03):
-			// performPushExchange, running on this session's own
-			// runHandshake goroutine, can still be writing these fields
-			// when enforceHandshakeWindow's timeout goroutine calls Close
-			// concurrently — reading them without the same lock the writer
-			// uses is a data race.
+			// WR-05: hold mu across BOTH the assignedIP/peerID/dataWrapper
+			// snapshot AND the dataSessions routing-entry delete below,
+			// nesting s.srv.mu inside mu rather than releasing mu in
+			// between (as a pre-WR-05 version of this method did).
+			// performPushExchange's own atomic publish (ovpn.go) uses the
+			// identical mu-then-srv.mu nesting for the same reason: without
+			// it, this snapshot could observe assignedIP/peerID/dataWrapper
+			// as not-yet-set (nothing to clean up here), and
+			// performPushExchange could then finish publishing everything
+			// — including the dataSessions entry — a moment later,
+			// pointing at a peer-id this Close call believed was already
+			// fully idle. Because stopOnce guarantees this closure body
+			// never runs a second time, that publish would never get
+			// cleaned up: a permanent leak of the pool IP/peer-id (WR-05
+			// consequence 1) and a permanently stale dataSessions entry
+			// (WR-05 consequence 2). Holding mu across both steps makes
+			// the two sides' critical sections mutually exclusive as a
+			// whole, so this snapshot always sees either nothing published
+			// yet, or everything published — never a partial state.
 			s.mu.Lock()
 			assignedIP := s.assignedIP
 			peerID := s.peerID
 			dataWrapper := s.dataWrapper
-			s.mu.Unlock()
 
 			// Remove the dataSessions routing entry BEFORE releasing
 			// peerID back to the pool (WR-04): pool.release makes peerID
@@ -472,6 +504,8 @@ func (s *Session) Close() error {
 				}
 				s.srv.mu.Unlock()
 			}
+			s.mu.Unlock()
+
 			if assignedIP != nil && s.srv.pool != nil {
 				s.srv.pool.release(assignedIP, peerID)
 			}

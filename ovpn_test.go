@@ -616,6 +616,93 @@ func TestPerformPushExchangeAnswersBufferedRetransmitWithSameIP(t *testing.T) {
 	}
 }
 
+// TestPerformPushExchangeReleasesAllocationWhenSessionAlreadyClosing is
+// WR-05's regression test: enforceHandshakeWindow's timeout goroutine can
+// call sess.Close() concurrently with performPushExchange at any point up
+// to sess.doneCh closing. This forces Close to have already run to
+// completion by the time performPushExchange reaches the point where it
+// would otherwise publish sess.assignedIP/peerID/dataWrapper and the
+// srv.dataSessions routing entry — the same outcome enforceHandshakeWindow
+// landing "anywhere before w.Write(reply) returns" produces, made
+// deterministic here by calling the real, idempotent sess.Close() before
+// performPushExchange ever runs rather than depending on goroutine
+// scheduling. Before the fix, performPushExchange never consulted
+// sess.stopCh at all: it would allocate, publish every field, publish the
+// dataSessions routing entry, start the keepalive goroutine, and return nil
+// regardless — permanently leaking the pool IP/peer-id (nothing else would
+// ever release it, since Close's own stopOnce.Do already ran) and leaving a
+// permanently stale srv.dataSessions entry. This test fails against that
+// code: performPushExchange returns nil, sess.assignedIP/dataWrapper end up
+// non-nil, srv.dataSessions gains an entry, and the network's sole
+// allocatable address never becomes allocatable again.
+func TestPerformPushExchangeReleasesAllocationWhenSessionAlreadyClosing(t *testing.T) {
+	_, network, err := net.ParseCIDR("10.60.0.0/30") // exactly one allocatable client address/peer-id
+	if err != nil {
+		t.Fatalf("parse network: %v", err)
+	}
+	pool, err := newIPPool(network)
+	if err != nil {
+		t.Fatalf("newIPPool: %v", err)
+	}
+
+	srv := &Server{
+		pool:         pool,
+		cfg:          Config{Network: network},
+		sessions:     make(map[sessionKey]*Session),
+		dataSessions: make(map[uint32]*Session),
+	}
+
+	dataKeys, err := keyderiv.NewKey2(make([]byte, 256))
+	if err != nil {
+		t.Fatalf("NewKey2: %v", err)
+	}
+	sess := &Session{
+		tlsReader: bufio.NewReader(strings.NewReader(pushRequestLiteral + "\x00")),
+		dataKeys:  dataKeys,
+		srv:       srv,
+		stopCh:    make(chan struct{}),
+	}
+
+	// Simulates enforceHandshakeWindow's timeout goroutine winning the
+	// race entirely: sess.assignedIP/peerID/dataWrapper are all still
+	// unset, so this Close call's own cleanup is a no-op (nothing to
+	// release yet) — exactly the state a real timeout-triggered Close
+	// would find if it ran before performPushExchange even called
+	// s.pool.allocate(). What's under test is what performPushExchange
+	// does AFTER this, once its own allocate() call succeeds and it
+	// checks sess.closing() before publishing anything.
+	if err := sess.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	var out strings.Builder
+	if err := srv.performPushExchange(sess, &out); err == nil {
+		t.Fatal("performPushExchange succeeded for an already-closing session; want an error")
+	}
+
+	if sess.assignedIP != nil {
+		t.Errorf("sess.assignedIP = %v, want nil — must not publish state for an already-closing session", sess.assignedIP)
+	}
+	if sess.dataWrapper != nil {
+		t.Error("sess.dataWrapper is set — must not publish state for an already-closing session")
+	}
+
+	srv.mu.Lock()
+	n := len(srv.dataSessions)
+	srv.mu.Unlock()
+	if n != 0 {
+		t.Errorf("srv.dataSessions has %d entries, want 0 — must not leak a routing entry for an already-closing session", n)
+	}
+
+	// The core WR-05 assertion: the IP/peer-id s.pool.allocate() handed out
+	// inside performPushExchange must have been released back to the pool,
+	// not permanently leaked — a second allocate() on this exactly-one-slot
+	// network must still succeed.
+	if _, _, err := pool.allocate(); err != nil {
+		t.Fatalf("pool.allocate() after performPushExchange: %v (the allocation performPushExchange made was never released back to the pool)", err)
+	}
+}
+
 // TestOnSessionDoesNotFireWhenPushNeverArrives is 02-02-PLAN.md Task 3's
 // proof that runHandshake's doneCh close now covers the whole bring-up
 // sequence, not merely tls.Conn.Handshake() returning nil: a client that

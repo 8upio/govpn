@@ -529,6 +529,26 @@ func (s *Server) runHandshake(sess *Session) {
 
 	close(sess.doneCh)
 
+	// WR-05: performPushExchange's own atomic publish (guarded by its
+	// closing check) guarantees that if it returned nil here, either
+	// nothing was published (session was already closing) or everything
+	// was published consistently and any concurrent Close has already —
+	// or will still correctly — clean it up. That leaves exactly one gap
+	// this check closes: enforceHandshakeWindow's timeout goroutine can
+	// still call Close() in the narrow window AFTER performPushExchange's
+	// atomic publish committed but BEFORE control reaches here, which
+	// performPushExchange's own return value can't observe (it already
+	// returned nil). Re-check sess.stopCh once more, right before ever
+	// invoking OnSession, so D-08's "the Session handed to OnSession is
+	// immediately usable" contract holds even in that residual window —
+	// an already-closing session is treated exactly like a failed
+	// bring-up (Close is idempotent via stopOnce, so this second call is a
+	// no-op) rather than handed to the embedder.
+	if sess.closing() {
+		_ = sess.Close()
+		return
+	}
+
 	// D-08: OnSession fires only here — after Key Method 2 and the
 	// PUSH_REQUEST/PUSH_REPLY exchange have both completed and
 	// sess.assignedIP/sess.dataKeys are both live — so the Session handed
@@ -578,39 +598,74 @@ func (s *Server) performPushExchange(sess *Session, w io.Writer) error {
 			if err != nil {
 				return fmt.Errorf("ovpn: allocate tunnel IP: %w", err)
 			}
-			// Guarded by sess.mu (WR-03): enforceHandshakeWindow's timeout
-			// goroutine can call sess.Close(), which reads these same
-			// fields, concurrently with this assignment — sess.doneCh is
-			// deliberately not closed until this whole function returns.
-			sess.mu.Lock()
-			sess.assignedIP = ip
-			sess.peerID = peerID
-			sess.mu.Unlock()
 
-			// The data-channel Wrapper is constructed here, at the same
-			// point the tunnel IP/peer-id are assigned and before
-			// PUSH_REPLY is written — so it is live before OnSession ever
-			// fires (D-08) and before the peer-id this datagram was routed
-			// on could possibly reach the client. sess.dataKeys.ServerSlots
-			// already applies the data channel's own key-direction
-			// inversion (Pitfall 1) — do not re-derive it here.
+			// The data-channel Wrapper is constructed here, before the
+			// atomic publish below, at the same point the tunnel IP/
+			// peer-id are conceptually assigned — so it is live before
+			// OnSession ever fires (D-08) and before the peer-id this
+			// datagram was routed on could possibly reach the client.
+			// sess.dataKeys.ServerSlots already applies the data channel's
+			// own key-direction inversion (Pitfall 1) — do not re-derive
+			// it here. Built before the closing check below (rather than
+			// after, as pre-WR-05) so the fields, the data wrapper, and
+			// the dataSessions routing entry can all be published in one
+			// atomic step gated on that single check, instead of leaving
+			// gaps between separately-published pieces of state for
+			// enforceHandshakeWindow's Close to land in.
 			dataWrapper, err := datachan.NewWrapper(sess.dataKeys.ServerSlots(), peerID, dataChannelKeyID)
 			if err != nil {
+				s.pool.release(ip, peerID)
 				return fmt.Errorf("ovpn: build data-channel wrapper: %w", err)
 			}
-			sess.mu.Lock()
-			sess.dataWrapper = dataWrapper
-			sess.mu.Unlock()
-			sess.ipInbound = make(chan []byte, ipInboundQueueSize)
+			ipInbound := make(chan []byte, ipInboundQueueSize)
 
+			// WR-05: enforceHandshakeWindow's timeout goroutine can call
+			// sess.Close() concurrently at any point until sess.doneCh
+			// closes — i.e. for this entire function's duration — and
+			// Close's stopOnce.Do body only ever runs once. If it already
+			// ran (or is running right now), the IP/peer-id
+			// s.pool.allocate() just handed out above, and the
+			// dataSessions routing entry about to be published below,
+			// would otherwise never be released or removed: Close already
+			// snapshotted (empty) state and won't run its cleanup a second
+			// time. sess.closing() checks sess.stopCh, which Close closes
+			// as the very first thing inside stopOnce.Do, before anything
+			// else.
+			//
+			// Publishing assignedIP/peerID/dataWrapper AND the
+			// dataSessions entry as one atomic step gated on this check —
+			// held under sess.mu with s.mu (dataSessions' own lock) nested
+			// inside it, mirroring the identical nesting Close uses on its
+			// cleanup path — is what closes the race completely. The
+			// nesting matters, not just the check: releasing sess.mu
+			// between the fields write and the dataSessions write would
+			// let Close's own cleanup (guarded only by sess.mu, separately
+			// from s.mu) observe the fields as already published, release
+			// peerID back to the pool believing nothing else needs it, and
+			// hand that same peerID to a brand-new concurrent session —
+			// which this function would then clobber a moment later by
+			// finishing its own (by-then-stale) dataSessions publish.
+			sess.mu.Lock()
+			if sess.closing() {
+				sess.mu.Unlock()
+				s.pool.release(ip, peerID)
+				return errors.New("ovpn: session closed during push exchange")
+			}
+			sess.assignedIP = ip
+			sess.peerID = peerID
+			sess.dataWrapper = dataWrapper
+			sess.ipInbound = ipInbound
 			s.mu.Lock()
 			s.dataSessions[peerID] = sess
 			s.mu.Unlock()
+			sess.mu.Unlock()
 
 			// D-11: the keepalive goroutine starts here too — alongside
 			// the data wrapper, before PUSH_REPLY is written and well
 			// before OnSession fires — emitting on exactly the schedule
-			// buildPushReply below pushes to the client.
+			// buildPushReply below pushes to the client. Only reached once
+			// the atomic publish above has committed, so it can never
+			// start for a session the closing check just decided is dead.
 			sess.startKeepalive()
 		}
 
