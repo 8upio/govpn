@@ -12,20 +12,20 @@ A real, unmodified OpenVPN 2.6 client can connect to a Go process embedding this
 
 ### Validated
 
-(None yet — ship to validate)
+- ✓ Control-channel framing (opcode / session-ID / packet-ID parsing) implemented as a `net.Conn`, with the OpenVPN reliability layer (ACK / retransmission) — Phase 1
+- ✓ TLS handshake via stdlib `crypto/tls` layered on the framing conn (`tls.Server(customConn, tlsConfig)`) — no hand-rolled TLS — Phase 1
+- ✓ tls-crypt support (control-channel encryption + HMAC wrapping) — Phase 1 (verified on the wire against a real OpenVPN 2.6.14 client)
+- ✓ Certificate-based client auth (server cert + client CA via `Config.TLSConfig`) — Phase 1 (mutual TLS with CA-verified peer CN)
+- ✓ `srv.Serve(net.PacketConn)` server loop over UDP — Phase 1
+- ✓ Interop harness: pinned Docker OpenVPN 2.6 client, pcap assertions, golden vectors, loss injection, CI wiring — Phase 1
 
 ### Active
 
 **Core library (`ovpn`)**
-- [ ] Control-channel framing (opcode / session-ID / packet-ID parsing) implemented as a `net.Conn`, with the OpenVPN reliability layer (ACK / retransmission)
-- [ ] TLS handshake via stdlib `crypto/tls` layered on the framing conn (`tls.Server(customConn, tlsConfig)`) — no hand-rolled TLS
-- [ ] tls-crypt support (control-channel encryption + HMAC wrapping) — realistic OpenVPN 2.6 production configs work
-- [ ] Certificate-based client auth (server cert + client CA via `Config.TLSConfig`)
 - [ ] Data-channel key derivation (Key Method 2 PRF expansion), verified byte-exact against the OpenVPN C reference (`ssl.c` / `crypto.c`)
 - [ ] Data-channel encryption/decryption with AES-256-GCM (fixed cipher, no NCP)
-- [ ] Session management: per-client `Session` as `io.ReadWriteCloser` for raw IP packets, `OnSession` callback, assigned tunnel IP exposed
+- [ ] Session management: per-client `Session` as `io.ReadWriteCloser` for raw IP packets, `OnSession` callback, assigned tunnel IP exposed (Phase 1 delivered `Session` + `OnSession` for the control channel; IP-packet I/O is Phase 2)
 - [ ] Virtual tunnel-IP assignment from configurable `Config.Network` (`*net.IPNet`, any size up to /16-scale), server = first host IP; `topology subnet` pushed to clients (only topology supported)
-- [ ] `srv.Serve(net.PacketConn)` server loop over UDP
 
 **Userspace netstack (subpackage)**
 - [ ] UDP support: `ListenUDP(port) (net.PacketConn, error)` — parse/build IP+UDP headers, demux by destination, existing socket-based code works unchanged
@@ -103,4 +103,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-08-22 after initialization*
+*Last updated: 2026-08-24 after Phase 1 (Handshake) — real OpenVPN 2.6.14 client reaches TLS established over tls-crypt with mutual cert auth*

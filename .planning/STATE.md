@@ -62,6 +62,10 @@ Progress: [░░░░░░░░░░] 0%
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- Phase 1: Per-session tls-crypt Wrapper (mirrors C's per-tls_session tls_wrap_ctx) — a shared wrapper's replay window rejects concurrent clients
+- Phase 1: tls-crypt long-form packet-ID timestamp frozen per key (packet_id.c semantics); rollover gate fails closed
+- Phase 1: Server.handshakeWindow test-injectable (default 60s reference --hand-window)
+- Phase 1: Config.OnSession panics recovered; observable via Config.OnSessionPanic hook
 - Init: tls-crypt in v1 (not plain TLS/tls-auth); renegotiation (soft reset) pulled INTO v1 (Phase 4)
 - Init: Userspace netstack gets minimal server-side TCP for the tunnel-only example web server
 - Init: Docker interop harness with synthetic packet loss is a v1 requirement, built in Phase 1
@@ -83,6 +87,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-08-22 22:15
-Stopped at: Project initialization complete (ROADMAP.md created)
+Last session: 2026-08-24
+Stopped at: Phase 1 complete (verified, validated, secured), ready to plan Phase 2
 Resume file: None
