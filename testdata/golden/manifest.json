@@ -27,6 +27,36 @@
     "file": "005-server-to-client-final-small.bin",
     "direction": "server-\u003eclient",
     "opcode": 4,
-    "packet_id": 10
+    "packet_id": 12
+  },
+  {
+    "file": "006-client-to-server-icmp-echo-request.bin",
+    "direction": "client-\u003eserver",
+    "opcode": 9,
+    "packet_id": 0,
+    "peer_id": 0,
+    "data_packet_id": 2,
+    "key_file": "data-channel.key",
+    "sender_slot": 0
+  },
+  {
+    "file": "007-server-to-client-icmp-echo-reply.bin",
+    "direction": "server-\u003eclient",
+    "opcode": 9,
+    "packet_id": 0,
+    "peer_id": 0,
+    "data_packet_id": 1,
+    "key_file": "data-channel.key",
+    "sender_slot": 1
+  },
+  {
+    "file": "008-server-to-client-ping-keepalive.bin",
+    "direction": "server-\u003eclient",
+    "opcode": 9,
+    "packet_id": 0,
+    "peer_id": 0,
+    "data_packet_id": 10,
+    "key_file": "data-channel.key",
+    "sender_slot": 1
   }
 ]

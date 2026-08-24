@@ -1,0 +1,9 @@
+{
+  "client_pre_master": "3ae6f500379493cc571fa6f47ed63ac0da56392e757b4ac6bddc00d0ab86b77cf030859a6989639e75f310456ac7d4a5",
+  "client_random1": "4487d480d8f5117e7642c440ee44ff64cd3b567dd43a5ba66f28fb43a2886ba8",
+  "client_random2": "517fb0c8120ffd717e65521d452be98427b83256afa9a090e34a4362a12c5ed3",
+  "server_random1": "a3cb38bc5aa728dc76bddab3d839e4aa06d77425d9a7dd09dba40e1103247328",
+  "server_random2": "e525d89d0a35fd731095edb772ed4ffce6a411b9bf449da3f98e6aaac0fef086",
+  "client_session_id": "411d5a7906c0f888",
+  "server_session_id": "871315a7128f95e2"
+}

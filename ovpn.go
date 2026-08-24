@@ -631,6 +631,7 @@ func (s *Server) performKeyMethod2Exchange(sess *Session, tlsConn *tls.Conn) err
 	if err != nil {
 		return fmt.Errorf("ovpn: write server Key Method 2: %w", err)
 	}
+	sess.serverKM = serverKM
 
 	src := &keyderiv.KeySource2{
 		Client: *clientKM,

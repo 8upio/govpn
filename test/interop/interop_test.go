@@ -70,6 +70,8 @@ type scenarioResult struct {
 	capturePath    string
 	keyPath        string
 	privilegeCheck string // `docker inspect` output, captured while the server container still exists
+	dataKeysPath   string // this scenario's own preserved copy of the server's /tmp/datachan-keys.json (02-04-PLAN.md Task 2)
+	keyMethod2Path string // this scenario's own preserved copy of the server's /tmp/datachan-km2.json (02-04-PLAN.md Task 2)
 }
 
 // scenarioResults is populated once, in TestMain, before any Test function
@@ -116,7 +118,7 @@ func TestMain(m *testing.M) {
 			os.Exit(1)
 		}
 		outDir := filepath.Join(root, "testdata", "golden")
-		if err := ExportGolden(res.capturePath, res.keyPath, outDir); err != nil {
+		if err := ExportGolden(res.capturePath, res.keyPath, res.dataKeysPath, res.keyMethod2Path, outDir); err != nil {
 			fmt.Fprintln(os.Stderr, "interop: export golden vectors:", err)
 			os.Exit(1)
 		}
@@ -188,6 +190,24 @@ func runScenario(root, interopDir string, sc scenario) scenarioResult {
 		}
 	}
 
+	// Retrieve the server's own data-channel key export and Key Method 2
+	// export via `docker cp` — WHILE the container still exists, the same
+	// ordering constraint the privilege check above already established
+	// (02-04-PLAN.md Task 2). A copy failure is non-fatal to the scenario
+	// itself (every scenario writes these; only -update-golden's own
+	// clean-large run ever reads them back), so it is logged, not folded
+	// into upErr.
+	dataKeysPath := filepath.Join(interopDir, "captures", sc.name+"-datachan-keys.json")
+	if cpErr := dockerCopyFromContainer("govpn-interop-server", "/tmp/datachan-keys.json", dataKeysPath); cpErr != nil {
+		fmt.Fprintf(os.Stderr, "interop: docker cp data-channel key export (%s): %v\n", sc.name, cpErr)
+		dataKeysPath = ""
+	}
+	keyMethod2Path := filepath.Join(interopDir, "captures", sc.name+"-datachan-km2.json")
+	if cpErr := dockerCopyFromContainer("govpn-interop-server", "/tmp/datachan-km2.json", keyMethod2Path); cpErr != nil {
+		fmt.Fprintf(os.Stderr, "interop: docker cp Key Method 2 export (%s): %v\n", sc.name, cpErr)
+		keyMethod2Path = ""
+	}
+
 	downArgs := append(append([]string{"compose"}, composeFiles...), "down", "--remove-orphans")
 	downCmd := exec.Command("docker", downArgs...)
 	downCmd.Dir = interopDir
@@ -201,7 +221,22 @@ func runScenario(root, interopDir string, sc scenario) scenarioResult {
 		capturePath:    capturePath,
 		keyPath:        keyPath,
 		privilegeCheck: privilegeCheck,
+		dataKeysPath:   dataKeysPath,
+		keyMethod2Path: keyMethod2Path,
 	}
+}
+
+// dockerCopyFromContainer runs `docker cp container:srcPath dstPath`,
+// retrieving a file from inside a still-running (or already-stopped but not
+// yet removed) container's own filesystem without needing a bind-mounted
+// host volume or any particular in-container UID/permission alignment
+// (02-04-PLAN.md Task 2).
+func dockerCopyFromContainer(container, srcPath, dstPath string) error {
+	out, err := exec.Command("docker", "cp", container+":"+srcPath, dstPath).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("docker cp %s:%s %s: %w: %s", container, srcPath, dstPath, err, out)
+	}
+	return nil
 }
 
 func copyFile(src, dst string) error {
@@ -535,7 +570,7 @@ func assertCertificateFlightFragmented(t *testing.T, res scenarioResult) {
 	if err != nil {
 		t.Fatalf("read tls-crypt key %s: %v", res.keyPath, err)
 	}
-	packets, err := decodeCapture(res.capturePath, key, tunnelPort)
+	packets, err := decodeCapture(res.capturePath, key, tunnelPort, nil)
 	if err != nil {
 		t.Fatalf("decode capture %s: %v", res.capturePath, err)
 	}
@@ -643,7 +678,7 @@ func logRetransmissionEvidence(t *testing.T, res scenarioResult) {
 		t.Logf("retransmission evidence: read tls-crypt key %s: %v", res.keyPath, err)
 		return
 	}
-	packets, err := decodeCapture(res.capturePath, key, tunnelPort)
+	packets, err := decodeCapture(res.capturePath, key, tunnelPort, nil)
 	if err != nil {
 		t.Logf("retransmission evidence: decode capture %s: %v", res.capturePath, err)
 		return

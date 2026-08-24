@@ -166,7 +166,27 @@ func (w *Wrapper) Seal(dst, plaintext []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	return w.sealWithSeq(dst, seq, plaintext), nil
+}
 
+// SealWithPacketID performs the identical seal algorithm as Seal but with
+// an explicit packetID instead of auto-incrementing w.sendSeq, and never
+// touches sendSeq — so it can never be mistaken for the live-traffic path.
+// Reproduction-only: it exists so a byte-exact re-seal of a captured
+// historical vector (whose packet ID is fixed by the capture, not the next
+// one this Wrapper would otherwise assign) is possible at all — mirroring
+// internal/tlscrypt.Wrapper.WrapWithPacketID's own precedent
+// (01-04-SUMMARY.md Deviation 4, 02-04-PLAN.md Task 2).
+func (w *Wrapper) SealWithPacketID(dst []byte, packetID uint32, plaintext []byte) []byte {
+	return w.sealWithSeq(dst, packetID, plaintext)
+}
+
+// sealWithSeq is Seal/SealWithPacketID's shared implementation: build the
+// header, assemble the nonce, seal via the AEAD, and reorder Go's own
+// ciphertext||tag convention into the wire's tag||ciphertext order
+// (Pitfall 2) — the single seam both callers go through, so the reorder is
+// tested once, not duplicated.
+func (w *Wrapper) sealWithSeq(dst []byte, seq uint32, plaintext []byte) []byte {
 	var header [headerSize]byte
 	header[0] = byte(wire.OpDataV2)<<3 | w.keyID&0x07
 	header[offPeerID+0] = byte(w.peerID >> 16)
@@ -187,7 +207,7 @@ func (w *Wrapper) Seal(dst, plaintext []byte) ([]byte, error) {
 	dst = append(dst, header[:]...)
 	dst = append(dst, tag...)
 	dst = append(dst, ciphertext...)
-	return dst, nil
+	return dst
 }
 
 // SealPing seals the 16-byte ping keepalive magic (ping.go's pingMagic) as

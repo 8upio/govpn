@@ -125,6 +125,16 @@ type Session struct {
 	// retained only for diagnostics after DeriveKeys has consumed it.
 	clientKM *keyderiv.KeySource
 
+	// serverKM is the server's own Key Method 2 random1/random2 (mirroring
+	// clientKM above) — the reference server never populates a pre_master
+	// (RESEARCH Pattern 3: the server contributes no pre-master entropy),
+	// so this only ever holds random1/random2. Retained only so a
+	// debug/test harness can independently re-derive this session's
+	// data-channel keys via DebugKeyMethod2Material below (02-04-PLAN.md
+	// Task 2, WIRE-03 against live evidence) — the production code path
+	// never reads it back.
+	serverKM *keyderiv.KeySource
+
 	// pushRequested records whether this session's client has sent its
 	// PUSH_REQUEST and been answered with PUSH_REPLY (ovpn.go's
 	// performPushExchange). It remains an atomic.Bool, matching plan
@@ -216,6 +226,40 @@ func (s *Session) AssignedIP() net.IP {
 // is diagnostic-only in the same spirit as PushRequestSeen above.
 func (s *Session) PeerID() uint32 {
 	return s.peerID
+}
+
+// DebugKeyMethod2Material returns this session's raw Key Method 2 seed
+// material (the exchanged pre_master/random1/random2 halves, in
+// keyderiv.KeySource2's own shape) and the client/server control-channel
+// session IDs DeriveKeys consumed to derive dataKeys, so a test harness can
+// independently re-run keyderiv.DeriveKeys and confirm byte-identical
+// reproduction against a real client's own captured exchange (02-04-PLAN.md
+// Task 2's golden-vector verification, WIRE-03 against live evidence, not
+// only against the reference's own PRF test vector). ok is false until Key
+// Method 2 has completed. This is a debug/test-only accessor — a
+// production embedder has no reason to call it, and the library itself
+// never reads this material back after performKeyMethod2Exchange has
+// already consumed it to derive dataKeys.
+func (s *Session) DebugKeyMethod2Material() (src keyderiv.KeySource2, clientSID, serverSID [wire.SessionIDSize]byte, ok bool) {
+	if s.clientKM == nil || s.serverKM == nil {
+		return keyderiv.KeySource2{}, clientSID, serverSID, false
+	}
+	return keyderiv.KeySource2{Client: *s.clientKM, Server: *s.serverKM}, s.clientSessionID, s.SessionID, true
+}
+
+// DebugDataKeys returns this session's derived per-direction data-channel
+// key material from the server's own perspective
+// (keyderiv.Key2.ServerSlots), so a test harness can build its own
+// internal/datachan.Wrapper to independently decode this session's
+// data-channel traffic — e.g. golden-vector export/verification
+// (02-04-PLAN.md Task 2). ok is false until Key Method 2 has completed
+// (dataKeys != nil). Debug/test-only, mirroring DebugKeyMethod2Material
+// above.
+func (s *Session) DebugDataKeys() (keys keyderiv.DataKeys, ok bool) {
+	if s.dataKeys == nil {
+		return keyderiv.DataKeys{}, false
+	}
+	return s.dataKeys.ServerSlots(), true
 }
 
 // Read delivers exactly one raw, decrypted IP packet per call (D-05):
