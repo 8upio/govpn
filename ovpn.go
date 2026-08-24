@@ -13,6 +13,7 @@
 package ovpn
 
 import (
+	"bufio"
 	"crypto/rand"
 	"crypto/tls"
 	"errors"
@@ -23,6 +24,7 @@ import (
 	"time"
 
 	"github.com/8upio/govpn/internal/ctrlconn"
+	"github.com/8upio/govpn/internal/keyderiv"
 	"github.com/8upio/govpn/internal/reliable"
 	"github.com/8upio/govpn/internal/tlscrypt"
 	"github.com/8upio/govpn/internal/wire"
@@ -92,6 +94,21 @@ const (
 	// UDP datagram would) rather than backing up Serve.
 	inboundQueueSize = 32
 )
+
+// serverKM2Options is the options string this server sends in its own Key
+// Method 2 message. Per RESEARCH.md Pitfall 4, options_cmp_equal
+// (ssl.c:2498) only warns on mismatch (gated on --opt-verify, which this
+// project's clients don't set) — a short, honest string describing this
+// server's actual fixed configuration is sufficient for interop; there is
+// no need to reproduce the reference's exact OCC options-string format
+// byte-for-byte.
+const serverKM2Options = "V4,dev-type tun,link-mtu 1541,tun-mtu 1500,proto UDPv4,cipher AES-256-GCM,auth SHA1,keysize 256,key-method 2,tls-server"
+
+// pushRequestLiteral is the exact bytes a real OpenVPN client sends to
+// request its tunnel configuration: the literal string "PUSH_REQUEST" plus
+// one trailing NUL byte, 13 bytes total, unlike Key Method 2's own
+// length-prefixed field framing (RESEARCH Pattern 6, push.c:567,1089).
+var pushRequestLiteral = []byte("PUSH_REQUEST\x00")
 
 // sessionKey identifies a client by the pair the reference dispatches on:
 // remote UDP address and 8-byte session ID (tls_pre_decrypt_lite,
@@ -357,14 +374,14 @@ func (sess *Session) pump() {
 
 // runHandshake runs crypto/tls, unmodified, over sess's control-channel
 // Conn. Success is exactly Handshake() returning nil plus a populated
-// verified peer CommonName — not the reference's S_ACTIVE state (which
-// additionally requires Key Method 2, Phase 2 scope), and not merely having
+// verified peer CommonName — not the reference's S_ACTIVE state, which
+// additionally requires Key Method 2 (this plan) — and not merely having
 // received the client's reset (RESEARCH Pitfall 5). Once Handshake returns
-// nil, Config.OnSession is invoked exactly once. TLS application data that
-// arrives after that point — the client's own Key Method 2 payload — is the
-// client's protocol-correct next step; Session.conn simply buffers it
-// unread (see internal/ctrlconn.Conn.Deliver and Read), and this goroutine
-// never calls Read again, so it is never disturbed.
+// nil, this goroutine performs the Key Method 2 exchange (D-15: a
+// bufio.Reader scoped to this function's continuation, not a modification
+// of internal/ctrlconn.Conn) before Config.OnSession is invoked. A session
+// that cannot complete the Key Method 2 exchange is dead: sess.Close is
+// called and OnSession never fires for it.
 func (s *Server) runHandshake(sess *Session) {
 	tlsConn := tls.Server(sess.conn, s.cfg.TLSConfig)
 	err := tlsConn.Handshake()
@@ -380,9 +397,57 @@ func (s *Server) runHandshake(sess *Session) {
 	if len(state.PeerCertificates) > 0 {
 		sess.PeerCN = state.PeerCertificates[0].Subject.CommonName
 	}
+
+	if err := s.performKeyMethod2Exchange(sess, tlsConn); err != nil {
+		_ = sess.Close()
+		return
+	}
+
 	if s.cfg.OnSession != nil {
 		s.callOnSession(sess)
 	}
+}
+
+// performKeyMethod2Exchange runs the Key Method 2 exchange over tlsConn,
+// matching the reference server's own state-machine branch (tls_process,
+// ssl.c:3002-3031: server is "Receive Key" at S_START, "Send Key" at
+// S_GOT_KEY — the opposite order from the client, which already wrote its
+// own message immediately after its handshake completed, per 01-03's
+// documented deferral). It wraps tlsConn in a bufio.Reader retained on
+// sess.tlsReader (D-15) so plan 02-02's PUSH_REQUEST continuation reads
+// from the same buffered stream rather than losing bytes to a second
+// reader. On success, sess.dataKeys holds the derived 256-byte key
+// expansion.
+func (s *Server) performKeyMethod2Exchange(sess *Session, tlsConn *tls.Conn) error {
+	sess.tlsReader = bufio.NewReader(tlsConn)
+
+	clientKM, _, err := keyderiv.ReadClientKeyMethod2(sess.tlsReader)
+	if err != nil {
+		return fmt.Errorf("ovpn: read client Key Method 2: %w", err)
+	}
+	sess.clientKM = clientKM
+
+	serverKM, err := keyderiv.WriteServerKeyMethod2(tlsConn, serverKM2Options)
+	if err != nil {
+		return fmt.Errorf("ovpn: write server Key Method 2: %w", err)
+	}
+
+	src := &keyderiv.KeySource2{
+		Client: *clientKM,
+		Server: *serverKM,
+	}
+	// wire.SessionID / Session.SessionID are the same 8-byte
+	// control-channel session IDs DeriveKeys wants (server's own
+	// perspective: clientSID = the client's session ID we received,
+	// serverSID = our own — ssl.c:1586-1589); the pointer conversions
+	// below are between types with identical underlying [8]byte layout,
+	// no new session-ID concept is introduced.
+	dataKeys, err := keyderiv.DeriveKeys(src, (*[8]byte)(&sess.clientSessionID), (*[8]byte)(&sess.SessionID))
+	if err != nil {
+		return fmt.Errorf("ovpn: derive data-channel keys: %w", err)
+	}
+	sess.dataKeys = dataKeys
+	return nil
 }
 
 // callOnSession invokes Config.OnSession with panic recovery: this runs on

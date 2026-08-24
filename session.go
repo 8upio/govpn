@@ -1,6 +1,7 @@
 package ovpn
 
 import (
+	"bufio"
 	"crypto/tls"
 	"errors"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/8upio/govpn/internal/ctrlconn"
+	"github.com/8upio/govpn/internal/keyderiv"
 	"github.com/8upio/govpn/internal/tlscrypt"
 	"github.com/8upio/govpn/internal/wire"
 )
@@ -95,6 +97,32 @@ type Session struct {
 	// stopOnce guards stopCh so repeated or concurrent calls to Close are
 	// safe and idempotent.
 	stopOnce sync.Once
+
+	// tlsReader is a bufio.Reader wrapping the session's tls.Conn, scoped
+	// to runHandshake's Key Method 2 / PUSH_REQUEST continuation (D-15).
+	// It is created once, in runHandshake, and retained here so plan
+	// 02-02's PUSH_REQUEST/PUSH_REPLY continuation reads from the SAME
+	// buffered stream rather than starting a second bufio.Reader over
+	// tlsConn — a second reader would lose whatever bytes the first one
+	// already pulled into its internal buffer. internal/ctrlconn.Conn
+	// itself is not modified by this plan.
+	tlsReader *bufio.Reader
+
+	// dataKeys is this session's derived 256-byte Key Method 2 key
+	// expansion, per-session like wrapper above, never server-global. It
+	// is the single input plan 02-03's internal/datachan.Wrapper will
+	// consume. nil until the Key Method 2 exchange completes.
+	dataKeys *keyderiv.Key2
+
+	// clientKM is the client's own Key Method 2 pre_master/random1/random2,
+	// retained only for diagnostics after DeriveKeys has consumed it.
+	clientKM *keyderiv.KeySource
+
+	// pushRequested records whether this session's client has sent its
+	// PUSH_REQUEST (observed, read and discarded — plan 02-02 owns
+	// answering it with PUSH_REPLY). Diagnostic only in this plan (Task 3's
+	// interop gate).
+	pushRequested bool
 }
 
 // Read is a placeholder: Phase 1 has no data channel to read raw IP packets
