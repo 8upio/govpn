@@ -20,7 +20,14 @@ set -eu
 # is pushed or needed — the client just pings an address inside its own
 # pushed subnet.
 TUNNEL_SERVER_IP="${TUNNEL_SERVER_IP:-10.8.0.1}"
-PING_COUNT="${PING_COUNT:-4}"
+# PING_COUNT/interval: 02-04-PLAN.md Task 1 widened this from 4 packets at a
+# 0.2s interval to 10 packets at a 1s interval (~10s total) so the lossy
+# scenario's ping spans several of docker-compose.lossy.yml's loss events
+# rather than completing inside a single short window — a multi-second ping
+# is what makes "at least one reply returned" (the lossy scenario's tolerant
+# assertion, VRFY-03) a meaningful proof of tunnel survival rather than a
+# coin flip on whichever single packet happened to survive.
+PING_COUNT="${PING_COUNT:-10}"
 
 CAPTURE_DIR="${CAPTURE_DIR:-/captures}"
 CAPTURE_FILE="${CAPTURE_DIR}/interop.pcap"
@@ -95,14 +102,15 @@ done
 
 if ip addr show tun0 2>/dev/null | grep -q 'inet '; then
 	echo "entrypoint: tun0 is up, pinging server tunnel IP $TUNNEL_SERVER_IP through it"
-	# -i 0.2 (the fastest interval iputils-ping permits a non-root caller;
-	# this container runs as root anyway, per docker-compose.yml's own
-	# comment on the client service, so even smaller intervals would be
-	# permitted, but 0.2 is already comfortably fast) keeps the whole ping
-	# well under test/interop/server/main.go's postHandshakeSurvival
+	# -i 1 (one request per second) over PING_COUNT requests spans several
+	# seconds of the lossy scenario's loss/reorder events (02-04-PLAN.md
+	# Task 1) rather than completing inside one short burst, while staying
+	# well under test/interop/server/main.go's 20s postHandshakeSurvival
 	# window, so the server doesn't exit — ending the compose run via
 	# --abort-on-container-exit — before this prints its summary line.
-	if ping -c "$PING_COUNT" -i 0.2 -W 2 "$TUNNEL_SERVER_IP"; then
+	# -W 2 bounds the per-reply wait so a dropped echo is retried on the
+	# next second's request rather than stalling the whole sequence.
+	if ping -c "$PING_COUNT" -i 1 -W 2 "$TUNNEL_SERVER_IP"; then
 		echo "entrypoint: ping to $TUNNEL_SERVER_IP succeeded"
 	else
 		echo "entrypoint: ping to $TUNNEL_SERVER_IP failed (see ping output above)"

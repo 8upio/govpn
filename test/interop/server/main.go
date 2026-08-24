@@ -39,12 +39,18 @@ import (
 // postHandshakeSurvival is how long the harness stays up after OnSession
 // fires before printing PASS and exiting — long enough for the real
 // client's Key Method 2 application data to arrive and be silently
-// buffered (proving the server doesn't error or reset on it), and —
-// 02-03-PLAN.md Task 1 — long enough for entrypoint.sh's own ping of the
-// server's tunnel IP (tun0 coming up, then several ICMP round trips) to
-// complete and print its summary line before this process exits and pulls
-// the whole compose run down via --abort-on-container-exit.
-const postHandshakeSurvival = 5 * time.Second
+// buffered (proving the server doesn't error or reset on it), and long
+// enough for entrypoint.sh's own ping of the server's tunnel IP (tun0
+// coming up, then the full ICMP round-trip sequence) to complete and print
+// its summary line before this process exits and pulls the whole compose
+// run down via --abort-on-container-exit. 02-04-PLAN.md Task 1 raised this
+// from 5s to 20s: VRFY-03's lossy-large assertions need entrypoint.sh's
+// ping widened from 4 packets at a 0.2s interval to ~10 packets at a 1s
+// interval (so the round trip spans several of docker-compose.lossy.yml's
+// loss events, not just one), and a 10-second ping needs headroom on top
+// of the tun0-up wait and scheduling jitter across all three scenarios,
+// not only the lossy one — this constant is shared, not per-scenario.
+const postHandshakeSurvival = 20 * time.Second
 
 func main() {
 	pkiDir := flag.String("pki", "/pki", "directory containing ca.crt, server.crt, server.key, tls-crypt.key")

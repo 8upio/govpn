@@ -59,16 +59,29 @@ func decodeCapture(capturePath string, key []byte, port uint16) ([]decodedPacket
 
 	out := make([]decodedPacket, 0, len(payloads))
 	for i, p := range payloads {
-		if len(p.Payload) < tlscrypt.OffCT {
-			return nil, fmt.Errorf("decode capture: payload %d (%s): length %d shorter than the tls-crypt prefix", i, p.Direction, len(p.Payload))
+		// Opcode class must be determined BEFORE any tls-crypt-specific
+		// length check: P_DATA_V1/P_DATA_V2 payloads are legitimately
+		// shorter than tlscrypt.OffCT (the data channel has its own,
+		// much shorter, 4-byte header + tag layout — RESEARCH Pattern 5),
+		// and 02-04-PLAN.md Task 1 extended the live ping round-trip to
+		// every scenario, so short data-channel packets now legitimately
+		// appear in every capture, not only clean-small's. Checking the
+		// tls-crypt minimum length first (as an earlier version of this
+		// function did) rejected every such packet as "too short" before
+		// ever reaching the data-channel skip below.
+		if len(p.Payload) < 1 {
+			return nil, fmt.Errorf("decode capture: payload %d (%s): empty payload", i, p.Direction)
 		}
-
 		opcode, _ := wire.ParseHeaderByte(p.Payload[0])
 		if !wire.ValidOpcode(opcode) {
 			return nil, fmt.Errorf("decode capture: payload %d (%s): header opcode %d outside the legal range", i, p.Direction, opcode)
 		}
 		if opcode == wire.OpDataV1 || opcode == wire.OpDataV2 {
 			continue
+		}
+
+		if len(p.Payload) < tlscrypt.OffCT {
+			return nil, fmt.Errorf("decode capture: payload %d (%s): length %d shorter than the tls-crypt prefix", i, p.Direction, len(p.Payload))
 		}
 
 		var w *tlscrypt.Wrapper
