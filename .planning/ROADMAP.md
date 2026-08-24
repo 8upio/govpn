@@ -68,7 +68,7 @@ Plans:
   4. Replayed and out-of-window data packets are dropped, and keepalive/ping magic packets are answered inside the library — the Session consumer never sees one
   5. The harness runs a lossy scenario (5–10% packet loss and reordering) in which handshake and ping round-trip both still succeed
 
-**Plans**: 1/4 plans executed
+**Plans**: 2/4 plans executed
 
 Plans:
 **Wave 1**
@@ -77,7 +77,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 02-02-PLAN.md — Tunnel up: PUSH_REQUEST/PUSH_REPLY, tunnel-IP pool, `Session.AssignedIP()`, `OnSession` moves past tunnel-up
+- [x] 02-02-PLAN.md — Tunnel up: PUSH_REQUEST/PUSH_REPLY, tunnel-IP pool, `Session.AssignedIP()`, `OnSession` moves past tunnel-up
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
@@ -125,7 +125,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Handshake | 4/4 | Complete    | 2026-08-24 |
-| 2. Tunnel Up | 1/4 | In Progress|  |
+| 2. Tunnel Up | 2/4 | In Progress|  |
 | 3. In-Process Termination | 0/TBD | Not started | - |
 | 4. Durable Sessions | 0/TBD | Not started | - |
 
