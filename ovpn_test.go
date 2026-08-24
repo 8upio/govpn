@@ -1710,3 +1710,81 @@ func TestPingEmissionDoesNotConsumeSessionWriteQuota(t *testing.T) {
 		t.Error("the timer-triggered ping never arrived on the wire")
 	}
 }
+
+// TestHandleDatagramAcceptsShortDataChannelPing is CR-01's regression test:
+// handleDatagram used to apply the control-channel's tls-crypt-derived
+// minDatagramSize (49 bytes) uniformly to every inbound datagram, including
+// P_DATA_V2 packets — which are never tls-crypt wrapped and can legitimately
+// be far shorter. A real client-to-server ping keepalive (D-11) seals to
+// exactly 40 bytes, so it used to be silently dropped by that gate before
+// handleDatagram ever inspected the opcode. This test drives a synthetic
+// 40-byte sealed client ping through the full Server.handleDatagram accept
+// path (not Session.handleDataPacket directly, which every other ping test
+// in this file exercises and which never touched the buggy gate) and proves
+// the packet actually reached Wrapper.Open server-side: a ping is absorbed
+// (D-11) and never observable via ipInbound, so the proof is indirect —
+// re-opening the identical bytes a second time must now be rejected as a
+// replay, which is only possible if the first delivery already advanced the
+// server's replay window.
+func TestHandleDatagramAcceptsShortDataChannelPing(t *testing.T) {
+	const peerID = 7
+
+	wrapper, err := datachan.NewWrapper(testSymmetricDataKeys(t), peerID, dataChannelKeyID)
+	if err != nil {
+		t.Fatalf("NewWrapper: %v", err)
+	}
+
+	pingSealed, err := wrapper.SealPing(nil)
+	if err != nil {
+		t.Fatalf("SealPing: %v", err)
+	}
+	if len(pingSealed) != 40 {
+		t.Fatalf("sealed ping is %d bytes, want 40 (CR-01's reproduction size)", len(pingSealed))
+	}
+	if len(pingSealed) >= minDatagramSize {
+		t.Fatalf("test fixture no longer reproduces CR-01: sealed ping (%d bytes) is not shorter than minDatagramSize (%d)", len(pingSealed), minDatagramSize)
+	}
+
+	serverPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("server listen: %v", err)
+	}
+	defer serverPC.Close()
+
+	sess := &Session{
+		dataWrapper: wrapper,
+		ipInbound:   make(chan []byte, ipInboundQueueSize),
+		stopCh:      make(chan struct{}),
+	}
+	s := &Server{
+		pc:           serverPC,
+		sessions:     make(map[sessionKey]*Session),
+		dataSessions: map[uint32]*Session{peerID: sess},
+	}
+
+	clientAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:1")
+	if err != nil {
+		t.Fatalf("resolve addr: %v", err)
+	}
+
+	// Drive the full accept path.
+	s.handleDatagram(serverPC, clientAddr, pingSealed)
+
+	// The ping itself must never surface on ipInbound (D-11) — assert that
+	// separately from the replay proof below, so a future regression that
+	// starts delivering pings as ordinary payloads is also caught.
+	select {
+	case leaked := <-sess.ipInbound:
+		t.Fatalf("ping keepalive was delivered as an IP packet: %x", leaked)
+	default:
+	}
+
+	// Re-open the identical bytes directly against the same Wrapper this
+	// session used. If handleDatagram's length gate had swallowed the
+	// packet before it ever reached Wrapper.Open, the replay window would
+	// still be empty and this would succeed (ErrPingAbsorbed again) instead
+	// of failing with ErrReplay.
+	if _, err := wrapper.Open(nil, pingSealed); !errors.Is(err, datachan.ErrReplay) {
+		t.Fatalf("re-Open of the same sealed ping = %v, want ErrReplay (proves handleDatagram actually delivered the first one to Wrapper.Open instead of dropping it at the pre-opcode length gate)", err)
+	}
+}

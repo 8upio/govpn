@@ -293,7 +293,7 @@ func (t packetConnTransport) WriteTo(p []byte, addr net.Addr) (int, error) {
 }
 
 func (s *Server) handleDatagram(pc net.PacketConn, addr net.Addr, packet []byte) {
-	if len(packet) < minDatagramSize || len(packet) > maxDatagramSize {
+	if len(packet) < 1 || len(packet) > maxDatagramSize {
 		return
 	}
 
@@ -307,8 +307,21 @@ func (s *Server) handleDatagram(pc net.PacketConn, addr net.Addr, packet []byte)
 	// control-opcode parse below, which would otherwise splice peer-id
 	// bytes together with packet-id/tag bytes into a sessionKey that can
 	// never match any control-channel session (Pitfall 3, D-16).
+	//
+	// Data-channel packets are never tls-crypt wrapped and have a much
+	// shorter minimum wire size than a control-channel packet (a 16-byte
+	// ping keepalive seals to 40 bytes, well under minDatagramSize's
+	// 49-byte tls-crypt prefix) — handleDataDatagram/datachan.Wrapper.Open
+	// enforce their own, correctly-sized minimum, so minDatagramSize below
+	// must not gate this branch (CR-01).
 	if opcode == wire.OpDataV1 || opcode == wire.OpDataV2 {
 		s.handleDataDatagram(opcode, packet)
+		return
+	}
+
+	// minDatagramSize (the tls-crypt prefix) only applies to control-channel
+	// packets, which are always tls-crypt wrapped.
+	if len(packet) < minDatagramSize {
 		return
 	}
 
