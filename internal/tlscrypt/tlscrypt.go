@@ -139,6 +139,19 @@ type Wrapper struct {
 	mu      sync.Mutex
 	sendSeq uint32 // this side's own monotonic tls-crypt packet-ID sequence counter
 
+	// sendTime is the unix-second timestamp written into every outgoing
+	// packet's long-form packet-ID timestamp field. Mirrors the reference's
+	// packet_id_send.time (packet_id.c:323-344): set once, the first time
+	// Wrap is ever called, and thereafter frozen for the life of the key —
+	// only touched again on a sendSeq rollover, exactly like sendRolloverAt
+	// below. It is NOT time.Now() on every call: a real OpenVPN client's
+	// replay-window logic (packet_id.c's seq_backtrack branch) treats any
+	// packet whose timestamp exceeds its own stored value as an
+	// unconditional accept that resets its window, so a live per-packet
+	// timestamp would defeat that anti-replay window for traffic this
+	// library sends.
+	sendTime int64
+
 	// sendRolloverAt is the unix-second timestamp of this Wrapper's last
 	// sendSeq rollover (0xFFFFFFFF -> 0), or 0 if it has never rolled over.
 	// Used by Wrap to mirror the reference's rollover gate — see Wrap's doc
@@ -187,6 +200,12 @@ func (w *Wrapper) Wrap(dst, header, plaintext []byte) ([]byte, error) {
 	}
 
 	w.mu.Lock()
+	if w.sendTime == 0 {
+		// packet_id_send_update (packet_id.c:323-326): "if (!p->time) {
+		// p->time = now; }" — frozen once, the first time this Wrapper is
+		// ever used to send.
+		w.sendTime = time.Now().Unix()
+	}
 	if w.sendSeq == 0xFFFFFFFF {
 		// The reference (packet_id_send_update, called from
 		// tls_crypt_wrap via packet_id_write, tls_crypt.c:164-168) only
@@ -204,15 +223,16 @@ func (w *Wrapper) Wrap(dst, header, plaintext []byte) ([]byte, error) {
 			return nil, errors.New("tlscrypt: packet ID roll over")
 		}
 		w.sendRolloverAt = now
+		w.sendTime = now
 		w.sendSeq = 0
 	}
 	w.sendSeq++
-	seq := w.sendSeq
+	seq, ts := w.sendSeq, w.sendTime
 	w.mu.Unlock()
 
 	var pid [PIDSize]byte
 	binary.BigEndian.PutUint32(pid[0:4], seq)
-	binary.BigEndian.PutUint32(pid[4:8], uint32(time.Now().Unix()))
+	binary.BigEndian.PutUint32(pid[4:8], uint32(ts))
 
 	return w.wrapWithPID(dst, header, pid, plaintext)
 }
