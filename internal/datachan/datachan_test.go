@@ -442,3 +442,50 @@ func TestPacketIDFailsClosedAtMax(t *testing.T) {
 		t.Fatalf("Seal at counter ceiling = %v, want ErrPacketIDExhausted", err)
 	}
 }
+
+// TestOpenReplayRejectionDoesNotLeakPlaintextIntoDst is WR-02's regression
+// test. Unlike an ErrAuth failure (where Go's own GCM implementation zeroes
+// the output region it wrote before returning), a replay rejection happens
+// *after* AEAD.Open has already succeeded and written real decrypted
+// plaintext — so if that decryption target were the caller's own dst
+// buffer, a dst with spare backing capacity would be left holding
+// successfully decrypted, attacker-controlled plaintext even though Open's
+// return value discards it. Open must decrypt into a buffer that is never
+// dst until after the replay check has also passed.
+func TestOpenReplayRejectionDoesNotLeakPlaintextIntoDst(t *testing.T) {
+	w, err := NewWrapper(testDataKeys(t), 1, 0)
+	if err != nil {
+		t.Fatalf("NewWrapper: %v", err)
+	}
+
+	plaintext := []byte("secret payload that must never leak into dst")
+	sealed, err := w.Seal(nil, plaintext)
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+
+	// First Open succeeds and marks the replay window.
+	if _, err := w.Open(nil, sealed); err != nil {
+		t.Fatalf("first Open = %v, want success", err)
+	}
+
+	// Second Open with the identical bytes authenticates fine (same tag,
+	// same key) but must be rejected as a replay.
+	backing := make([]byte, 0, 64)
+	for i := 0; i < cap(backing); i++ {
+		backing = append(backing, 0xEE)
+	}
+	sentinel := append([]byte(nil), backing...)
+	dst := backing[:0] // len 0, cap 64 — spare capacity aliasing backing's array.
+
+	got, err := w.Open(dst, sealed)
+	if !errors.Is(err, ErrReplay) {
+		t.Fatalf("second Open (replay) = %v, want ErrReplay", err)
+	}
+	if got != nil {
+		t.Errorf("second Open (replay) returned %q, want nil", got)
+	}
+	if !bytes.Equal(backing[:cap(backing)], sentinel) {
+		t.Errorf("dst's backing array was written to on a replay rejection: got %x, want unchanged sentinel %x — decrypted attacker-controlled plaintext leaked into dst's spare capacity", backing[:cap(backing)], sentinel)
+	}
+}

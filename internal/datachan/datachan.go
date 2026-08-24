@@ -251,8 +251,14 @@ func (w *Wrapper) Open(dst, packet []byte) ([]byte, error) {
 	sealed = append(sealed, ciphertext...)
 	sealed = append(sealed, tag...)
 
-	prefixLen := len(dst)
-	plaintext, err := w.decryptAEAD.Open(dst, nonce[:], sealed, header)
+	// Decrypt into a scratch buffer, never directly into the caller's dst:
+	// AEAD.Open only zeroes its output region on an *authentication*
+	// failure, so a packet that authenticates but is then rejected as a
+	// replay would otherwise leave successfully decrypted, attacker-
+	// controlled plaintext sitting in dst even though the return value
+	// discards it (WR-02). Only copy into dst once both the AEAD tag check
+	// and the replay check have passed.
+	plaintext, err := w.decryptAEAD.Open(nil, nonce[:], sealed, header)
 	if err != nil {
 		return nil, ErrAuth
 	}
@@ -261,10 +267,9 @@ func (w *Wrapper) Open(dst, packet []byte) ([]byte, error) {
 		return nil, ErrReplay
 	}
 
-	decrypted := plaintext[prefixLen:]
-	if IsPing(decrypted) {
+	if IsPing(plaintext) {
 		return nil, ErrPingAbsorbed
 	}
 
-	return plaintext, nil
+	return append(dst, plaintext...), nil
 }
