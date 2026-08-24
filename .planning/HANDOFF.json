@@ -9,28 +9,77 @@
   "total_tasks": null,
   "status": "paused",
   "completed_tasks": [
-    {"id": "phase-1", "name": "Phase 1 Handshake — fully complete (4/4 plans, verification passed, code review 2 fix iterations, Nyquist validated, threat-secure)", "status": "done", "commit": "9db4e88"},
-    {"id": "02-discuss", "name": "Phase 2 smart discuss — CONTEXT.md written, 12 decisions across 3 areas, all accepted by user", "status": "done", "commit": "3531876"},
-    {"id": "02-research", "name": "Phase 2 research (gsd-phase-researcher, sonnet) — was IN FLIGHT when session paused", "status": "in_progress", "progress": "Agent spawned to write .planning/phases/02-tunnel-up/02-RESEARCH.md from the C reference at /Users/svenloth/dev/openvpn-reference. Check if the file exists on disk before re-running."}
+    {
+      "id": "phase-1",
+      "name": "Phase 1 Handshake \u2014 fully complete (4/4 plans, verification passed, code review 2 fix iterations, Nyquist validated, threat-secure)",
+      "status": "done",
+      "commit": "9db4e88"
+    },
+    {
+      "id": "02-discuss",
+      "name": "Phase 2 smart discuss \u2014 CONTEXT.md written, 12 decisions across 3 areas, all accepted by user",
+      "status": "done",
+      "commit": "3531876"
+    },
+    {
+      "id": "02-research",
+      "name": "Phase 2 research \u2014 COMPLETE (02-RESEARCH.md committed as fbd5146; byte-exact KM2/PRF/AEAD layouts with C-source line citations; two critical pitfalls flagged: server key-direction is the mirror-opposite of tlscrypt's slot convention, and P_DATA AEAD tag precedes ciphertext unlike Go's Seal/Open)",
+      "status": "done",
+      "commit": "fbd5146"
+    }
   ],
   "remaining_tasks": [
-    {"id": "02-research-verify", "name": "If 02-RESEARCH.md is missing or incomplete, re-run research: /gsd-plan-phase 2 (it auto-detects missing research) or /gsd-plan-phase --research-phase 2", "status": "not_started"},
-    {"id": "02-plan", "name": "Plan Phase 2 (planner=opus, checker=haiku, granularity=coarse, MVP mode active via ROADMAP)", "status": "not_started"},
-    {"id": "02-execute", "name": "Execute Phase 2 waves + code review/fix + verify + validate + secure (same pipeline as Phase 1)", "status": "not_started"},
-    {"id": "03-04", "name": "Phases 3 (In-Process Termination) and 4 (Durable Sessions): discuss → plan → execute each, then milestone audit → complete → cleanup", "status": "not_started"}
+    {
+      "id": "02-plan",
+      "name": "Plan Phase 2 (planner=opus, checker=haiku, granularity=coarse, MVP mode active via ROADMAP)",
+      "status": "not_started"
+    },
+    {
+      "id": "02-execute",
+      "name": "Execute Phase 2 waves + code review/fix + verify + validate + secure (same pipeline as Phase 1)",
+      "status": "not_started"
+    },
+    {
+      "id": "03-04",
+      "name": "Phases 3 (In-Process Termination) and 4 (Durable Sessions): discuss \u2192 plan \u2192 execute each, then milestone audit \u2192 complete \u2192 cleanup",
+      "status": "not_started"
+    }
   ],
   "blockers": [],
   "async_jobs": [],
   "human_actions_pending": [
-    {"action": "Phase 1 UAT items 1-2: push repo to a GitHub remote and confirm the CI fast + interop jobs run and fail loudly when broken", "context": "Tracked in .planning/phases/01-handshake/01-UAT.md — deferred by user choice until a remote exists; not blocking phase progression", "blocking": false}
+    {
+      "action": "Phase 1 UAT items 1-2: push repo to a GitHub remote and confirm the CI fast + interop jobs run and fail loudly when broken",
+      "context": "Tracked in .planning/phases/01-handshake/01-UAT.md \u2014 deferred by user choice until a remote exists; not blocking phase progression",
+      "blocking": false
+    }
   ],
   "decisions": [
-    {"decision": "Phase 2 IP pool: sequential first-free from Config.Network, immediate reuse on close, duplicate-CN allowed", "rationale": "Reference default semantics, simplest correct v1", "phase": "02"},
-    {"decision": "PUSH_REPLY minimal: ifconfig + topology subnet + cipher AES-256-GCM + keepalive 10 60 (fixed)", "rationale": "Exactly what success criteria require; routes/redirect-gateway deferred to Phase 3", "phase": "02"},
-    {"decision": "Session: one IP packet per Read/Write, bounded queue drop-on-overflow, OnSession fires only when tunnel fully up (callsite moves deeper than Phase 1)", "rationale": "Datagram semantics match PROJECT.md; VPN drop semantics; Session immediately usable in callback", "phase": "02"},
-    {"decision": "Data channel: classic non-epoch 4-byte packet-id, 64-wide replay window per key, ping magic absorbed in library, golden vectors derived from C reference with provenance", "rationale": "What an unmodified 2.6 client negotiates by default; mirrors packet_id.c; PROJECT.md forbids approximating from memory", "phase": "02"}
+    {
+      "decision": "Phase 2 IP pool: sequential first-free from Config.Network, immediate reuse on close, duplicate-CN allowed",
+      "rationale": "Reference default semantics, simplest correct v1",
+      "phase": "02"
+    },
+    {
+      "decision": "PUSH_REPLY minimal: ifconfig + topology subnet + cipher AES-256-GCM + keepalive 10 60 (fixed)",
+      "rationale": "Exactly what success criteria require; routes/redirect-gateway deferred to Phase 3",
+      "phase": "02"
+    },
+    {
+      "decision": "Session: one IP packet per Read/Write, bounded queue drop-on-overflow, OnSession fires only when tunnel fully up (callsite moves deeper than Phase 1)",
+      "rationale": "Datagram semantics match PROJECT.md; VPN drop semantics; Session immediately usable in callback",
+      "phase": "02"
+    },
+    {
+      "decision": "Data channel: classic non-epoch 4-byte packet-id, 64-wide replay window per key, ping magic absorbed in library, golden vectors derived from C reference with provenance",
+      "rationale": "What an unmodified 2.6 client negotiates by default; mirrors packet_id.c; PROJECT.md forbids approximating from memory",
+      "phase": "02"
+    }
   ],
-  "uncommitted_files": [".gsd/ (untracked, pre-existing)", "openvpn-go-briefing.md (untracked, pre-existing)"],
-  "next_action": "Check whether .planning/phases/02-tunnel-up/02-RESEARCH.md exists (the researcher may have finished after the pause). If yes: commit it if uncommitted, then resume the autonomous run with /gsd-autonomous --from 2 (it will skip discuss, use existing research, and continue at planning). If no: same command — plan-phase will re-run research automatically.",
-  "context_notes": "Session was a /gsd-autonomous run. Phase 1 is fully closed end-to-end (STATE/ROADMAP/REQUIREMENTS/PROJECT all updated and committed through 3531876). Phase 2 was mid-pipeline: discuss done, research dispatched. The whole per-phase pipeline used: worktree-isolated gsd-executor per wave (worktree.baseRef=head was set in .claude/settings.local.json to satisfy the isolation guard — keep it), post-merge go build + go test -race gates, code review (review→fix→re-review loop), gsd-verifier, then validate-phase + secure-phase hooks. Executor model sonnet, planner opus, checker haiku, reviewer/fixer/verifier sonnet, security auditor opus."
+  "uncommitted_files": [
+    ".gsd/ (untracked, pre-existing)",
+    "openvpn-go-briefing.md (untracked, pre-existing)"
+  ],
+  "next_action": "Resume with /gsd-autonomous --from 2 \u2014 discuss and research are both done; it continues at planning (opus planner, haiku checker, MVP mode).",
+  "context_notes": "Session was a /gsd-autonomous run. Phase 1 is fully closed end-to-end (STATE/ROADMAP/REQUIREMENTS/PROJECT all updated and committed through 3531876). Phase 2 was mid-pipeline: discuss done, research dispatched. The whole per-phase pipeline used: worktree-isolated gsd-executor per wave (worktree.baseRef=head was set in .claude/settings.local.json to satisfy the isolation guard \u2014 keep it), post-merge go build + go test -race gates, code review (review\u2192fix\u2192re-review loop), gsd-verifier, then validate-phase + secure-phase hooks. Executor model sonnet, planner opus, checker haiku, reviewer/fixer/verifier sonnet, security auditor opus."
 }
