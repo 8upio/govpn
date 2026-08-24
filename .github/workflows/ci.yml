@@ -26,6 +26,16 @@ jobs:
       - name: go build
         run: go build ./...
 
+      # This phase's own standing prohibition gates (gates_test.go,
+      # 02-04-PLAN.md Task 3), run as their own named step so a violation
+      # is legible in the CI summary rather than buried in the full
+      # race-test output below — the same reasoning behind 01-04's
+      # decision to run the race command both explicitly and through
+      # `make test` (make test also depends on this target, so a local
+      # `make test` run enforces it too, not only CI).
+      - name: Phase prohibition gates (make gates)
+        run: make gates
+
       # Explicit `go test -race ./...` (not hidden behind `make test`
       # below) so this exact command is visible in CI logs and the
       # project's own CLAUDE.md mandate ("run go test -race on every CI
