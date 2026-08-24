@@ -1,15 +1,24 @@
-.PHONY: test interop golden
+.PHONY: test interop golden gates
 
 # Fast tier: vet, build, and the race-enabled unit + golden-vector tests
 # (including internal/wire/golden_test.go and
 # internal/tlscrypt/golden_test.go, which assert against real OpenVPN 2.6
 # client bytes committed in testdata/golden). Never touches Docker. This is
 # the default target (first rule in this file) — the cheap check stays
-# reflexive.
-test:
+# reflexive. Depends on gates so this phase's own standing prohibitions
+# (gates_test.go, 02-04-PLAN.md Task 3) are enforced on every default run,
+# not opted into separately.
+test: gates
 	go vet ./...
 	go build ./...
 	go test -race ./...
+
+# Runs only this phase's standing prohibition gates (gates_test.go) — every
+# must_haves.prohibitions entry declared across this phase's four plans,
+# turned into assertions that fail a normal `go test` run rather than
+# sitting in a document nobody greps.
+gates:
+	go test -race -run TestPhase2 -v ./
 
 # Full interop tier: generates a fresh test PKI in Go (large profile, so
 # the certificate-fragmentation assertions have something to fragment —

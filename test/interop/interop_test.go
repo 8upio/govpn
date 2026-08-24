@@ -70,6 +70,8 @@ type scenarioResult struct {
 	capturePath    string
 	keyPath        string
 	privilegeCheck string // `docker inspect` output, captured while the server container still exists
+	dataKeysPath   string // this scenario's own preserved copy of the server's /tmp/datachan-keys.json (02-04-PLAN.md Task 2)
+	keyMethod2Path string // this scenario's own preserved copy of the server's /tmp/datachan-km2.json (02-04-PLAN.md Task 2)
 }
 
 // scenarioResults is populated once, in TestMain, before any Test function
@@ -116,7 +118,7 @@ func TestMain(m *testing.M) {
 			os.Exit(1)
 		}
 		outDir := filepath.Join(root, "testdata", "golden")
-		if err := ExportGolden(res.capturePath, res.keyPath, outDir); err != nil {
+		if err := ExportGolden(res.capturePath, res.keyPath, res.dataKeysPath, res.keyMethod2Path, outDir); err != nil {
 			fmt.Fprintln(os.Stderr, "interop: export golden vectors:", err)
 			os.Exit(1)
 		}
@@ -188,6 +190,24 @@ func runScenario(root, interopDir string, sc scenario) scenarioResult {
 		}
 	}
 
+	// Retrieve the server's own data-channel key export and Key Method 2
+	// export via `docker cp` — WHILE the container still exists, the same
+	// ordering constraint the privilege check above already established
+	// (02-04-PLAN.md Task 2). A copy failure is non-fatal to the scenario
+	// itself (every scenario writes these; only -update-golden's own
+	// clean-large run ever reads them back), so it is logged, not folded
+	// into upErr.
+	dataKeysPath := filepath.Join(interopDir, "captures", sc.name+"-datachan-keys.json")
+	if cpErr := dockerCopyFromContainer("govpn-interop-server", "/tmp/datachan-keys.json", dataKeysPath); cpErr != nil {
+		fmt.Fprintf(os.Stderr, "interop: docker cp data-channel key export (%s): %v\n", sc.name, cpErr)
+		dataKeysPath = ""
+	}
+	keyMethod2Path := filepath.Join(interopDir, "captures", sc.name+"-datachan-km2.json")
+	if cpErr := dockerCopyFromContainer("govpn-interop-server", "/tmp/datachan-km2.json", keyMethod2Path); cpErr != nil {
+		fmt.Fprintf(os.Stderr, "interop: docker cp Key Method 2 export (%s): %v\n", sc.name, cpErr)
+		keyMethod2Path = ""
+	}
+
 	downArgs := append(append([]string{"compose"}, composeFiles...), "down", "--remove-orphans")
 	downCmd := exec.Command("docker", downArgs...)
 	downCmd.Dir = interopDir
@@ -201,7 +221,22 @@ func runScenario(root, interopDir string, sc scenario) scenarioResult {
 		capturePath:    capturePath,
 		keyPath:        keyPath,
 		privilegeCheck: privilegeCheck,
+		dataKeysPath:   dataKeysPath,
+		keyMethod2Path: keyMethod2Path,
 	}
+}
+
+// dockerCopyFromContainer runs `docker cp container:srcPath dstPath`,
+// retrieving a file from inside a still-running (or already-stopped but not
+// yet removed) container's own filesystem without needing a bind-mounted
+// host volume or any particular in-container UID/permission alignment
+// (02-04-PLAN.md Task 2).
+func dockerCopyFromContainer(container, srcPath, dstPath string) error {
+	out, err := exec.Command("docker", "cp", container+":"+srcPath, dstPath).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("docker cp %s:%s %s: %w: %s", container, srcPath, dstPath, err, out)
+	}
+	return nil
 }
 
 func copyFile(src, dst string) error {
@@ -256,18 +291,19 @@ func TestInteropScenarios(t *testing.T) {
 			assertHandshakeCompleted(t, res)
 			assertKeyExchangeCompleted(t, res)
 			assertTunnelUp(t, res)
-			assertServerStaysUnprivileged(t, res)
 
-			// 02-03-PLAN.md Task 1's own acceptance criteria name
-			// clean-small specifically for the data-channel round-trip
-			// proof (the encrypted ping through Session.Read/Write) —
-			// scoping it there, not to the lossy-large scenario's own
-			// deliberately lossy link, mirrors 02-01-SUMMARY.md's own
-			// precedent of scoping a scenario-specific assertion to the
-			// scenario the plan names.
-			if sc.name == "clean-small" {
-				assertDataChannelRoundTrip(t, res)
-			}
+			// 02-04-PLAN.md Task 1 (VRFY-03): the ping round-trip proof
+			// (the encrypted ping through Session.Read/Write) now runs
+			// for every scenario, not only clean-small (02-03-PLAN.md's
+			// original scope) — the lossy-large scenario needs it to
+			// prove the tunnel itself, not just the handshake, survives
+			// a lossy link. The clean scenarios keep the strict
+			// zero-loss expectation; the lossy scenario tolerates a
+			// dropped echo as a retry rather than a failure, asserting
+			// only that at least one reply returned.
+			assertPingRoundTrip(t, res, !sc.lossy)
+
+			assertServerStaysUnprivileged(t, res)
 
 			if sc.largeCert {
 				assertCertificateFlightFragmented(t, res)
@@ -425,13 +461,22 @@ var pingStatsRe = regexp.MustCompile(`(\d+) packets transmitted, (\d+) received,
 // test/interop/server/main.go's startICMPResponder).
 var pingRxTxRe = regexp.MustCompile(`ping_rx=(\d+) ping_tx=(\d+)`)
 
-// assertDataChannelRoundTrip is 02-03-PLAN.md Task 1's verification: a
-// real OpenVPN 2.6.14 client's ping of the server's own pushed tunnel IP
-// (test/interop/entrypoint.sh, run once tun0 is up) round-trips through
-// Session.Read/Write with zero loss, and the server's own harness ICMP
-// responder observed and answered at least one such packet — proven by an
-// assertion in the scenario table, not read by hand.
-func assertDataChannelRoundTrip(t *testing.T, res scenarioResult) {
+// assertPingRoundTrip is 02-03-PLAN.md Task 1's original verification
+// (a real OpenVPN 2.6.14 client's ping of the server's own pushed tunnel
+// IP, test/interop/entrypoint.sh, run once tun0 is up, round-trips through
+// Session.Read/Write, and the server's own harness ICMP responder observed
+// and answered at least one such packet), extended by 02-04-PLAN.md Task 1
+// (VRFY-03) to run on every scenario, not only clean-small, with the
+// zero-loss expectation parameterized by strict: the clean scenarios keep
+// the original zero-loss assertion, while the lossy scenario tolerates a
+// dropped echo as a retry rather than a failure — asserting only that at
+// least one reply returned, since demanding zero loss at 7% synthetic loss
+// in both directions would make the test flaky for a reason unrelated to
+// correctness. All of this is proven by an assertion in the scenario
+// table, never read by hand, and never via a skipped subtest (01-04-SUMMARY.md
+// Deviation 2: skipping a subtest silently drops every later
+// assertion in it).
+func assertPingRoundTrip(t *testing.T, res scenarioResult, strict bool) {
 	t.Helper()
 
 	if res.composeErr != nil {
@@ -459,8 +504,21 @@ func assertDataChannelRoundTrip(t *testing.T, res scenarioResult) {
 	if received == 0 {
 		t.Fatalf("client ping received 0 of %d replies from the server's tunnel IP — see log above", transmitted)
 	}
-	if lossPct != 0 {
-		t.Errorf("client ping reported %d%% packet loss on the clean-small scenario's link, want 0%% — see log above", lossPct)
+	if strict {
+		if lossPct != 0 {
+			t.Errorf("client ping reported %d%% packet loss on a clean scenario's link, want 0%% — see log above", lossPct)
+		}
+	} else {
+		// Non-fatal evidence that this scenario's synthetic loss actually
+		// struck data-channel traffic (mirrors logRetransmissionEvidence's
+		// own precedent and rationale for the control channel below): a
+		// nonzero loss percentage here is direct evidence the tunnel
+		// delivered a reply despite tc netem/lossyPacketConn dropping or
+		// reordering some of this ping's own encrypted packets, not merely
+		// that the handshake survived. A 0% report is also valid (loss has
+		// no user-controllable seed on the client's egress) and is not an
+		// assertion failure either way — see VRFY-03's own tolerant intent.
+		t.Logf("data-channel ping on the lossy link: %d/%d replies received (%d%% reported client-observed loss) — tolerated per VRFY-03; a nonzero value is direct evidence of reorder/retransmission on the data channel itself, not just the control channel", received, transmitted, lossPct)
 	}
 
 	rtm := pingRxTxRe.FindStringSubmatch(res.composeOut)
@@ -478,7 +536,7 @@ func assertDataChannelRoundTrip(t *testing.T, res scenarioResult) {
 	if pingRx == 0 || pingTx == 0 {
 		t.Fatalf("server output reports ping_rx=%d ping_tx=%d, want both greater than zero — see log above", pingRx, pingTx)
 	}
-	t.Logf("data-channel round trip: client received %d/%d ping replies (0%% loss); server observed ping_rx=%d ping_tx=%d", received, transmitted, pingRx, pingTx)
+	t.Logf("data-channel round trip: client received %d/%d ping replies (%d%% loss); server observed ping_rx=%d ping_tx=%d", received, transmitted, lossPct, pingRx, pingTx)
 }
 
 // assertServerStaysUnprivileged is plan 01-02's runtime privilege check,
@@ -512,7 +570,7 @@ func assertCertificateFlightFragmented(t *testing.T, res scenarioResult) {
 	if err != nil {
 		t.Fatalf("read tls-crypt key %s: %v", res.keyPath, err)
 	}
-	packets, err := decodeCapture(res.capturePath, key, tunnelPort)
+	packets, err := decodeCapture(res.capturePath, key, tunnelPort, nil)
 	if err != nil {
 		t.Fatalf("decode capture %s: %v", res.capturePath, err)
 	}
@@ -620,7 +678,7 @@ func logRetransmissionEvidence(t *testing.T, res scenarioResult) {
 		t.Logf("retransmission evidence: read tls-crypt key %s: %v", res.keyPath, err)
 		return
 	}
-	packets, err := decodeCapture(res.capturePath, key, tunnelPort)
+	packets, err := decodeCapture(res.capturePath, key, tunnelPort, nil)
 	if err != nil {
 		t.Logf("retransmission evidence: decode capture %s: %v", res.capturePath, err)
 		return

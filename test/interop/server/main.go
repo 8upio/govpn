@@ -22,6 +22,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -39,12 +41,18 @@ import (
 // postHandshakeSurvival is how long the harness stays up after OnSession
 // fires before printing PASS and exiting — long enough for the real
 // client's Key Method 2 application data to arrive and be silently
-// buffered (proving the server doesn't error or reset on it), and —
-// 02-03-PLAN.md Task 1 — long enough for entrypoint.sh's own ping of the
-// server's tunnel IP (tun0 coming up, then several ICMP round trips) to
-// complete and print its summary line before this process exits and pulls
-// the whole compose run down via --abort-on-container-exit.
-const postHandshakeSurvival = 5 * time.Second
+// buffered (proving the server doesn't error or reset on it), and long
+// enough for entrypoint.sh's own ping of the server's tunnel IP (tun0
+// coming up, then the full ICMP round-trip sequence) to complete and print
+// its summary line before this process exits and pulls the whole compose
+// run down via --abort-on-container-exit. 02-04-PLAN.md Task 1 raised this
+// from 5s to 20s: VRFY-03's lossy-large assertions need entrypoint.sh's
+// ping widened from 4 packets at a 0.2s interval to ~10 packets at a 1s
+// interval (so the round trip spans several of docker-compose.lossy.yml's
+// loss events, not just one), and a 10-second ping needs headroom on top
+// of the tun0-up wait and scheduling jitter across all three scenarios,
+// not only the lossy one — this constant is shared, not per-scenario.
+const postHandshakeSurvival = 20 * time.Second
 
 func main() {
 	pkiDir := flag.String("pki", "/pki", "directory containing ca.crt, server.crt, server.key, tls-crypt.key")
@@ -115,6 +123,22 @@ func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorder
 			"handshake established peer_cn=%s tls_version=%s cipher_suite=%s",
 			sess.PeerCN, tls.VersionName(state.Version), tls.CipherSuiteName(state.CipherSuite),
 		)
+
+		// Write this session's derived data-channel key material and raw
+		// Key Method 2 seed material to files inside this container's own
+		// filesystem — never to stdout, never into the pcap capture
+		// (02-04-PLAN.md Task 2). test/interop/interop_test.go's
+		// runScenario retrieves these via `docker cp` while the container
+		// still exists, the same ordering constraint the privilege check
+		// already established (before `docker compose down` removes it).
+		// Only -update-golden's own clean-large run ever reads them back;
+		// every other scenario writes and discards them harmlessly.
+		if err := writeDataChannelKeyExport(sess); err != nil {
+			log.Printf("warning: failed to write data-channel key export: %v", err)
+		}
+		if err := writeKeyMethod2Export(sess); err != nil {
+			log.Printf("warning: failed to write Key Method 2 export: %v", err)
+		}
 
 		// Start the harness's own ICMP echo responder as soon as the
 		// Session is usable (D-08 guarantees it is, the moment OnSession
@@ -445,6 +469,92 @@ func icmpEchoReply(pkt []byte) (reply []byte, ok bool) {
 	binary.BigEndian.PutUint16(outICMP[2:4], internetChecksum(outICMP))
 
 	return out, true
+}
+
+// dataChannelKeyExportPath/keyMethod2ExportPath are fixed in-container
+// paths (this harness runs exactly one session per process) — /tmp is
+// writable by any UID on the base images this harness builds from, so
+// these writes succeed even under the server's own unprivileged
+// "user: 65534:65534" (T-01-07), unlike a bind-mounted host volume, which
+// would need matching host/container UID permissions the harness does not
+// otherwise need to reason about.
+const (
+	dataChannelKeyExportPath = "/tmp/datachan-keys.json"
+	keyMethod2ExportPath     = "/tmp/datachan-km2.json"
+)
+
+// dataChannelKeyExport is the on-disk (hex-encoded) shape of
+// sess.DebugDataKeys()'s output — the server's own per-direction
+// AES-256-GCM key/implicit-IV material (keyderiv.Key2.ServerSlots), read
+// back by test/interop/golden_export.go and internal/datachan/golden_test.go
+// to independently open/re-seal a captured session's P_DATA_V2 traffic
+// (02-04-PLAN.md Task 2).
+type dataChannelKeyExport struct {
+	EncryptCipher     string `json:"encrypt_cipher"`
+	EncryptImplicitIV string `json:"encrypt_implicit_iv"`
+	DecryptCipher     string `json:"decrypt_cipher"`
+	DecryptImplicitIV string `json:"decrypt_implicit_iv"`
+}
+
+// writeDataChannelKeyExport writes sess's derived data-channel key material
+// to dataChannelKeyExportPath as JSON, hex-encoding every byte field so the
+// file stays human-diffable, matching the plaintext-hex convention this
+// project already uses for testdata/golden's own committed material.
+func writeDataChannelKeyExport(sess *ovpn.Session) error {
+	keys, ok := sess.DebugDataKeys()
+	if !ok {
+		return fmt.Errorf("session has no data-channel keys yet")
+	}
+	export := dataChannelKeyExport{
+		EncryptCipher:     hex.EncodeToString(keys.EncryptCipher[:]),
+		EncryptImplicitIV: hex.EncodeToString(keys.EncryptImplicitIV[:]),
+		DecryptCipher:     hex.EncodeToString(keys.DecryptCipher[:]),
+		DecryptImplicitIV: hex.EncodeToString(keys.DecryptImplicitIV[:]),
+	}
+	data, err := json.MarshalIndent(export, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dataChannelKeyExportPath, append(data, '\n'), 0o600)
+}
+
+// keyMethod2Export is the on-disk (hex-encoded) shape of
+// sess.DebugKeyMethod2Material()'s output — the raw Key Method 2 seed
+// material (both sides' pre_master/random1/random2) and both
+// control-channel session IDs, read back by
+// internal/keyderiv/golden_test.go's TestGoldenKeyExpansionFromCapture to
+// independently re-run keyderiv.DeriveKeys and confirm it reproduces the
+// committed derived key material byte-for-byte from a real client's own
+// captured exchange (02-04-PLAN.md Task 2, WIRE-03 against live evidence).
+type keyMethod2Export struct {
+	ClientPreMaster string `json:"client_pre_master"`
+	ClientRandom1   string `json:"client_random1"`
+	ClientRandom2   string `json:"client_random2"`
+	ServerRandom1   string `json:"server_random1"`
+	ServerRandom2   string `json:"server_random2"`
+	ClientSessionID string `json:"client_session_id"`
+	ServerSessionID string `json:"server_session_id"`
+}
+
+func writeKeyMethod2Export(sess *ovpn.Session) error {
+	src, clientSID, serverSID, ok := sess.DebugKeyMethod2Material()
+	if !ok {
+		return fmt.Errorf("session has no Key Method 2 material yet")
+	}
+	export := keyMethod2Export{
+		ClientPreMaster: hex.EncodeToString(src.Client.PreMaster[:]),
+		ClientRandom1:   hex.EncodeToString(src.Client.Random1[:]),
+		ClientRandom2:   hex.EncodeToString(src.Client.Random2[:]),
+		ServerRandom1:   hex.EncodeToString(src.Server.Random1[:]),
+		ServerRandom2:   hex.EncodeToString(src.Server.Random2[:]),
+		ClientSessionID: hex.EncodeToString(clientSID[:]),
+		ServerSessionID: hex.EncodeToString(serverSID[:]),
+	}
+	data, err := json.MarshalIndent(export, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(keyMethod2ExportPath, append(data, '\n'), 0o600)
 }
 
 // internetChecksum computes the RFC 1071 Internet checksum over b: the

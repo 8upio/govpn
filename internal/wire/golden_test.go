@@ -21,11 +21,30 @@ import (
 // up to the repo root, then into testdata/golden).
 const goldenDir = "../../testdata/golden"
 
+// goldenManifestEntry mirrors test/interop/golden_export.go's own manifest
+// schema. KeyFile is only ever set on a data-channel entry (02-04-PLAN.md
+// Task 2's extension) — this package's own tests only ever unmarshal it to
+// filter those entries out via controlChannelEntries below, since a
+// data-channel P_DATA_V2 payload is never tls-crypt wrapped and has no
+// control-packet opcode/packet-ID to assert against (RESEARCH Pitfall 3).
 type goldenManifestEntry struct {
 	File      string `json:"file"`
 	Direction string `json:"direction"`
 	Opcode    int    `json:"opcode"`
 	PacketID  uint32 `json:"packet_id"`
+	KeyFile   string `json:"key_file,omitempty"`
+}
+
+// controlChannelEntries filters manifest to entries this package's tests
+// can act on — every data-channel entry (KeyFile != "") is excluded.
+func controlChannelEntries(manifest []goldenManifestEntry) []goldenManifestEntry {
+	out := make([]goldenManifestEntry, 0, len(manifest))
+	for _, e := range manifest {
+		if e.KeyFile == "" {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 func loadGoldenManifest(t *testing.T) []goldenManifestEntry {
@@ -84,7 +103,7 @@ func unwrapGoldenVector(t *testing.T, key []byte, entry goldenManifestEntry, raw
 // and assert the result is byte-identical to what unwrap produced.
 func TestGoldenControlPacketsRoundTrip(t *testing.T) {
 	key := loadGoldenKey(t)
-	manifest := loadGoldenManifest(t)
+	manifest := controlChannelEntries(loadGoldenManifest(t))
 
 	for _, entry := range manifest {
 		entry := entry
@@ -134,7 +153,7 @@ func TestGoldenControlPacketsRoundTrip(t *testing.T) {
 // merely "close enough."
 func TestGoldenManifestTamperDetection(t *testing.T) {
 	key := loadGoldenKey(t)
-	manifest := loadGoldenManifest(t)
+	manifest := controlChannelEntries(loadGoldenManifest(t))
 	entry := manifest[0]
 
 	raw, err := os.ReadFile(filepath.Join(goldenDir, entry.File))
