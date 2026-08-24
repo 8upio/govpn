@@ -145,17 +145,30 @@ type Session struct {
 	// goroutine.
 	pushRequested atomic.Bool
 
+	// mu guards assignedIP, peerID, and dataWrapper below (WR-03):
+	// ovpn.go's performPushExchange (running on this session's own
+	// runHandshake goroutine) writes them, while Close — which
+	// enforceHandshakeWindow's timeout goroutine can invoke concurrently
+	// at any point until sess.doneCh closes, i.e. for the entire duration
+	// of performPushExchange — reads them. Without this lock those are an
+	// unsynchronized concurrent read/write of the same memory from two
+	// goroutines, undefined under the Go memory model. Every other field
+	// in this struct has its own, already-established discipline (stopCh/
+	// stopOnce, srv.mu for dataSessions/sessions) and does not need this
+	// mutex.
+	mu sync.Mutex
+
 	// assignedIP is this session's tunnel address, allocated from
 	// Config.Network by ovpn.go's performPushExchange and pushed to the
 	// client in PUSH_REPLY (D-01). nil until that exchange completes.
 	// Released back to Server.pool exactly once, inside Close's
-	// stopOnce.Do block (D-02), alongside peerID below.
+	// stopOnce.Do block (D-02), alongside peerID below. Guarded by mu.
 	assignedIP net.IP
 
 	// peerID is this session's 24-bit peer-id, allocated alongside
 	// assignedIP from the same Server.pool call and pushed to the client
 	// as `peer-id <n>`. Server.dataSessions keys its data-packet routing
-	// table on this same value (D-16).
+	// table on this same value (D-16). Guarded by mu.
 	peerID uint32
 
 	// dataWrapper is this session's AES-256-GCM data-channel Wrapper,
@@ -164,6 +177,7 @@ type Session struct {
 	// OnSession ever fires (D-08). nil until then; Read/Write on a nil
 	// dataWrapper is a bug elsewhere (Read blocks forever, Write errors)
 	// since D-08 guarantees a Session handed to an embedder always has one.
+	// Guarded by mu.
 	dataWrapper *datachan.Wrapper
 
 	// ipInbound is fed decrypted IP packets by handleDataDatagram's decrypt
@@ -207,11 +221,15 @@ func (s *Session) PushRequestSeen() bool {
 // documented zero-value behavior. The returned net.IP is a defensive copy:
 // mutating it cannot corrupt the allocator's own state.
 func (s *Session) AssignedIP() net.IP {
-	if s.assignedIP == nil {
+	s.mu.Lock()
+	assignedIP := s.assignedIP
+	s.mu.Unlock()
+
+	if assignedIP == nil {
 		return nil
 	}
-	ip := make(net.IP, len(s.assignedIP))
-	copy(ip, s.assignedIP)
+	ip := make(net.IP, len(assignedIP))
+	copy(ip, assignedIP)
 	return ip
 }
 
@@ -225,6 +243,8 @@ func (s *Session) AssignedIP() net.IP {
 // ConnectionState as the surface a real embedder needs, and this accessor
 // is diagnostic-only in the same spirit as PushRequestSeen above.
 func (s *Session) PeerID() uint32 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.peerID
 }
 
@@ -424,13 +444,25 @@ func (s *Session) Close() error {
 	s.stopOnce.Do(func() {
 		close(s.stopCh)
 		if s.srv != nil {
-			if s.assignedIP != nil && s.srv.pool != nil {
-				s.srv.pool.release(s.assignedIP, s.peerID)
+			// Snapshot assignedIP/peerID/dataWrapper under mu (WR-03):
+			// performPushExchange, running on this session's own
+			// runHandshake goroutine, can still be writing these fields
+			// when enforceHandshakeWindow's timeout goroutine calls Close
+			// concurrently — reading them without the same lock the writer
+			// uses is a data race.
+			s.mu.Lock()
+			assignedIP := s.assignedIP
+			peerID := s.peerID
+			dataWrapper := s.dataWrapper
+			s.mu.Unlock()
+
+			if assignedIP != nil && s.srv.pool != nil {
+				s.srv.pool.release(assignedIP, peerID)
 			}
-			if s.dataWrapper != nil {
+			if dataWrapper != nil {
 				s.srv.mu.Lock()
-				if existing, ok := s.srv.dataSessions[s.peerID]; ok && existing == s {
-					delete(s.srv.dataSessions, s.peerID)
+				if existing, ok := s.srv.dataSessions[peerID]; ok && existing == s {
+					delete(s.srv.dataSessions, peerID)
 				}
 				s.srv.mu.Unlock()
 			}

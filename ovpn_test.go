@@ -1788,3 +1788,58 @@ func TestHandleDatagramAcceptsShortDataChannelPing(t *testing.T) {
 		t.Fatalf("re-Open of the same sealed ping = %v, want ErrReplay (proves handleDatagram actually delivered the first one to Wrapper.Open instead of dropping it at the pre-opcode length gate)", err)
 	}
 }
+
+// TestPerformPushExchangeFieldWritesRaceSafeAgainstClose is WR-03's
+// regression test. ovpn.go's performPushExchange (on this session's own
+// runHandshake goroutine) writes assignedIP/peerID/dataWrapper, while
+// enforceHandshakeWindow's timeout goroutine can call Session.Close —
+// which reads those same fields — concurrently at any point until
+// sess.doneCh closes (deliberately not closed until performPushExchange's
+// whole bring-up sequence returns). The real interleaving is a
+// millisecond-scale timing race not reliably reproducible through the full
+// TLS/Key-Method-2/PUSH_REQUEST protocol machinery, so this test drives the
+// exact same field-write sequence performPushExchange uses (same lock
+// discipline under test) directly against the real Close, forced to
+// overlap via a barrier, repeated to make any regression in either side's
+// locking reliably caught by `go test -race`.
+func TestPerformPushExchangeFieldWritesRaceSafeAgainstClose(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		sess := &Session{
+			stopCh: make(chan struct{}),
+			srv: &Server{
+				sessions:     make(map[sessionKey]*Session),
+				dataSessions: make(map[uint32]*Session),
+			},
+		}
+
+		wrapper, err := datachan.NewWrapper(testSymmetricDataKeys(t), 1, 0)
+		if err != nil {
+			t.Fatalf("NewWrapper: %v", err)
+		}
+
+		start := make(chan struct{})
+		writerDone := make(chan struct{})
+
+		// Mirrors performPushExchange's own assign-then-publish sequence
+		// (ovpn.go) byte-for-byte: same fields, same lock discipline.
+		go func() {
+			<-start
+			ip, peerID := net.ParseIP("10.8.0.2"), uint32(1)
+			sess.mu.Lock()
+			sess.assignedIP = ip
+			sess.peerID = peerID
+			sess.mu.Unlock()
+
+			sess.mu.Lock()
+			sess.dataWrapper = wrapper
+			sess.mu.Unlock()
+			close(writerDone)
+		}()
+
+		close(start)
+		// Race the timeout-triggered Close directly against the writer
+		// goroutine above, exactly as enforceHandshakeWindow can.
+		_ = sess.Close()
+		<-writerDone
+	}
+}

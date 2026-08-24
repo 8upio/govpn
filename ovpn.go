@@ -578,8 +578,14 @@ func (s *Server) performPushExchange(sess *Session, w io.Writer) error {
 			if err != nil {
 				return fmt.Errorf("ovpn: allocate tunnel IP: %w", err)
 			}
+			// Guarded by sess.mu (WR-03): enforceHandshakeWindow's timeout
+			// goroutine can call sess.Close(), which reads these same
+			// fields, concurrently with this assignment — sess.doneCh is
+			// deliberately not closed until this whole function returns.
+			sess.mu.Lock()
 			sess.assignedIP = ip
 			sess.peerID = peerID
+			sess.mu.Unlock()
 
 			// The data-channel Wrapper is constructed here, at the same
 			// point the tunnel IP/peer-id are assigned and before
@@ -592,7 +598,9 @@ func (s *Server) performPushExchange(sess *Session, w io.Writer) error {
 			if err != nil {
 				return fmt.Errorf("ovpn: build data-channel wrapper: %w", err)
 			}
+			sess.mu.Lock()
 			sess.dataWrapper = dataWrapper
+			sess.mu.Unlock()
 			sess.ipInbound = make(chan []byte, ipInboundQueueSize)
 
 			s.mu.Lock()
