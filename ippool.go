@@ -45,6 +45,21 @@ type ipPool struct {
 	usedPeerIDs map[uint32]bool
 }
 
+// normalizeIPv4Mask reduces a net.IPMask to its 4-byte IPv4 form. A
+// *net.IPNet's Mask can be either a 4-byte or a 16-byte slice depending on
+// how it was constructed (e.g. a CIDR string using IPv4-mapped IPv6
+// notation, or a manually-built *net.IPNet) — net.IP(mask).String() on the
+// 16-byte form formats it as an IPv6 address rather than a dotted-decimal
+// IPv4 netmask. Every caller that turns Config.Network's mask into either
+// pool arithmetic (newIPPool) or an ifconfig netmask string
+// (buildPushReply) must go through this one normalization path (WR-01).
+func normalizeIPv4Mask(mask net.IPMask) net.IPMask {
+	if len(mask) == net.IPv6len {
+		return mask[12:]
+	}
+	return mask
+}
+
 // newIPPool builds an ipPool over network. It handles IPv4 only: a
 // non-IPv4 network (or one smaller than a /30, which has no allocatable
 // client address once the network, server, and broadcast addresses are
@@ -60,10 +75,7 @@ func newIPPool(network *net.IPNet) (*ipPool, error) {
 	if ip4 == nil {
 		return nil, errors.New("ovpn: Config.Network must be an IPv4 network")
 	}
-	mask := network.Mask
-	if len(mask) == net.IPv6len {
-		mask = mask[12:]
-	}
+	mask := normalizeIPv4Mask(network.Mask)
 	if len(mask) != net.IPv4len {
 		return nil, errors.New("ovpn: Config.Network must be an IPv4 network")
 	}

@@ -81,7 +81,7 @@ func buildPushReply(clientIP net.IP, network *net.IPNet, peerID uint32, cipher s
 	if cipher == "" {
 		cipher = "AES-256-GCM"
 	}
-	netmask := net.IP(network.Mask).String()
+	netmask := net.IP(normalizeIPv4Mask(network.Mask)).String()
 
 	opts := []string{
 		"PUSH_REPLY",

@@ -47,6 +47,31 @@ func TestPushReplyNetmaskFromPrefix(t *testing.T) {
 	}
 }
 
+// TestPushReplyNormalizesSixteenByteMask is WR-01's regression test:
+// net.IPNet.Mask can be a 16-byte slice even for an IPv4 network (e.g. a
+// manually-built *net.IPNet, not just one parsed from a CIDR string), and
+// buildPushReply must normalize it exactly like newIPPool already does,
+// rather than formatting the raw 16 bytes as an IPv6 address in the
+// ifconfig line.
+func TestPushReplyNormalizesSixteenByteMask(t *testing.T) {
+	network := &net.IPNet{
+		IP:   net.ParseIP("10.8.0.0").To4(),
+		Mask: net.CIDRMask(24, 32), // net.CIDRMask always returns a 4-byte
+	}
+	// Force the 16-byte shape newIPPool's own doc comment calls out as the
+	// exact case it defends against.
+	sixteenByteMask := make(net.IPMask, net.IPv6len)
+	copy(sixteenByteMask[12:], network.Mask)
+	network.Mask = sixteenByteMask
+
+	reply := buildPushReply(net.ParseIP("10.8.0.2"), network, 0, "AES-256-GCM")
+
+	wantSegment := "ifconfig 10.8.0.2 255.255.255.0"
+	if !bytes.Contains(reply, []byte(wantSegment)) {
+		t.Errorf("buildPushReply() with a 16-byte Mask = %q, want it to contain %q (normalized dotted-decimal netmask, not the raw 16-byte IPv6-shaped mask)", reply, wantSegment)
+	}
+}
+
 func TestPushReplyEndsWithSingleNUL(t *testing.T) {
 	_, network, err := net.ParseCIDR("10.8.0.0/24")
 	if err != nil {
