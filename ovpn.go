@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -54,6 +55,15 @@ type Config struct {
 	// Session whose PeerCN is the verified client CommonName (threat
 	// T-01-16).
 	OnSession func(*Session)
+
+	// OnSessionPanic, if set, is invoked when OnSession panics instead of
+	// letting the panic take down the embedding process. It receives the
+	// Session that was being handed to OnSession, the recovered panic
+	// value, and a captured stack trace (runtime/debug.Stack()) so the
+	// embedder has a diagnostic trail rather than a session that silently
+	// vanishes. OnSessionPanic itself is called from inside the recover
+	// path and must not panic.
+	OnSessionPanic func(sess *Session, recovered any, stack []byte)
 }
 
 // ParseStaticKeyV1 parses an OpenVPN "Static key V1" PEM-style envelope
@@ -373,11 +383,17 @@ func (s *Server) runHandshake(sess *Session) {
 // embedding process, taking down every other in-flight session along with
 // it. A panicking OnSession is a bug in the embedder's callback, not a
 // reason to bring down the host process for a library explicitly designed
-// to be embedded "in any Go program" — so it is recovered and swallowed
-// here rather than allowed to escape.
+// to be embedded "in any Go program" — so it is recovered here rather than
+// allowed to escape. The recovered value and a stack trace are handed to
+// Config.OnSessionPanic (if set) so the embedder isn't left debugging a
+// mysteriously-disappearing session with zero diagnostic trail.
 func (s *Server) callOnSession(sess *Session) {
 	defer func() {
-		recover() //nolint:errcheck // intentionally swallowed, see callOnSession's doc comment
+		if r := recover(); r != nil {
+			if s.cfg.OnSessionPanic != nil {
+				s.cfg.OnSessionPanic(sess, r, debug.Stack())
+			}
+		}
 	}()
 	s.cfg.OnSession(sess)
 }
