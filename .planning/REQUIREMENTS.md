@@ -24,8 +24,8 @@ Requirements for initial release. Each maps to roadmap phases.
 
 ### Data Channel
 
-- [ ] **DATA-01**: P_DATA_V2 packets (24-bit peer-id) encrypt/decrypt with AES-256-GCM using correct nonce construction (packet-ID ‖ implicit IV) and header-as-AAD
-- [ ] **DATA-02**: Data-channel replay protection (packet-ID window) drops replayed/out-of-window packets
+- [x] **DATA-01**: P_DATA_V2 packets (24-bit peer-id) encrypt/decrypt with AES-256-GCM using correct nonce construction (packet-ID ‖ implicit IV) and header-as-AAD
+- [x] **DATA-02**: Data-channel replay protection (packet-ID window) drops replayed/out-of-window packets
 - [ ] **DATA-03**: Keepalive/ping magic packets are answered and filtered inside the library — never surfaced to the Session consumer
 
 ### Session & Server API
@@ -51,7 +51,7 @@ Requirements for initial release. Each maps to roadmap phases.
 
 - [x] **VRFY-01**: Docker harness: pinned OpenVPN 2.6 client container (self-built Debian image) connects to the library with a generated config (certs, tls-crypt key) — automatable in CI
 - [ ] **VRFY-02**: End-to-end through the real client: ping (ICMP), UDP round-trip, and HTTP page load through the tunnel all succeed
-- [ ] **VRFY-03**: Harness includes a lossy-network scenario (5–10% packet loss/reordering) under which handshake and traffic still succeed
+- [x] **VRFY-03**: Harness includes a lossy-network scenario (5–10% packet loss/reordering) under which handshake and traffic still succeed
 
 ## v2 Requirements
 
@@ -101,12 +101,12 @@ Which phases cover which requirements. Updated during roadmap creation.
 | WIRE-03 | Phase 2 | Complete |
 | CTRL-04 | Phase 2 | Complete |
 | CTRL-05 | Phase 2 | Pending |
-| DATA-01 | Phase 2 | Pending |
-| DATA-02 | Phase 2 | Pending |
+| DATA-01 | Phase 2 | Complete |
+| DATA-02 | Phase 2 | Complete |
 | DATA-03 | Phase 2 | Pending |
 | SESS-02 | Phase 2 | Pending |
 | SESS-03 | Phase 2 | Pending |
-| VRFY-03 | Phase 2 | Pending |
+| VRFY-03 | Phase 2 | Complete |
 | NET-01 | Phase 3 | Pending |
 | NET-02 | Phase 3 | Pending |
 | NET-03 | Phase 3 | Pending |
