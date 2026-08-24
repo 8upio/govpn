@@ -255,6 +255,7 @@ func TestInteropScenarios(t *testing.T) {
 
 			assertHandshakeCompleted(t, res)
 			assertKeyExchangeCompleted(t, res)
+			assertTunnelUp(t, res)
 			assertServerStaysUnprivileged(t, res)
 
 			if sc.largeCert {
@@ -349,6 +350,57 @@ func assertKeyExchangeCompleted(t *testing.T, res scenarioResult) {
 	}
 	if clientKeyNegotiationFailedRe.MatchString(res.composeOut) {
 		t.Fatal("client output reports a TLS key negotiation failure — see log above")
+	}
+}
+
+// assignedIPRe/peerIDRe extract the assigned_ip=/peer_id= fields
+// test/interop/server's PASS line carries (02-02-PLAN.md Task 1), so
+// assertTunnelUp can check them numerically/textually rather than
+// string-matching a whole log line that could drift.
+var (
+	assignedIPRe = regexp.MustCompile(`assigned_ip=(\d+\.\d+\.\d+\.\d+)`)
+	peerIDRe     = regexp.MustCompile(`peer_id=(\d+)`)
+)
+
+// initSequenceCompletedRe matches the real client's own success line
+// (init.c, unchanged across 2.6.x) — asserted present, not paraphrased.
+var initSequenceCompletedRe = regexp.MustCompile(`Initialization Sequence Completed`)
+
+// assertTunnelUp is 02-02-PLAN.md Task 1's verification: a real OpenVPN
+// 2.6.14 client requests its configuration, receives a byte-exact
+// PUSH_REPLY carrying an address from the server's configured tunnel
+// network, and reports Initialization Sequence Completed with its tun
+// interface configured with that same address — asserted by the scenario
+// table, not read by hand.
+func assertTunnelUp(t *testing.T, res scenarioResult) {
+	t.Helper()
+
+	if res.composeErr != nil {
+		// assertHandshakeCompleted already fails loudly on this; avoid a
+		// second, redundant fatal here obscuring the first.
+		return
+	}
+
+	ipMatch := assignedIPRe.FindStringSubmatch(res.composeOut)
+	if ipMatch == nil {
+		t.Fatal("server output does not contain a parsable assigned_ip= field — see log above")
+	}
+	assignedIP := ipMatch[1]
+
+	if peerIDRe.FindStringSubmatch(res.composeOut) == nil {
+		t.Fatal("server output does not contain a parsable peer_id= field — see log above")
+	}
+
+	if !initSequenceCompletedRe.MatchString(res.composeOut) {
+		t.Fatal("client output does not contain \"Initialization Sequence Completed\" — see log above")
+	}
+
+	// The server's own PASS line already contains assignedIP once; a
+	// second occurrence proves the CLIENT's own log independently names
+	// the same address (its own ifconfig/ip-addr tun-configuration line),
+	// not just the server's side of the exchange.
+	if strings.Count(res.composeOut, assignedIP) < 2 {
+		t.Fatalf("assigned tunnel address %s appears only in the server's own PASS line, not in the client's tun interface configuration — see log above", assignedIP)
 	}
 }
 
