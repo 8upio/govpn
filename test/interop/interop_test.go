@@ -258,6 +258,17 @@ func TestInteropScenarios(t *testing.T) {
 			assertTunnelUp(t, res)
 			assertServerStaysUnprivileged(t, res)
 
+			// 02-03-PLAN.md Task 1's own acceptance criteria name
+			// clean-small specifically for the data-channel round-trip
+			// proof (the encrypted ping through Session.Read/Write) —
+			// scoping it there, not to the lossy-large scenario's own
+			// deliberately lossy link, mirrors 02-01-SUMMARY.md's own
+			// precedent of scoping a scenario-specific assertion to the
+			// scenario the plan names.
+			if sc.name == "clean-small" {
+				assertDataChannelRoundTrip(t, res)
+			}
+
 			if sc.largeCert {
 				assertCertificateFlightFragmented(t, res)
 			}
@@ -402,6 +413,72 @@ func assertTunnelUp(t *testing.T, res scenarioResult) {
 	if strings.Count(res.composeOut, assignedIP) < 2 {
 		t.Fatalf("assigned tunnel address %s appears only in the server's own PASS line, not in the client's tun interface configuration — see log above", assignedIP)
 	}
+}
+
+// pingStatsRe matches iputils-ping's own summary line (the client image's
+// iputils-ping package, added by 02-03-PLAN.md Task 1 specifically for
+// this assertion): "N packets transmitted, M received, L% packet loss".
+var pingStatsRe = regexp.MustCompile(`(\d+) packets transmitted, (\d+) received, (\d+)% packet loss`)
+
+// pingRxTxRe extracts the ping_rx=/ping_tx= fields test/interop/server's
+// PASS line carries (02-03-PLAN.md Task 1's harness ICMP echo responder,
+// test/interop/server/main.go's startICMPResponder).
+var pingRxTxRe = regexp.MustCompile(`ping_rx=(\d+) ping_tx=(\d+)`)
+
+// assertDataChannelRoundTrip is 02-03-PLAN.md Task 1's verification: a
+// real OpenVPN 2.6.14 client's ping of the server's own pushed tunnel IP
+// (test/interop/entrypoint.sh, run once tun0 is up) round-trips through
+// Session.Read/Write with zero loss, and the server's own harness ICMP
+// responder observed and answered at least one such packet — proven by an
+// assertion in the scenario table, not read by hand.
+func assertDataChannelRoundTrip(t *testing.T, res scenarioResult) {
+	t.Helper()
+
+	if res.composeErr != nil {
+		// assertHandshakeCompleted already fails loudly on this; avoid a
+		// second, redundant fatal here obscuring the first.
+		return
+	}
+
+	m := pingStatsRe.FindStringSubmatch(res.composeOut)
+	if m == nil {
+		t.Fatal("client output does not contain a parsable ping summary line (\"N packets transmitted, M received, L% packet loss\") — see log above")
+	}
+	transmitted, err := strconv.Atoi(m[1])
+	if err != nil {
+		t.Fatalf("parse ping transmitted count %q: %v", m[1], err)
+	}
+	received, err := strconv.Atoi(m[2])
+	if err != nil {
+		t.Fatalf("parse ping received count %q: %v", m[2], err)
+	}
+	lossPct, err := strconv.Atoi(m[3])
+	if err != nil {
+		t.Fatalf("parse ping loss percentage %q: %v", m[3], err)
+	}
+	if received == 0 {
+		t.Fatalf("client ping received 0 of %d replies from the server's tunnel IP — see log above", transmitted)
+	}
+	if lossPct != 0 {
+		t.Errorf("client ping reported %d%% packet loss on the clean-small scenario's link, want 0%% — see log above", lossPct)
+	}
+
+	rtm := pingRxTxRe.FindStringSubmatch(res.composeOut)
+	if rtm == nil {
+		t.Fatal("server output does not contain a parsable ping_rx=/ping_tx= field — see log above")
+	}
+	pingRx, err := strconv.Atoi(rtm[1])
+	if err != nil {
+		t.Fatalf("parse ping_rx=%q: %v", rtm[1], err)
+	}
+	pingTx, err := strconv.Atoi(rtm[2])
+	if err != nil {
+		t.Fatalf("parse ping_tx=%q: %v", rtm[2], err)
+	}
+	if pingRx == 0 || pingTx == 0 {
+		t.Fatalf("server output reports ping_rx=%d ping_tx=%d, want both greater than zero — see log above", pingRx, pingTx)
+	}
+	t.Logf("data-channel round trip: client received %d/%d ping replies (0%% loss); server observed ping_rx=%d ping_tx=%d", received, transmitted, pingRx, pingTx)
 }
 
 // assertServerStaysUnprivileged is plan 01-02's runtime privilege check,

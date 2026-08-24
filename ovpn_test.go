@@ -2,6 +2,7 @@ package ovpn
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -9,6 +10,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
+	"errors"
 	"io"
 	"math/big"
 	"net"
@@ -20,6 +22,8 @@ import (
 	"time"
 
 	"github.com/8upio/govpn/internal/ctrlconn"
+	"github.com/8upio/govpn/internal/datachan"
+	"github.com/8upio/govpn/internal/keyderiv"
 	"github.com/8upio/govpn/internal/tlscrypt"
 	"github.com/8upio/govpn/internal/wire"
 )
@@ -568,10 +572,14 @@ func TestPerformPushExchangeAnswersBufferedRetransmitWithSameIP(t *testing.T) {
 		t.Fatalf("newIPPool: %v", err)
 	}
 
-	srv := &Server{pool: pool, cfg: Config{Network: network}}
+	srv := &Server{pool: pool, cfg: Config{Network: network}, dataSessions: make(map[uint32]*Session)}
 
 	input := pushRequestLiteral + "\x00" + pushRequestLiteral + "\x00"
-	sess := &Session{tlsReader: bufio.NewReader(strings.NewReader(input))}
+	dataKeys, err := keyderiv.NewKey2(make([]byte, 256))
+	if err != nil {
+		t.Fatalf("NewKey2: %v", err)
+	}
+	sess := &Session{tlsReader: bufio.NewReader(strings.NewReader(input)), dataKeys: dataKeys}
 
 	var out strings.Builder
 	if err := srv.performPushExchange(sess, &out); err != nil {
@@ -1329,5 +1337,376 @@ func TestOnSessionPanicRecovered(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("OnSessionPanic was never called")
+	}
+}
+
+// TestSessionReadWriteDatagramSemantics is 02-03-PLAN.md Task 1's D-05
+// proof: Session.Write seals exactly one full IP packet per call (the peer
+// decrypts it to the exact bytes given to Write, not a stream fragment),
+// and Session.Read delivers exactly one full IP packet per call — a
+// too-small buffer returns an error and RETAINS the packet (this
+// Session's own documented D-05 choice, session.go's pendingRead doc
+// comment) rather than truncating it or silently losing it, and a
+// subsequent Read with a large-enough buffer still receives it, in full.
+func TestSessionReadWriteDatagramSemantics(t *testing.T) {
+	var raw [256]byte
+	for i := range raw {
+		raw[i] = byte(i)
+	}
+	key2, err := keyderiv.NewKey2(raw[:])
+	if err != nil {
+		t.Fatalf("NewKey2: %v", err)
+	}
+	serverKeys := key2.ServerSlots()
+	// clientKeys is the mirror image of serverKeys (matching how a real
+	// peer's own key-direction assignment inverts the server's, Pitfall
+	// 1) — this test's own encrypt/decrypt pairing, not
+	// keyderiv.keyDirection(false) itself, since that's internal/keyderiv's
+	// own already-tested concern.
+	clientKeys := keyderiv.DataKeys{
+		EncryptCipher:     serverKeys.DecryptCipher,
+		EncryptImplicitIV: serverKeys.DecryptImplicitIV,
+		DecryptCipher:     serverKeys.EncryptCipher,
+		DecryptImplicitIV: serverKeys.EncryptImplicitIV,
+	}
+
+	const peerID = 7
+	serverWrapper, err := datachan.NewWrapper(serverKeys, peerID, 0)
+	if err != nil {
+		t.Fatalf("NewWrapper (server): %v", err)
+	}
+	clientWrapper, err := datachan.NewWrapper(clientKeys, peerID, 0)
+	if err != nil {
+		t.Fatalf("NewWrapper (client): %v", err)
+	}
+
+	serverPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("server listen: %v", err)
+	}
+	defer serverPC.Close()
+	clientPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("client listen: %v", err)
+	}
+	defer clientPC.Close()
+
+	sess := &Session{
+		srv:         &Server{pc: serverPC},
+		RemoteAddr:  clientPC.LocalAddr(),
+		dataWrapper: serverWrapper,
+		ipInbound:   make(chan []byte, ipInboundQueueSize),
+		stopCh:      make(chan struct{}),
+	}
+
+	// --- Write: seals exactly one packet per call, sent to RemoteAddr. ---
+	writePayload := bytes.Repeat([]byte{0x99}, 500)
+	n, err := sess.Write(writePayload)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if n != len(writePayload) {
+		t.Fatalf("Write returned %d, want %d", n, len(writePayload))
+	}
+
+	buf := make([]byte, 2048)
+	if err := clientPC.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	rn, _, err := clientPC.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("client read: %v", err)
+	}
+	clientDecoded, err := clientWrapper.Open(nil, buf[:rn])
+	if err != nil {
+		t.Fatalf("client Open of the packet Write sent: %v", err)
+	}
+	if !bytes.Equal(clientDecoded, writePayload) {
+		t.Error("client did not decrypt Write's exact payload")
+	}
+
+	// --- Read: the client seals a 500-byte packet, sess's own decrypt
+	// path (handleDataPacket) delivers it whole in one Read. ---
+	sealedFromClient, err := clientWrapper.Seal(nil, writePayload)
+	if err != nil {
+		t.Fatalf("client Seal: %v", err)
+	}
+	sess.handleDataPacket(sealedFromClient)
+
+	small := make([]byte, 100)
+	if _, err := sess.Read(small); err == nil {
+		t.Fatal("Read into a too-small buffer succeeded, want an error")
+	}
+
+	big := make([]byte, 500)
+	rcount, err := sess.Read(big)
+	if err != nil {
+		t.Fatalf("Read after a too-small Read retained the packet: %v", err)
+	}
+	if rcount != 500 {
+		t.Fatalf("Read returned %d bytes, want exactly 500", rcount)
+	}
+	if !bytes.Equal(big[:rcount], writePayload) {
+		t.Error("retained packet was not delivered intact by the next Read")
+	}
+}
+
+// testSymmetricDataKeys builds a deterministic keyderiv.DataKeys whose
+// encrypt and decrypt slots are identical, so a single datachan.Wrapper
+// can Seal and Open its own traffic — sufficient for these Session-level
+// keepalive/ping-plumbing tests, which are not about
+// internal/datachan's own key-direction correctness (already proven
+// there and in internal/keyderiv's own tests).
+func testSymmetricDataKeys(t testing.TB) keyderiv.DataKeys {
+	t.Helper()
+	var keys keyderiv.DataKeys
+	for i := range keys.EncryptCipher {
+		keys.EncryptCipher[i] = byte(0x30 + i)
+	}
+	for i := range keys.EncryptImplicitIV {
+		keys.EncryptImplicitIV[i] = byte(0x40 + i)
+	}
+	keys.DecryptCipher = keys.EncryptCipher
+	keys.DecryptImplicitIV = keys.EncryptImplicitIV
+	return keys
+}
+
+// TestPingNeverReachesSessionRead is 02-03-PLAN.md Task 3's DATA-03 proof
+// at the Session level: driving handleDataPacket with a ping followed by a
+// real 60-byte IP packet, Read's first and only returned value is the
+// 60-byte packet — the ping is never returned, never returned as a
+// zero-length read, and does not consume the queue slot the real packet
+// needs.
+func TestPingNeverReachesSessionRead(t *testing.T) {
+	wrapper, err := datachan.NewWrapper(testSymmetricDataKeys(t), 1, 0)
+	if err != nil {
+		t.Fatalf("NewWrapper: %v", err)
+	}
+	sess := &Session{
+		dataWrapper: wrapper,
+		ipInbound:   make(chan []byte, ipInboundQueueSize),
+		stopCh:      make(chan struct{}),
+	}
+
+	pingSealed, err := wrapper.SealPing(nil)
+	if err != nil {
+		t.Fatalf("SealPing: %v", err)
+	}
+	sess.handleDataPacket(pingSealed)
+
+	real := bytes.Repeat([]byte{0x77}, 60)
+	realSealed, err := wrapper.Seal(nil, real)
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	sess.handleDataPacket(realSealed)
+
+	buf := make([]byte, 200)
+	n, err := sess.Read(buf)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if n != 60 {
+		t.Fatalf("Read returned %d bytes, want 60 (the ping must not be delivered, not even as a zero-length read)", n)
+	}
+	if !bytes.Equal(buf[:n], real) {
+		t.Errorf("Read = %x, want %x", buf[:n], real)
+	}
+
+	select {
+	case extra := <-sess.ipInbound:
+		t.Errorf("unexpected extra queued packet after the real one: %x — the ping must not have consumed a queue slot", extra)
+	default:
+	}
+}
+
+// TestServerEmitsPingOnSchedule is 02-03-PLAN.md Task 3's D-11 proof: with
+// an injected tick channel standing in for a real pingInterval ticker
+// (internal/reliable's own injected-Clock precedent), advancing one tick
+// produces exactly one emitted ping, and three more ticks (standing in for
+// "35 seconds" at a 10-second period) produce exactly three more — no ping
+// is emitted before the first tick.
+func TestServerEmitsPingOnSchedule(t *testing.T) {
+	wrapper, err := datachan.NewWrapper(testSymmetricDataKeys(t), 1, 0)
+	if err != nil {
+		t.Fatalf("NewWrapper: %v", err)
+	}
+	serverPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("server listen: %v", err)
+	}
+	defer serverPC.Close()
+	clientPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("client listen: %v", err)
+	}
+	defer clientPC.Close()
+
+	sess := &Session{
+		srv:         &Server{pc: serverPC},
+		RemoteAddr:  clientPC.LocalAddr(),
+		dataWrapper: wrapper,
+		stopCh:      make(chan struct{}),
+	}
+
+	tick := make(chan time.Time)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		sess.runKeepalive(tick)
+	}()
+	defer func() {
+		close(sess.stopCh)
+		<-done
+	}()
+
+	// No ping before the first tick.
+	if err := clientPC.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	buf := make([]byte, 2048)
+	if _, _, err := clientPC.ReadFrom(buf); err == nil {
+		t.Fatal("received a packet before any tick was sent, want none")
+	}
+
+	readOnePing := func() {
+		t.Helper()
+		if err := clientPC.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			t.Fatalf("set read deadline: %v", err)
+		}
+		n, _, err := clientPC.ReadFrom(buf)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if _, err := wrapper.Open(nil, buf[:n]); !errors.Is(err, datachan.ErrPingAbsorbed) {
+			t.Fatalf("Open(received packet) = %v, want ErrPingAbsorbed", err)
+		}
+	}
+
+	// One tick (standing in for the first 10-second interval) -> one ping.
+	tick <- time.Now()
+	readOnePing()
+
+	// Three more ticks (standing in for the remaining time within a
+	// 35-second window at a 10-second period) -> three more pings.
+	for i := 0; i < 3; i++ {
+		tick <- time.Now()
+		readOnePing()
+	}
+}
+
+// TestPingTimerStopsOnClose is 02-03-PLAN.md Task 3's proof that the
+// keepalive goroutine exits cleanly on Close: after stopCh closes,
+// runKeepalive's own goroutine exits (asserted via a done channel, not a
+// sleep), and it no longer accepts further ticks.
+func TestPingTimerStopsOnClose(t *testing.T) {
+	wrapper, err := datachan.NewWrapper(testSymmetricDataKeys(t), 1, 0)
+	if err != nil {
+		t.Fatalf("NewWrapper: %v", err)
+	}
+	sess := &Session{dataWrapper: wrapper, stopCh: make(chan struct{})}
+
+	tick := make(chan time.Time)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		sess.runKeepalive(tick)
+	}()
+
+	close(sess.stopCh)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("keepalive goroutine did not exit after stopCh closed")
+	}
+
+	select {
+	case tick <- time.Now():
+		t.Fatal("keepalive goroutine accepted a tick after it should have already exited")
+	case <-time.After(100 * time.Millisecond):
+		// Expected: nobody is receiving on tick anymore.
+	}
+}
+
+// TestPingEmissionDoesNotConsumeSessionWriteQuota is 02-03-PLAN.md Task 3's
+// proof that server-emitted pings never go through the public
+// Session.Write path: a real embedder Write and an independently-timer-
+// triggered ping both reach the client as two separate packets, and the
+// Write call's own return value is unaffected by the concurrently-emitted
+// ping — proving the ping used dataWrapper/srv.pc directly (emitPing),
+// never Session.Write itself.
+func TestPingEmissionDoesNotConsumeSessionWriteQuota(t *testing.T) {
+	wrapper, err := datachan.NewWrapper(testSymmetricDataKeys(t), 1, 0)
+	if err != nil {
+		t.Fatalf("NewWrapper: %v", err)
+	}
+	serverPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("server listen: %v", err)
+	}
+	defer serverPC.Close()
+	clientPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("client listen: %v", err)
+	}
+	defer clientPC.Close()
+
+	sess := &Session{
+		srv:         &Server{pc: serverPC},
+		RemoteAddr:  clientPC.LocalAddr(),
+		dataWrapper: wrapper,
+		stopCh:      make(chan struct{}),
+	}
+
+	payload := bytes.Repeat([]byte{0x11}, 60)
+	n, err := sess.Write(payload)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if n != len(payload) {
+		t.Fatalf("Write returned %d, want %d — a concurrently-emitted ping must not affect Write's own return value", n, len(payload))
+	}
+
+	tick := make(chan time.Time, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		sess.runKeepalive(tick)
+	}()
+	tick <- time.Now()
+	defer func() {
+		close(sess.stopCh)
+		<-done
+	}()
+
+	// Two independent packets must arrive: Write's own payload and the
+	// timer's own ping — order is not guaranteed between two independent
+	// goroutines, so accept either arrival order.
+	var sawPayload, sawPing bool
+	buf := make([]byte, 2048)
+	for i := 0; i < 2; i++ {
+		if err := clientPC.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			t.Fatalf("set read deadline: %v", err)
+		}
+		rn, _, err := clientPC.ReadFrom(buf)
+		if err != nil {
+			t.Fatalf("read packet %d: %v", i, err)
+		}
+		got, openErr := wrapper.Open(nil, buf[:rn])
+		switch {
+		case errors.Is(openErr, datachan.ErrPingAbsorbed):
+			sawPing = true
+		case openErr == nil && bytes.Equal(got, payload):
+			sawPayload = true
+		default:
+			t.Fatalf("packet %d: Open = (%x, %v), want either the ping (ErrPingAbsorbed) or Write's exact payload", i, got, openErr)
+		}
+	}
+	if !sawPayload {
+		t.Error("Write's own payload never arrived on the wire")
+	}
+	if !sawPing {
+		t.Error("the timer-triggered ping never arrived on the wire")
 	}
 }

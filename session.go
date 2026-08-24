@@ -4,12 +4,15 @@ import (
 	"bufio"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/8upio/govpn/internal/ctrlconn"
+	"github.com/8upio/govpn/internal/datachan"
 	"github.com/8upio/govpn/internal/keyderiv"
 	"github.com/8upio/govpn/internal/tlscrypt"
 	"github.com/8upio/govpn/internal/wire"
@@ -23,14 +26,14 @@ import (
 // The Session handed to OnSession is therefore immediately usable:
 // AssignedIP() is already populated.
 //
-// Session becomes a full io.ReadWriteCloser for raw, decrypted IP packets
-// once the AES-256-GCM data channel exists (plan 02-03). This plan
-// declares the io.ReadWriteCloser methods so the public shape is stable
-// across the phase, but Read/Write are deliberately unimplemented
-// placeholders here: there is no data channel yet to read from or write
-// to, and pretending otherwise would be scope creep into plan 02-03's
-// territory. Close is real — it tears down this session's control channel
-// and releases its tunnel IP and peer-id back to the pool.
+// Session is a full io.ReadWriteCloser for raw, decrypted IP packets:
+// Read/Write are datagram-shaped (D-05) — one full IP packet per call, a
+// buffer too small for the next packet on Read returns an error rather
+// than truncating — backed by the AES-256-GCM data channel
+// (internal/datachan). A 16-byte ping keepalive is absorbed entirely
+// inside the decrypt path and never reaches Read's caller (D-11). Close
+// tears down this session's control channel and releases its tunnel IP
+// and peer-id back to the pool.
 type Session struct {
 	// SessionID is this session's server-assigned 8-byte control-channel
 	// session ID.
@@ -141,9 +144,39 @@ type Session struct {
 
 	// peerID is this session's 24-bit peer-id, allocated alongside
 	// assignedIP from the same Server.pool call and pushed to the client
-	// as `peer-id <n>`. Plan 02-03 keys its data-packet routing table on
-	// this same value (D-16).
+	// as `peer-id <n>`. Server.dataSessions keys its data-packet routing
+	// table on this same value (D-16).
 	peerID uint32
+
+	// dataWrapper is this session's AES-256-GCM data-channel Wrapper,
+	// built from sess.dataKeys.ServerSlots() at the same point assignedIP/
+	// peerID are allocated (ovpn.go's performPushExchange) — live before
+	// OnSession ever fires (D-08). nil until then; Read/Write on a nil
+	// dataWrapper is a bug elsewhere (Read blocks forever, Write errors)
+	// since D-08 guarantees a Session handed to an embedder always has one.
+	dataWrapper *datachan.Wrapper
+
+	// ipInbound is fed decrypted IP packets by handleDataDatagram's decrypt
+	// path (ovpn.go) and drained by Read. Sized ipInboundQueueSize (D-14,
+	// matching Phase 1's inboundQueueSize): a slow embedder must never
+	// block the shared UDP read loop, so a full queue drops the newest
+	// packet exactly like inbound above (D-06) — that policy governs
+	// arrival, not delivery: once a packet has been pulled off this
+	// channel, pendingRead below is what keeps Read from then losing it.
+	// Never closed directly — Read selects on stopCh instead, the same
+	// discipline pump/inbound already establish.
+	ipInbound chan []byte
+
+	// pendingRead holds a decrypted IP packet Read already pulled off
+	// ipInbound but could not deliver because the caller's buffer was too
+	// small (D-05: Read must not truncate and must not silently discard —
+	// "packet retained" is the choice this Session makes, the other
+	// D-05-compliant option being "packet dropped with an error"). The
+	// next Read call, with any buffer, checks here first. Assumes the
+	// single-reader-goroutine convention io.Reader implementations
+	// ordinarily rely on; concurrent Read calls on one Session are not
+	// supported (mirrors bufio.Reader's own contract).
+	pendingRead []byte
 }
 
 // PushRequestSeen reports whether this session's client has sent its
@@ -185,18 +218,144 @@ func (s *Session) PeerID() uint32 {
 	return s.peerID
 }
 
-// Read is a placeholder: there is no data channel yet to read raw IP
-// packets from. It always returns io.EOF. Plan 02-03 replaces this with
-// real AES-256-GCM data-channel decryption.
+// Read delivers exactly one raw, decrypted IP packet per call (D-05):
+// datagram-shaped, never a stream. If p is too small to hold the next
+// packet, Read returns a typed error and RETAINS the packet in
+// pendingRead rather than truncating it or discarding it silently — a
+// subsequent Read with a large enough buffer still receives it, in full,
+// undamaged. (D-05 leaves the choice between "packet retained" and
+// "packet dropped with an error" to the implementation; this Session
+// retains.) Read blocks until a packet arrives or the Session is closed,
+// in which case it returns io.EOF.
 func (s *Session) Read(p []byte) (int, error) {
-	return 0, io.EOF
+	if s.pendingRead != nil {
+		pkt := s.pendingRead
+		if len(p) < len(pkt) {
+			return 0, fmt.Errorf("ovpn: read buffer (%d bytes) too small for %d-byte packet; packet retained for a future Read", len(p), len(pkt))
+		}
+		s.pendingRead = nil
+		return copy(p, pkt), nil
+	}
+
+	select {
+	case pkt := <-s.ipInbound:
+		if len(p) < len(pkt) {
+			s.pendingRead = pkt
+			return 0, fmt.Errorf("ovpn: read buffer (%d bytes) too small for %d-byte packet; packet retained for a future Read", len(p), len(pkt))
+		}
+		return copy(p, pkt), nil
+	case <-s.stopCh:
+		return 0, io.EOF
+	}
 }
 
-// Write is a placeholder: there is no data channel yet to write raw IP
-// packets to. Plan 02-03 replaces this with real AES-256-GCM data-channel
-// encryption.
+// Write encrypts p as one P_DATA_V2 packet (D-05: one full IP packet per
+// call) and sends it to the client's UDP address over the same
+// net.PacketConn the control channel uses. It returns len(p) on success,
+// matching io.Writer's contract for a full write.
 func (s *Session) Write(p []byte) (int, error) {
-	return 0, errors.New("ovpn: data channel not implemented until plan 02-03")
+	if s.dataWrapper == nil {
+		return 0, errors.New("ovpn: data channel not yet established")
+	}
+	sealed, err := s.dataWrapper.Seal(nil, p)
+	if err != nil {
+		return 0, fmt.Errorf("ovpn: seal data packet: %w", err)
+	}
+	if s.srv == nil || s.srv.pc == nil {
+		return 0, errors.New("ovpn: session has no transport")
+	}
+	if _, err := s.srv.pc.WriteTo(sealed, s.RemoteAddr); err != nil {
+		return 0, fmt.Errorf("ovpn: write data packet: %w", err)
+	}
+	return len(p), nil
+}
+
+// handleDataPacket decrypts an inbound P_DATA_V2 payload (ovpn.go's
+// handleDataDatagram) and, unless it fails to authenticate or is a ping
+// (absorbed inside Wrapper.Open — D-11, never surfaced here), delivers it
+// into ipInbound using the same non-blocking select+default drop policy
+// inbound above already uses (D-06): a slow embedder must never block the
+// shared UDP read loop. An authentication failure is dropped silently,
+// exactly like a forged control packet — no allocation, no per-attacker
+// state (T-02-17).
+func (s *Session) handleDataPacket(packet []byte) {
+	if s.dataWrapper == nil {
+		return
+	}
+	plaintext, err := s.dataWrapper.Open(nil, packet)
+	if err != nil {
+		// Includes datachan.ErrPingAbsorbed: a ping is absorbed inside
+		// Open, never delivered, and never counts as a delivered IP
+		// packet.
+		return
+	}
+	select {
+	case s.ipInbound <- plaintext:
+	case <-s.stopCh:
+	default:
+		// Queue full: drop this decrypted packet exactly as a genuinely
+		// congested link would (D-06) — never block handleDatagram's
+		// per-datagram goroutine.
+	}
+}
+
+// startKeepalive starts this session's per-session keepalive goroutine
+// (D-11): a real time.Ticker at pingInterval feeds runKeepalive below.
+// Called once, from ovpn.go's performPushExchange, at the same point the
+// data wrapper goes live — alongside the PUSH_REPLY write, before
+// OnSession ever fires.
+func (s *Session) startKeepalive() {
+	ticker := time.NewTicker(pingInterval)
+	go func() {
+		defer ticker.Stop()
+		s.runKeepalive(ticker.C)
+	}()
+}
+
+// runKeepalive is startKeepalive's own core loop, factored out so tests
+// can drive it from an injected tick channel instead of a real
+// pingInterval-second ticker — internal/reliable's own injected-Clock
+// precedent, applied here as an injected ticker channel (the constructor-
+// supplied-channel option 02-03-PLAN.md's own action text names) so
+// TestServerEmitsPingOnSchedule/TestPingTimerStopsOnClose run in
+// milliseconds, not real 10-second waits. It selects on stopCh and exits
+// on Close, the same discipline pump/handleDataPacket already establish —
+// no second teardown signal.
+//
+// This goroutine only EMITS pings; it does not implement ping-restart /
+// idle-session reaping (detecting a dead peer from a missing reply) —
+// that is SESS-05, Phase 4's scope.
+func (s *Session) runKeepalive(tickCh <-chan time.Time) {
+	for {
+		select {
+		case <-tickCh:
+			s.emitPing()
+		case <-s.stopCh:
+			return
+		}
+	}
+}
+
+// emitPing seals and sends one ping keepalive packet directly through
+// dataWrapper and srv.pc — deliberately NOT through Session.Write, so a
+// server-emitted ping never appears to the embedder as bytes written
+// through the public Write path and never affects anything Write's own
+// return value represents.
+func (s *Session) emitPing() {
+	if s.dataWrapper == nil {
+		return
+	}
+	sealed, err := s.dataWrapper.SealPing(nil)
+	if err != nil {
+		// ErrPacketIDExhausted or similar — nothing more to do; the next
+		// tick tries again (and will fail the same way until Phase 4's
+		// renegotiation, out of this phase's scope).
+		return
+	}
+	if s.srv == nil || s.srv.pc == nil {
+		return
+	}
+	_, _ = s.srv.pc.WriteTo(sealed, s.RemoteAddr)
 }
 
 // ConnectionState returns this session's underlying TLS connection state
@@ -223,6 +382,13 @@ func (s *Session) Close() error {
 		if s.srv != nil {
 			if s.assignedIP != nil && s.srv.pool != nil {
 				s.srv.pool.release(s.assignedIP, s.peerID)
+			}
+			if s.dataWrapper != nil {
+				s.srv.mu.Lock()
+				if existing, ok := s.srv.dataSessions[s.peerID]; ok && existing == s {
+					delete(s.srv.dataSessions, s.peerID)
+				}
+				s.srv.mu.Unlock()
 			}
 			s.srv.removeSession(s)
 		}

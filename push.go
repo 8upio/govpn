@@ -89,7 +89,10 @@ func buildPushReply(clientIP net.IP, network *net.IPNet, peerID uint32, cipher s
 		"topology subnet",
 		fmt.Sprintf("peer-id %d", peerID),
 		fmt.Sprintf("cipher %s", cipher),
-		"ping 10",
+		// pingIntervalSeconds (ovpn.go, D-11) is the SAME constant
+		// session.go's keepalive goroutine reads for its own emission
+		// period — the pushed and emitted schedules cannot drift apart.
+		fmt.Sprintf("ping %d", pingIntervalSeconds),
 		"ping-restart 60",
 	}
 	reply := strings.Join(opts, ",")
