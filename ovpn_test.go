@@ -113,6 +113,53 @@ func readAndParseReply(t testing.TB, clientPC net.PacketConn, clientWrap *tlscry
 	return cp
 }
 
+// TestDuplicateCNGetsDistinctIPs is 02-02-PLAN.md Task 2's D-04 proof: two
+// sessions whose verified CommonName is identical (the reference's own
+// --duplicate-cn semantics — duplicate connections from the same client
+// identity are allowed, each getting its own tunnel address) still receive
+// distinct addresses and peer-ids. ipPool.allocate takes no identity
+// parameter at all, so it cannot special-case a CommonName even if it
+// wanted to — this test drives that property directly against two Session
+// values sharing the same PeerCN, exactly mirroring how ovpn.go's
+// performPushExchange calls s.pool.allocate() with no knowledge of
+// sess.PeerCN.
+func TestDuplicateCNGetsDistinctIPs(t *testing.T) {
+	_, network, err := net.ParseCIDR("10.8.0.0/24")
+	if err != nil {
+		t.Fatalf("parse network: %v", err)
+	}
+	pool, err := newIPPool(network)
+	if err != nil {
+		t.Fatalf("newIPPool: %v", err)
+	}
+
+	const duplicateCN = "duplicate-client"
+	sess1 := &Session{PeerCN: duplicateCN}
+	sess2 := &Session{PeerCN: duplicateCN}
+
+	ip1, peerID1, err := pool.allocate()
+	if err != nil {
+		t.Fatalf("allocate for sess1: %v", err)
+	}
+	sess1.assignedIP, sess1.peerID = ip1, peerID1
+
+	ip2, peerID2, err := pool.allocate()
+	if err != nil {
+		t.Fatalf("allocate for sess2: %v", err)
+	}
+	sess2.assignedIP, sess2.peerID = ip2, peerID2
+
+	if sess1.PeerCN != sess2.PeerCN {
+		t.Fatalf("test setup bug: sessions do not share a CommonName (%q vs %q)", sess1.PeerCN, sess2.PeerCN)
+	}
+	if sess1.assignedIP.Equal(sess2.assignedIP) {
+		t.Errorf("two sessions with identical PeerCN %q got the same tunnel address %s", duplicateCN, sess1.assignedIP)
+	}
+	if sess1.peerID == sess2.peerID {
+		t.Errorf("two sessions with identical PeerCN %q got the same peer-id %d", duplicateCN, sess1.peerID)
+	}
+}
+
 func TestHardResetRoundTrip(t *testing.T) {
 	key := testTLSCryptKey(t)
 
