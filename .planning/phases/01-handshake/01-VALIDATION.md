@@ -3,7 +3,7 @@ phase: 1
 slug: handshake
 # status lifecycle: draft (seeded by plan-phase) → validated (set by validate-phase §6)
 # audit-milestone §5.5 distinguishes NOT-VALIDATED (draft) from PARTIAL (validated + nyquist_compliant: false) (#2117)
-status: draft
+status: validated
 nyquist_compliant: true
 wave_0_complete: false
 created: 2026-08-23
@@ -43,16 +43,16 @@ The Docker-dependent interop tier is isolated behind the `interop` build tag so
 
 | Task ID | Plan | Wave | Requirement | Threat Ref | Secure Behavior | Test Type | Automated Command | File Exists | Status |
 |---------|------|------|-------------|------------|-----------------|-----------|-------------------|-------------|--------|
-| 1-01-01 | 01 | 1 | WIRE-01, WIRE-04, SESS-01 | T-01-01 / T-01-02 / T-01-06 | Length + opcode triage before allocation; `hmac.Equal` tag check before decrypt; session IDs from `crypto/rand` | unit (tracer, e2e over loopback UDP) | `go build ./... && go vet ./... && go test -race -run 'TestHardResetRoundTrip\|TestConcurrentSessions\|TestServeClose' -v .` | ❌ W0 (created by this task) | ⬜ pending |
-| 1-01-02 | 01 | 1 | WIRE-01, WIRE-04 | T-01-03 / T-01-04 | Bounds-checked parse returns typed errors, never panics; tls-crypt replay window rejects reused sequence numbers | unit (golden vector + fuzz) | `go test -race ./internal/... && go test -race -run Fuzz -fuzz FuzzParseControlPacket -fuzztime 20s ./internal/wire/` | ❌ W0 (created by this task) | ⬜ pending |
-| 1-02-01 | 02 | 2 | VRFY-01, SESS-01 | T-01-07 / T-01-08 / T-01-09 / T-01-11 | Server container unprivileged and capability-clean; base image digest-pinned; PKI namespaced and per-run | integration/e2e (Docker) | `go run ./cmd/gentestpki -out test/interop/pki && go test -tags interop -count=1 -timeout 300s -run TestRealClientFirstContact -v ./test/interop/` | ❌ W0 (created by this task) | ⬜ pending |
-| 1-02-02 | 02 | 2 | WIRE-04, VRFY-01 | T-01-10 / T-01-11 | Every wire datagram authenticates under the tls-crypt key; assertion demonstrated to fail on a tampered capture | integration (pcap assertion) | `go test -tags interop -count=1 -timeout 300s -run 'TestRealClientFirstContact\|TestCaptureIsFullyTLSCryptWrapped' -v ./test/interop/` | ❌ W0 (created by this task) | ⬜ pending |
-| 1-03-01 | 03 | 3 | CTRL-01, CTRL-02, CTRL-03, SESS-01 | T-01-12 / T-01-16 / T-01-17 | Mutual cert verification with pinned CA pool and explicit TLS 1.2 floor; `OnSession` gated on a successful handshake | unit (tracer, loopback TLS over two real `Conn`s) | `go build ./... && go vet ./... && go test -race -run TestTLSHandshakeOverCtrlConn -v ./internal/ctrlconn/ && go test -race ./...` | ❌ W0 (created by this task) | ⬜ pending |
-| 1-03-02 | 03 | 3 | CTRL-01 | T-01-13 / T-01-14 / T-01-15 | Bounded windows and sequentiality refusal prevent unbounded buffering; replay and out-of-window IDs rejected | unit (clock-injected, deterministic) | `go test -race -count=2 ./internal/reliable/ ./internal/ctrlconn/ -v` | ❌ W0 (created by this task) | ⬜ pending |
-| 1-03-03 | 03 | 3 | CTRL-03, VRFY-01 | T-01-12 / T-01-17 | Both sides report the CA-verified peer CommonName; post-handshake application data does not reset the session | integration/e2e (Docker) | `go run ./cmd/gentestpki -out test/interop/pki && go test -tags interop -count=1 -timeout 300s -v ./test/interop/` | ✅ (extends 1-02-01) | ⬜ pending |
-| 1-04-01 | 04 | 4 | CTRL-01, CTRL-02, VRFY-01 | T-01-18 / T-01-19 / T-01-21 | Loss injected without granting the server container any production-absent privilege; `docker inspect` re-asserted in the lossy scenario | integration/e2e (Docker, tracer) | `go run ./cmd/gentestpki -out test/interop/pki -profile large && go test -tags interop -count=1 -timeout 900s -run TestInteropScenarios -v ./test/interop/` | ✅ (extends 1-02-01) | ⬜ pending |
-| 1-04-02 | 04 | 4 | WIRE-01, WIRE-04 | T-01-20 / T-01-23 | Committed corpus key marked throwaway with full provenance; regeneration is a deliberate `make golden` act | unit (golden vector, real-client bytes, fast tier) | `go test -race -run 'TestGolden' -v ./internal/wire/ ./internal/tlscrypt/ && go test -race ./...` | ❌ W0 (created by this task) | ⬜ pending |
-| 1-04-03 | 04 | 4 | VRFY-01 | T-01-22 | Interop CI job fails rather than skips when Docker is unavailable; no `continue-on-error` on the test step | CI wiring | `make test && test -f .github/workflows/ci.yml && grep -c 'go test -race' .github/workflows/ci.yml` | ❌ W0 (created by this task) | ⬜ pending |
+| 1-01-01 | 01 | 1 | WIRE-01, WIRE-04, SESS-01 | T-01-01 / T-01-02 / T-01-06 | Length + opcode triage before allocation; `hmac.Equal` tag check before decrypt; session IDs from `crypto/rand` | unit (tracer, e2e over loopback UDP) | `go build ./... && go vet ./... && go test -race -run 'TestHardResetRoundTrip\|TestConcurrentSessions\|TestServeClose' -v .` | ❌ W0 (created by this task) | ✅ green |
+| 1-01-02 | 01 | 1 | WIRE-01, WIRE-04 | T-01-03 / T-01-04 | Bounds-checked parse returns typed errors, never panics; tls-crypt replay window rejects reused sequence numbers | unit (golden vector + fuzz) | `go test -race ./internal/... && go test -race -run Fuzz -fuzz FuzzParseControlPacket -fuzztime 20s ./internal/wire/` | ❌ W0 (created by this task) | ✅ green |
+| 1-02-01 | 02 | 2 | VRFY-01, SESS-01 | T-01-07 / T-01-08 / T-01-09 / T-01-11 | Server container unprivileged and capability-clean; base image digest-pinned; PKI namespaced and per-run | integration/e2e (Docker) | `go run ./cmd/gentestpki -out test/interop/pki && go test -tags interop -count=1 -timeout 300s -run TestRealClientFirstContact -v ./test/interop/` | ❌ W0 (created by this task) | ✅ green |
+| 1-02-02 | 02 | 2 | WIRE-04, VRFY-01 | T-01-10 / T-01-11 | Every wire datagram authenticates under the tls-crypt key; assertion demonstrated to fail on a tampered capture | integration (pcap assertion) | `go test -tags interop -count=1 -timeout 300s -run 'TestRealClientFirstContact\|TestCaptureIsFullyTLSCryptWrapped' -v ./test/interop/` | ❌ W0 (created by this task) | ✅ green |
+| 1-03-01 | 03 | 3 | CTRL-01, CTRL-02, CTRL-03, SESS-01 | T-01-12 / T-01-16 / T-01-17 | Mutual cert verification with pinned CA pool and explicit TLS 1.2 floor; `OnSession` gated on a successful handshake | unit (tracer, loopback TLS over two real `Conn`s) | `go build ./... && go vet ./... && go test -race -run TestTLSHandshakeOverCtrlConn -v ./internal/ctrlconn/ && go test -race ./...` | ❌ W0 (created by this task) | ✅ green |
+| 1-03-02 | 03 | 3 | CTRL-01 | T-01-13 / T-01-14 / T-01-15 | Bounded windows and sequentiality refusal prevent unbounded buffering; replay and out-of-window IDs rejected | unit (clock-injected, deterministic) | `go test -race -count=2 ./internal/reliable/ ./internal/ctrlconn/ -v` | ❌ W0 (created by this task) | ✅ green |
+| 1-03-03 | 03 | 3 | CTRL-03, VRFY-01 | T-01-12 / T-01-17 | Both sides report the CA-verified peer CommonName; post-handshake application data does not reset the session | integration/e2e (Docker) | `go run ./cmd/gentestpki -out test/interop/pki && go test -tags interop -count=1 -timeout 300s -v ./test/interop/` | ✅ (extends 1-02-01) | ✅ green |
+| 1-04-01 | 04 | 4 | CTRL-01, CTRL-02, VRFY-01 | T-01-18 / T-01-19 / T-01-21 | Loss injected without granting the server container any production-absent privilege; `docker inspect` re-asserted in the lossy scenario | integration/e2e (Docker, tracer) | `go run ./cmd/gentestpki -out test/interop/pki -profile large && go test -tags interop -count=1 -timeout 900s -run TestInteropScenarios -v ./test/interop/` | ✅ (extends 1-02-01) | ✅ green |
+| 1-04-02 | 04 | 4 | WIRE-01, WIRE-04 | T-01-20 / T-01-23 | Committed corpus key marked throwaway with full provenance; regeneration is a deliberate `make golden` act | unit (golden vector, real-client bytes, fast tier) | `go test -race -run 'TestGolden' -v ./internal/wire/ ./internal/tlscrypt/ && go test -race ./...` | ❌ W0 (created by this task) | ✅ green |
+| 1-04-03 | 04 | 4 | VRFY-01 | T-01-22 | Interop CI job fails rather than skips when Docker is unavailable; no `continue-on-error` on the test step | CI wiring | `make test && test -f .github/workflows/ci.yml && grep -c 'go test -race' .github/workflows/ci.yml` | ❌ W0 (created by this task) | ✅ green |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
 
@@ -64,17 +64,17 @@ Greenfield repository — zero source files exist. Every item below is created i
 by the task named, so no task's automated command references infrastructure that no task
 produces.
 
-- [ ] `go.mod` — module init, `go 1.24` directive, zero dependencies (task 1-01-01)
-- [ ] `ovpn_test.go` — end-to-end reset round trip over loopback UDP (task 1-01-01)
-- [ ] `internal/wire/wire_test.go` — WIRE-01 table vectors + `FuzzParseControlPacket` (task 1-01-02)
-- [ ] `internal/tlscrypt/tlscrypt_test.go`, `internal/tlscrypt/keyfile_test.go` — WIRE-04 vectors (task 1-01-02)
-- [ ] `cmd/gentestpki/main.go` — Go-generated CA, certs, tls-crypt key and client `.conf` (task 1-02-01)
-- [ ] `test/interop/Dockerfile` (digest-pinned `debian:bookworm-slim` + `openvpn`/`tcpdump`/`iproute2`), `test/interop/docker-compose.yml`, `test/interop/server/main.go`, `test/interop/interop_test.go` (task 1-02-01)
-- [ ] `test/interop/pcap.go`, `test/interop/capture_test.go`, `test/interop/entrypoint.sh` (task 1-02-02)
-- [ ] `Makefile` — `test` / `interop` targets (task 1-02-01), `golden` target (task 1-04-03)
-- [ ] `internal/ctrlconn/conn_test.go` (task 1-03-01), `internal/reliable/reliable_test.go` (task 1-03-02)
-- [ ] `testdata/golden/` corpus + README, `internal/wire/golden_test.go`, `internal/tlscrypt/golden_test.go` (task 1-04-02)
-- [ ] `.github/workflows/ci.yml` (task 1-04-03)
+- [x] `go.mod` — module init, `go 1.24` directive, zero dependencies (task 1-01-01)
+- [x] `ovpn_test.go` — end-to-end reset round trip over loopback UDP (task 1-01-01)
+- [x] `internal/wire/wire_test.go` — WIRE-01 table vectors + `FuzzParseControlPacket` (task 1-01-02)
+- [x] `internal/tlscrypt/tlscrypt_test.go`, `internal/tlscrypt/keyfile_test.go` — WIRE-04 vectors (task 1-01-02)
+- [x] `cmd/gentestpki/main.go` — Go-generated CA, certs, tls-crypt key and client `.conf` (task 1-02-01)
+- [x] `test/interop/Dockerfile` (digest-pinned `debian:bookworm-slim` + `openvpn`/`tcpdump`/`iproute2`), `test/interop/docker-compose.yml`, `test/interop/server/main.go`, `test/interop/interop_test.go` (task 1-02-01)
+- [x] `test/interop/pcap.go`, `test/interop/capture_test.go`, `test/interop/entrypoint.sh` (task 1-02-02)
+- [x] `Makefile` — `test` / `interop` targets (task 1-02-01), `golden` target (task 1-04-03)
+- [x] `internal/ctrlconn/conn_test.go` (task 1-03-01), `internal/reliable/reliable_test.go` (task 1-03-02)
+- [x] `testdata/golden/` corpus + README, `internal/wire/golden_test.go`, `internal/tlscrypt/golden_test.go` (task 1-04-02)
+- [x] `.github/workflows/ci.yml` (task 1-04-03)
 
 ---
 
@@ -101,4 +101,13 @@ is the sole evidence for a requirement.
 - [x] Feedback latency < 30s for the fast tier
 - [x] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** pending — set `status: validated` after the phase executes and the map's Status column is filled in.
+**Approval:** validated 2026-08-24 — all 10 automated commands green (fast tier re-run live; Docker interop tier re-run live and independently by the phase verifier, see 01-VERIFICATION.md).
+
+## Validation Audit 2026-08-24
+| Metric | Count |
+|--------|-------|
+| Gaps found | 0 |
+| Resolved | 0 |
+| Escalated | 0 |
+
+Fast-tier commands (1-01-01, 1-01-02, 1-03-01, 1-03-02, 1-04-02, 1-04-03) re-run live during this audit — all green, including the 20s FuzzParseControlPacket run. Docker-tier commands (1-02-01, 1-02-02, 1-03-03, 1-04-01) verified via the phase verifier's independent live re-run (01-VERIFICATION.md, all three interop scenarios passing). Additional regression coverage added post-review: TestHandshakeWindowTearsDownStalledSession (cf04830).
