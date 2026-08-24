@@ -106,6 +106,13 @@ type sessionKey struct {
 type Server struct {
 	cfg Config
 
+	// handshakeWindow bounds how long a session may sit in an incomplete
+	// handshake before enforceHandshakeWindow tears it down. It defaults to
+	// reliable.HandshakeWindow (the reference's --hand-window, 60s) and
+	// exists as a field only so tests can exercise the timeout-triggered
+	// teardown path without waiting a real minute.
+	handshakeWindow time.Duration
+
 	mu       sync.Mutex
 	pc       net.PacketConn
 	closed   bool
@@ -116,8 +123,9 @@ type Server struct {
 // Serve to begin reading from a net.PacketConn.
 func NewServer(cfg Config) *Server {
 	return &Server{
-		cfg:      cfg,
-		sessions: make(map[sessionKey]*Session),
+		cfg:             cfg,
+		handshakeWindow: reliable.HandshakeWindow,
+		sessions:        make(map[sessionKey]*Session),
 	}
 }
 
@@ -405,7 +413,7 @@ func (s *Server) enforceHandshakeWindow(sess *Session) {
 	select {
 	case <-sess.doneCh:
 		return
-	case <-time.After(reliable.HandshakeWindow):
+	case <-time.After(s.handshakeWindow):
 		_ = sess.Close()
 	}
 }

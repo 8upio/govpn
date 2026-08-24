@@ -384,6 +384,97 @@ func TestSessionCloseStopsPumpAndRemovesFromSessions(t *testing.T) {
 	}
 }
 
+// TestHandshakeWindowTearsDownStalledSession verifies the
+// timeout-triggered teardown path of enforceHandshakeWindow: a client that
+// sends its hard reset but never progresses the TLS handshake must be torn
+// down once the handshake window elapses — removed from Server.sessions
+// with all three per-session goroutines (pump, runHandshake,
+// enforceHandshakeWindow) exiting. Unlike
+// TestSessionCloseStopsPumpAndRemovesFromSessions, nothing here ever calls
+// Close explicitly; the window expiry alone must do the whole teardown.
+// The window is shortened via the test-injectable Server.handshakeWindow
+// field (production default: reliable.HandshakeWindow, 60s).
+func TestHandshakeWindowTearsDownStalledSession(t *testing.T) {
+	key := testTLSCryptKey(t)
+
+	serverPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("server listen: %v", err)
+	}
+	defer serverPC.Close()
+
+	srv := NewServer(Config{TLSCryptKey: key, TLSConfig: testTLSConfig(t)})
+	srv.handshakeWindow = 150 * time.Millisecond
+	go func() { _ = srv.Serve(serverPC) }()
+	defer srv.Close()
+
+	clientPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("client listen: %v", err)
+	}
+	defer clientPC.Close()
+
+	clientWrap, err := tlscrypt.NewWrapper(key, false)
+	if err != nil {
+		t.Fatalf("client wrapper: %v", err)
+	}
+
+	runtime.GC()
+	baseline := runtime.NumGoroutine()
+
+	clientSID := wire.SessionID{7, 7, 7, 7, 7, 7, 7, 7}
+	packet := clientHardReset(t, clientWrap, clientSID)
+	if _, err := clientPC.WriteTo(packet, serverPC.LocalAddr()); err != nil {
+		t.Fatalf("write hard reset: %v", err)
+	}
+	readAndParseReply(t, clientPC, clientWrap)
+
+	// The session must exist before the window elapses.
+	var sess *Session
+	deadline := time.Now().Add(2 * time.Second)
+	for sess == nil && time.Now().Before(deadline) {
+		srv.mu.Lock()
+		for _, s := range srv.sessions {
+			sess = s
+		}
+		srv.mu.Unlock()
+		if sess == nil {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	if sess == nil {
+		t.Fatal("expected a session to have been created in Server.sessions")
+	}
+
+	// Stall: never speak TLS. The window expiry alone must remove the
+	// session and wind down its goroutines.
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		srv.mu.Lock()
+		_, stillPresent := srv.sessions[sess.key]
+		srv.mu.Unlock()
+		if !stillPresent {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("session still present in Server.sessions after handshake window elapsed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		runtime.GC()
+		if n := runtime.NumGoroutine(); n <= baseline {
+			break
+		} else if time.Now().After(deadline) {
+			t.Errorf("goroutine count did not return to baseline after window teardown: got %d, want <= %d", n, baseline)
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // TestOnSessionPanicRecovered is a regression test for WR-01/WR-03
 // (01-REVIEW.md): a panicking Config.OnSession callback must not crash the
 // process, and — since WR-03's fix — the recovered panic value must be
