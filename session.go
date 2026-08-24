@@ -9,6 +9,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/8upio/govpn/internal/ctrlconn"
 	"github.com/8upio/govpn/internal/datachan"
@@ -296,6 +297,65 @@ func (s *Session) handleDataPacket(packet []byte) {
 		// congested link would (D-06) — never block handleDatagram's
 		// per-datagram goroutine.
 	}
+}
+
+// startKeepalive starts this session's per-session keepalive goroutine
+// (D-11): a real time.Ticker at pingInterval feeds runKeepalive below.
+// Called once, from ovpn.go's performPushExchange, at the same point the
+// data wrapper goes live — alongside the PUSH_REPLY write, before
+// OnSession ever fires.
+func (s *Session) startKeepalive() {
+	ticker := time.NewTicker(pingInterval)
+	go func() {
+		defer ticker.Stop()
+		s.runKeepalive(ticker.C)
+	}()
+}
+
+// runKeepalive is startKeepalive's own core loop, factored out so tests
+// can drive it from an injected tick channel instead of a real
+// pingInterval-second ticker — internal/reliable's own injected-Clock
+// precedent, applied here as an injected ticker channel (the constructor-
+// supplied-channel option 02-03-PLAN.md's own action text names) so
+// TestServerEmitsPingOnSchedule/TestPingTimerStopsOnClose run in
+// milliseconds, not real 10-second waits. It selects on stopCh and exits
+// on Close, the same discipline pump/handleDataPacket already establish —
+// no second teardown signal.
+//
+// This goroutine only EMITS pings; it does not implement ping-restart /
+// idle-session reaping (detecting a dead peer from a missing reply) —
+// that is SESS-05, Phase 4's scope.
+func (s *Session) runKeepalive(tickCh <-chan time.Time) {
+	for {
+		select {
+		case <-tickCh:
+			s.emitPing()
+		case <-s.stopCh:
+			return
+		}
+	}
+}
+
+// emitPing seals and sends one ping keepalive packet directly through
+// dataWrapper and srv.pc — deliberately NOT through Session.Write, so a
+// server-emitted ping never appears to the embedder as bytes written
+// through the public Write path and never affects anything Write's own
+// return value represents.
+func (s *Session) emitPing() {
+	if s.dataWrapper == nil {
+		return
+	}
+	sealed, err := s.dataWrapper.SealPing(nil)
+	if err != nil {
+		// ErrPacketIDExhausted or similar — nothing more to do; the next
+		// tick tries again (and will fail the same way until Phase 4's
+		// renegotiation, out of this phase's scope).
+		return
+	}
+	if s.srv == nil || s.srv.pc == nil {
+		return
+	}
+	_, _ = s.srv.pc.WriteTo(sealed, s.RemoteAddr)
 }
 
 // ConnectionState returns this session's underlying TLS connection state

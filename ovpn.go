@@ -117,6 +117,15 @@ const (
 	// (SESS-04, Phase 4), so every session ever has exactly one data-
 	// channel key slot.
 	dataChannelKeyID = 0
+
+	// pingIntervalSeconds is the fixed v1 keepalive schedule (D-11):
+	// push.go's buildPushReply pushes `ping N` using this exact value, and
+	// session.go's per-session keepalive goroutine emits its own pings on
+	// this exact period — reading both from one constant is what makes the
+	// pushed schedule and the emitted schedule structurally unable to
+	// drift apart. Not configurable in v1 (RESEARCH.md Deferred Ideas).
+	pingIntervalSeconds = 10
+	pingInterval        = pingIntervalSeconds * time.Second
 )
 
 // serverKM2Options is the options string this server sends in its own Key
@@ -576,6 +585,12 @@ func (s *Server) performPushExchange(sess *Session, w io.Writer) error {
 			s.mu.Lock()
 			s.dataSessions[peerID] = sess
 			s.mu.Unlock()
+
+			// D-11: the keepalive goroutine starts here too — alongside
+			// the data wrapper, before PUSH_REPLY is written and well
+			// before OnSession fires — emitting on exactly the schedule
+			// buildPushReply below pushes to the client.
+			sess.startKeepalive()
 		}
 
 		reply := buildPushReply(sess.assignedIP, s.cfg.Network, sess.peerID, cipher)

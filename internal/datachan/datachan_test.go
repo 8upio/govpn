@@ -266,44 +266,6 @@ func TestPacketIDStartsAtOne(t *testing.T) {
 	}
 }
 
-// TestOpenAbsorbsPingWithoutDeliveringPlaintext proves the tracer's own
-// minimal ping guard (Task 1's action text) works before Task 3 completes
-// it: a sealed ping magic packet yields ErrPingAbsorbed and no plaintext,
-// while an ordinary same-length payload is delivered normally.
-func TestOpenAbsorbsPingWithoutDeliveringPlaintext(t *testing.T) {
-	keys := testDataKeys(t)
-	w, err := NewWrapper(keys, 1, 0)
-	if err != nil {
-		t.Fatalf("NewWrapper: %v", err)
-	}
-
-	sealed, err := w.SealPing(nil)
-	if err != nil {
-		t.Fatalf("SealPing: %v", err)
-	}
-	plaintext, err := w.Open(nil, sealed)
-	if !errors.Is(err, ErrPingAbsorbed) {
-		t.Errorf("Open(ping) err = %v, want ErrPingAbsorbed", err)
-	}
-	if plaintext != nil {
-		t.Errorf("Open(ping) plaintext = %x, want nil", plaintext)
-	}
-
-	real := append([]byte(nil), pingMagicTask1[:]...)
-	real[0] ^= 0x01 // one bit different from the magic — must be delivered
-	sealedReal, err := w.Seal(nil, real)
-	if err != nil {
-		t.Fatalf("Seal: %v", err)
-	}
-	got, err := w.Open(nil, sealedReal)
-	if err != nil {
-		t.Fatalf("Open(non-ping 16-byte payload) = %v, want success", err)
-	}
-	if !bytes.Equal(got, real) {
-		t.Errorf("Open(non-ping) = %x, want %x", got, real)
-	}
-}
-
 // TestAuthFailureDoesNotTouchWindow is the state-assertion proof (not a
 // comment) that Open's ordering — AEAD success strictly gates
 // replay.accept — actually holds: a tampered packet at packet ID 7 fails

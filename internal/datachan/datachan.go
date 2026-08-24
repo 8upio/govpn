@@ -190,23 +190,13 @@ func (w *Wrapper) Seal(dst, plaintext []byte) ([]byte, error) {
 	return dst, nil
 }
 
-// pingMagicTask1 is the 16-byte ping keepalive magic (ping.c:42-45),
-// written out explicitly here so the tracer's own decrypt path can absorb a
-// ping and never surface one to a Session consumer even during the first
-// live run (D-11). Task 3 introduces ping.go's own PingSize/IsPing as the
-// canonical, tested home for this constant and replaces this literal's use
-// site in Open below with a call to it — this tracer-only copy exists
-// solely so Task 1 does not depend on a file Task 3 has not created yet.
-var pingMagicTask1 = [16]byte{
-	0x2a, 0x18, 0x7b, 0xf3, 0x64, 0x1e, 0xb4, 0xcb,
-	0x07, 0xed, 0x2d, 0x0a, 0x98, 0x1f, 0xc7, 0x48,
-}
-
-// SealPing seals the 16-byte ping keepalive magic as an ordinary data
-// packet — a ping is encrypted through exactly the same AEAD path as any
-// other data packet (ping.c:74-90), not a distinct wire opcode.
+// SealPing seals the 16-byte ping keepalive magic (ping.go's pingMagic) as
+// an ordinary data packet — a ping is encrypted through exactly the same
+// AEAD path as any other data packet (ping.c:74-90), not a distinct wire
+// opcode. Emission and absorption (Open below, via IsPing) share this one
+// magic constant and one set of offsets.
 func (w *Wrapper) SealPing(dst []byte) ([]byte, error) {
-	return w.Seal(dst, pingMagicTask1[:])
+	return w.Seal(dst, pingMagic[:])
 }
 
 // Open authenticates and decrypts packet, returning the plaintext IP
@@ -252,7 +242,7 @@ func (w *Wrapper) Open(dst, packet []byte) ([]byte, error) {
 	}
 
 	decrypted := plaintext[prefixLen:]
-	if len(decrypted) == len(pingMagicTask1) && [16]byte(decrypted) == pingMagicTask1 {
+	if IsPing(decrypted) {
 		return nil, ErrPingAbsorbed
 	}
 
