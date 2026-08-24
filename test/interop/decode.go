@@ -30,14 +30,21 @@ type decodedPacket struct {
 	Control   wire.ControlPacket
 }
 
-// decodeCapture reads capturePath, tls-crypt-unwraps every UDP payload on
-// port under key (building a fresh tlscrypt.Wrapper per payload — see
-// capture_test.go's doc comment for why a fresh anti-replay window per
-// payload is deliberate, not an oversight), and parses each into a
-// decodedPacket. A payload that fails to authenticate or parse is a hard
-// error: exactly the case where a control packet went out unwrapped or
-// corrupted, which must never be silently skipped (mirrors
-// capture_test.go's own discipline).
+// decodeCapture reads capturePath, tls-crypt-unwraps every control-channel
+// UDP payload on port under key (building a fresh tlscrypt.Wrapper per
+// payload — see capture_test.go's doc comment for why a fresh anti-replay
+// window per payload is deliberate, not an oversight), and parses each
+// into a decodedPacket. Data-channel payloads (P_DATA_V1/P_DATA_V2) are
+// skipped rather than decoded: plan 02-02 brings the tunnel up, so a real
+// client's own keepalive/data traffic now legitimately appears on the same
+// capture once PUSH_REPLY completes, but that traffic is never tls-crypt
+// wrapped (only the control channel is — RESEARCH Pitfall 3) and carries a
+// different, shorter header shape with no 8-byte session ID at this
+// function's fixed offset; every consumer of decodeCapture's output only
+// ever inspects control-channel opcodes. A control-channel payload that
+// fails to authenticate or parse is still a hard error: exactly the case
+// where a control packet went out unwrapped or corrupted, which must never
+// be silently skipped (mirrors capture_test.go's own discipline).
 func decodeCapture(capturePath string, key []byte, port uint16) ([]decodedPacket, error) {
 	f, err := os.Open(capturePath)
 	if err != nil {
@@ -59,6 +66,9 @@ func decodeCapture(capturePath string, key []byte, port uint16) ([]decodedPacket
 		opcode, _ := wire.ParseHeaderByte(p.Payload[0])
 		if !wire.ValidOpcode(opcode) {
 			return nil, fmt.Errorf("decode capture: payload %d (%s): header opcode %d outside the legal range", i, p.Direction, opcode)
+		}
+		if opcode == wire.OpDataV1 || opcode == wire.OpDataV2 {
+			continue
 		}
 
 		var w *tlscrypt.Wrapper

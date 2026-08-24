@@ -75,10 +75,21 @@ func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorder
 
 	obs := newObservingConn(transport)
 
+	// tunnelNetwork is this harness's own throwaway tunnel-IP range
+	// (02-02-PLAN.md D-01): the real client's client.conf never hardcodes
+	// an ifconfig address, so whatever the server pushes here is exactly
+	// what the client's tun interface ends up configured with.
+	_, tunnelNetwork, err := net.ParseCIDR("10.8.0.0/24")
+	if err != nil {
+		return fmt.Errorf("parse tunnel network: %w", err)
+	}
+
 	sessions := make(chan *ovpn.Session, 1)
 	srv := ovpn.NewServer(ovpn.Config{
 		TLSConfig:   tlsCfg,
 		TLSCryptKey: tlsCryptKey,
+		Network:     tunnelNetwork,
+		Cipher:      "AES-256-GCM",
 		OnSession: func(sess *ovpn.Session) {
 			select {
 			case sessions <- sess:
@@ -113,22 +124,21 @@ func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorder
 		case <-time.After(postHandshakeSurvival):
 		}
 
-		// km2=ok is unconditional here: Config.OnSession only fires after
-		// runHandshake's Key Method 2 exchange has already succeeded (a
-		// session whose exchange fails is closed and never reaches
-		// OnSession) — no key material, only this boolean status, is ever
-		// printed (threat T-02-03). push_request status reflects
-		// Session.PushRequestSeen(), which a background goroutine may
-		// still be setting concurrently with this print (the real
-		// client's own PUSH_REQUEST timer can fire anywhere inside the
-		// postHandshakeSurvival window just elapsed above).
+		// km2=ok and assigned_ip=/peer_id= are unconditional here:
+		// Config.OnSession only fires after runHandshake's Key Method 2
+		// exchange AND its PUSH_REQUEST/PUSH_REPLY exchange have both
+		// already succeeded (D-08) — a session whose exchange fails is
+		// closed and never reaches OnSession — so sess.AssignedIP() is
+		// guaranteed non-nil here. Only this diagnostic status and the
+		// non-secret, test-only assigned tunnel address/peer-id are ever
+		// printed (threat T-02-03/T-02-11); no key material.
 		pushStatus := "not-seen"
 		if sess.PushRequestSeen() {
 			pushStatus = "seen"
 		}
 		log.Printf(
-			"PASS: session established and stable %s past handshake completion; peer_cn=%s tls_version=%s tls_version_raw=0x%04x cipher_suite=%s km2=ok push_request=%s",
-			postHandshakeSurvival, sess.PeerCN, tls.VersionName(state.Version), state.Version, tls.CipherSuiteName(state.CipherSuite), pushStatus,
+			"PASS: session established and stable %s past handshake completion; peer_cn=%s tls_version=%s tls_version_raw=0x%04x cipher_suite=%s km2=ok push_request=%s assigned_ip=%s peer_id=%d",
+			postHandshakeSurvival, sess.PeerCN, tls.VersionName(state.Version), state.Version, tls.CipherSuiteName(state.CipherSuite), pushStatus, sess.AssignedIP(), sess.PeerID(),
 		)
 
 		_ = srv.Close()

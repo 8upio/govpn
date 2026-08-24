@@ -14,7 +14,6 @@ package ovpn
 
 import (
 	"bufio"
-	"bytes"
 	"crypto/rand"
 	"crypto/tls"
 	"errors"
@@ -45,19 +44,28 @@ type Config struct {
 	// key (see ParseStaticKeyV1), shared with every client.
 	TLSCryptKey []byte
 
-	// Network is the virtual tunnel-IP range clients are assigned from.
-	// Consumed starting in a later plan; declared here for the public
-	// surface's shape.
+	// Network is the virtual tunnel-IP range clients are assigned from
+	// (D-01): consumed starting in this plan. Must be an IPv4 *net.IPNet
+	// of at least /30 — the server reserves the first host address
+	// (base+1) for itself and allocates each connecting client the next
+	// free host address sequentially, skipping the network and broadcast
+	// addresses. If unset, a session that reaches the PUSH_REQUEST/
+	// PUSH_REPLY exchange fails and is closed before Config.OnSession
+	// fires.
 	Network *net.IPNet
 
-	// Cipher names the fixed data-channel cipher (e.g. "AES-256-GCM").
-	// Consumed starting in a later plan.
+	// Cipher names the fixed data-channel cipher pushed to clients as
+	// `cipher <name>` (e.g. "AES-256-GCM"). Consumed starting in this
+	// plan; defaults to "AES-256-GCM" when empty.
 	Cipher string
 
-	// OnSession is invoked exactly once per client, after
-	// tls.Conn.Handshake() has returned nil and never before, with a
-	// Session whose PeerCN is the verified client CommonName (threat
-	// T-01-16).
+	// OnSession is invoked exactly once per client, after Key Method 2 and
+	// the PUSH_REQUEST/PUSH_REPLY exchange have both completed and the
+	// data-channel keys and the assigned tunnel IP are live (D-08) — not
+	// merely after tls.Conn.Handshake() has returned nil. The Session
+	// handed to OnSession is therefore immediately usable: Session.
+	// AssignedIP() is already populated and PeerCN is the verified client
+	// CommonName (threat T-01-16).
 	OnSession func(*Session)
 
 	// OnSessionPanic, if set, is invoked when OnSession panics instead of
@@ -106,11 +114,11 @@ const (
 // byte-for-byte.
 const serverKM2Options = "V4,dev-type tun,link-mtu 1541,tun-mtu 1500,proto UDPv4,cipher AES-256-GCM,auth SHA1,keysize 256,key-method 2,tls-server"
 
-// pushRequestLiteral is the exact bytes a real OpenVPN client sends to
-// request its tunnel configuration: the literal string "PUSH_REQUEST" plus
-// one trailing NUL byte, 13 bytes total, unlike Key Method 2's own
-// length-prefixed field framing (RESEARCH Pattern 6, push.c:567,1089).
-var pushRequestLiteral = []byte("PUSH_REQUEST\x00")
+// pushRequestLiteral is the exact string a real OpenVPN client sends
+// (NUL-terminated on the wire, per readControlString/push.go) to request
+// its tunnel configuration, unlike Key Method 2's own length-prefixed
+// field framing (RESEARCH Pattern 6, push.c:567,1089).
+const pushRequestLiteral = "PUSH_REQUEST"
 
 // sessionKey identifies a client by the pair the reference dispatches on:
 // remote UDP address and 8-byte session ID (tls_pre_decrypt_lite,
@@ -131,6 +139,13 @@ type Server struct {
 	// exists as a field only so tests can exercise the timeout-triggered
 	// teardown path without waiting a real minute.
 	handshakeWindow time.Duration
+
+	// pool is this server's tunnel-IP and peer-id allocator, built from
+	// Config.Network in Serve. nil if Config.Network was never set — a
+	// session that reaches the PUSH_REQUEST/PUSH_REPLY exchange with a nil
+	// pool fails and is closed before OnSession fires (see
+	// performPushExchange).
+	pool *ipPool
 
 	mu       sync.Mutex
 	pc       net.PacketConn
@@ -167,6 +182,20 @@ func (s *Server) Serve(pc net.PacketConn) error {
 	}
 	if s.cfg.TLSConfig == nil {
 		return errors.New("ovpn: Config.TLSConfig must be set")
+	}
+	// Config.Network is intentionally not required here: a Server built
+	// without it can still complete Phase 1's TLS handshake (existing
+	// tests exercise exactly that). It is only needed once a session
+	// reaches the PUSH_REQUEST/PUSH_REPLY exchange (performPushExchange),
+	// where a nil pool fails that one session rather than refusing to
+	// serve at all. A malformed (non-nil but invalid) Network fails fast
+	// here, though, exactly like the TLSCryptKey check above.
+	if s.cfg.Network != nil {
+		pool, err := newIPPool(s.cfg.Network)
+		if err != nil {
+			return fmt.Errorf("ovpn: %w", err)
+		}
+		s.pool = pool
 	}
 
 	s.mu.Lock()
@@ -375,21 +404,21 @@ func (sess *Session) pump() {
 }
 
 // runHandshake runs crypto/tls, unmodified, over sess's control-channel
-// Conn. Success is exactly Handshake() returning nil plus a populated
-// verified peer CommonName — not the reference's S_ACTIVE state, which
-// additionally requires Key Method 2 (this plan) — and not merely having
-// received the client's reset (RESEARCH Pitfall 5). Once Handshake returns
-// nil, this goroutine performs the Key Method 2 exchange (D-15: a
-// bufio.Reader scoped to this function's continuation, not a modification
-// of internal/ctrlconn.Conn) before Config.OnSession is invoked. A session
-// that cannot complete the Key Method 2 exchange is dead: sess.Close is
+// Conn, then continues the bring-up sequence on the same goroutine through
+// Key Method 2 and the PUSH_REQUEST/PUSH_REPLY exchange before
+// Config.OnSession is ever invoked (D-08). sess.doneCh — which
+// enforceHandshakeWindow watches to decide whether to tear a stalled
+// session down — is deliberately NOT closed until this whole sequence
+// finishes (success or failure): the handshake window now covers the
+// entire bring-up, not merely tls.Conn.Handshake() returning nil, so a
+// client that completes TLS but never requests its configuration is still
+// reaped. A session that cannot complete any step is dead: sess.Close is
 // called and OnSession never fires for it.
 func (s *Server) runHandshake(sess *Session) {
 	tlsConn := tls.Server(sess.conn, s.cfg.TLSConfig)
 	err := tlsConn.Handshake()
-	close(sess.doneCh)
-
 	if err != nil {
+		close(sess.doneCh)
 		_ = sess.Close()
 		return
 	}
@@ -401,52 +430,84 @@ func (s *Server) runHandshake(sess *Session) {
 	}
 
 	if err := s.performKeyMethod2Exchange(sess, tlsConn); err != nil {
+		close(sess.doneCh)
 		_ = sess.Close()
 		return
 	}
 
-	// Observe whether the client progresses past key negotiation and
-	// begins asking for its tunnel configuration — an interop diagnostic
-	// (Task 3), not yet a protocol responsibility of this plan (plan
-	// 02-02 owns answering PUSH_REQUEST with PUSH_REPLY). Runs
-	// concurrently with OnSession firing below, since a real client's
-	// PUSH_REQUEST may arrive during, not before, the post-handshake
-	// window.
-	go s.watchForPushRequest(sess, tlsConn)
+	if err := s.performPushExchange(sess, tlsConn); err != nil {
+		close(sess.doneCh)
+		_ = sess.Close()
+		return
+	}
 
+	close(sess.doneCh)
+
+	// D-08: OnSession fires only here — after Key Method 2 and the
+	// PUSH_REQUEST/PUSH_REPLY exchange have both completed and
+	// sess.assignedIP/sess.dataKeys are both live — so the Session handed
+	// to the embedder is immediately usable.
 	if s.cfg.OnSession != nil {
 		s.callOnSession(sess)
 	}
 }
 
-// pushRequestWatchTimeout bounds watchForPushRequest's read so a client
-// that never sends PUSH_REQUEST (or a non-interop embedding) doesn't leak
-// this goroutine forever. Sized generously above
-// test/interop/server's postHandshakeSurvival (2s) so a real client's own
-// PUSH_REQUEST timer has comfortable room to fire within it.
-const pushRequestWatchTimeout = 10 * time.Second
-
-// watchForPushRequest reads the next protocol message off sess.tlsReader,
-// after the Key Method 2 exchange has completed, and records whether it is
-// the client's literal PUSH_REQUEST bytes (RESEARCH Pattern 6:
-// "PUSH_REQUEST" plus one trailing NUL, 13 bytes total — plain,
-// NUL-terminated ASCII, a different wire framing than Key Method 2's own
-// length-prefixed fields). This plan does not answer it — plan 02-02 owns
-// PUSH_REPLY — reading and discarding it here is safe: the reference
-// client retransmits PUSH_REQUEST on its own timer (push.c), so plan
-// 02-02's reply path will still see one. Nothing else reads from
-// sess.tlsReader after the Key Method 2 exchange in this plan, so this is
-// the sole reader.
-func (s *Server) watchForPushRequest(sess *Session, tlsConn *tls.Conn) {
-	_ = tlsConn.SetReadDeadline(time.Now().Add(pushRequestWatchTimeout))
-	defer func() { _ = tlsConn.SetReadDeadline(time.Time{}) }()
-
-	buf := make([]byte, len(pushRequestLiteral))
-	if _, err := io.ReadFull(sess.tlsReader, buf); err != nil {
-		return
+// performPushExchange answers the client's PUSH_REQUEST with a byte-exact
+// PUSH_REPLY (Pattern 6), reading from the same sess.tlsReader plan
+// 02-01's performKeyMethod2Exchange established (D-15) — a second
+// bufio.Reader over tlsConn would lose whatever bytes are already
+// buffered. It allocates the client's tunnel IP and peer-id from s.pool
+// exactly once per session: if the client's own retransmit timer causes a
+// second "PUSH_REQUEST" to already be sitting in sess.tlsReader's buffer
+// by the time this function replies to the first one, it answers that
+// retransmit with the SAME assigned IP and peer-id rather than allocating
+// again (T-02-06, TestOnSessionFiresExactlyOnce/TestPerformPushExchange
+// AnswersBufferedRetransmitWithSameIP) before returning — it never blocks
+// waiting for a retransmit that isn't already buffered. w takes only the
+// io.Writer subset of *tls.Conn (its only actual runHandshake calls this
+// with) so the retransmit-loop behavior above is directly, deterministically
+// unit-testable without a live network round trip.
+func (s *Server) performPushExchange(sess *Session, w io.Writer) error {
+	if s.pool == nil {
+		return errors.New("ovpn: Config.Network is not set; cannot answer PUSH_REQUEST")
 	}
-	if bytes.Equal(buf, pushRequestLiteral) {
+
+	cipher := s.cfg.Cipher
+	if cipher == "" {
+		cipher = "AES-256-GCM"
+	}
+
+	for {
+		req, err := readControlString(sess.tlsReader, maxControlStringLen)
+		if err != nil {
+			return fmt.Errorf("ovpn: read push request: %w", err)
+		}
+		if req != pushRequestLiteral {
+			return fmt.Errorf("ovpn: unexpected control string %q, want %q", req, pushRequestLiteral)
+		}
 		sess.pushRequested.Store(true)
+
+		if sess.assignedIP == nil {
+			ip, peerID, err := s.pool.allocate()
+			if err != nil {
+				return fmt.Errorf("ovpn: allocate tunnel IP: %w", err)
+			}
+			sess.assignedIP = ip
+			sess.peerID = peerID
+		}
+
+		reply := buildPushReply(sess.assignedIP, s.cfg.Network, sess.peerID, cipher)
+		if _, err := w.Write(reply); err != nil {
+			return fmt.Errorf("ovpn: write push reply: %w", err)
+		}
+
+		if sess.tlsReader.Buffered() == 0 {
+			return nil
+		}
+		// More bytes are already buffered — a retransmitted PUSH_REQUEST
+		// that arrived before this reply went out. Loop to answer it too,
+		// without allocating again (the sess.assignedIP == nil guard above
+		// no longer triggers).
 	}
 }
 
