@@ -68,7 +68,7 @@ Plans:
   4. Replayed and out-of-window data packets are dropped, and keepalive/ping magic packets are answered inside the library — the Session consumer never sees one
   5. The harness runs a lossy scenario (5–10% packet loss and reordering) in which handshake and ping round-trip both still succeed
 
-**Plans**: 3/4 plans executed
+**Plans**: 4/4 plans executed
 
 Plans:
 **Wave 1**
@@ -85,7 +85,7 @@ Plans:
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
-- [ ] 02-04-PLAN.md — Lossy-link tunnel + ping round-trip, real-client data-channel golden vectors, standing prohibition gates
+- [x] 02-04-PLAN.md — Lossy-link tunnel + ping round-trip, real-client data-channel golden vectors, standing prohibition gates
 
 ### Phase 3: In-Process Termination
 
@@ -125,7 +125,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Handshake | 4/4 | Complete    | 2026-08-24 |
-| 2. Tunnel Up | 3/4 | In Progress|  |
+| 2. Tunnel Up | 4/4 | In Progress|  |
 | 3. In-Process Termination | 0/TBD | Not started | - |
 | 4. Durable Sessions | 0/TBD | Not started | - |
 
