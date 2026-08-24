@@ -13,16 +13,20 @@
 package ovpn
 
 import (
+	"bufio"
+	"bytes"
 	"crypto/rand"
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"runtime/debug"
 	"sync"
 	"time"
 
 	"github.com/8upio/govpn/internal/ctrlconn"
+	"github.com/8upio/govpn/internal/keyderiv"
 	"github.com/8upio/govpn/internal/reliable"
 	"github.com/8upio/govpn/internal/tlscrypt"
 	"github.com/8upio/govpn/internal/wire"
@@ -92,6 +96,21 @@ const (
 	// UDP datagram would) rather than backing up Serve.
 	inboundQueueSize = 32
 )
+
+// serverKM2Options is the options string this server sends in its own Key
+// Method 2 message. Per RESEARCH.md Pitfall 4, options_cmp_equal
+// (ssl.c:2498) only warns on mismatch (gated on --opt-verify, which this
+// project's clients don't set) — a short, honest string describing this
+// server's actual fixed configuration is sufficient for interop; there is
+// no need to reproduce the reference's exact OCC options-string format
+// byte-for-byte.
+const serverKM2Options = "V4,dev-type tun,link-mtu 1541,tun-mtu 1500,proto UDPv4,cipher AES-256-GCM,auth SHA1,keysize 256,key-method 2,tls-server"
+
+// pushRequestLiteral is the exact bytes a real OpenVPN client sends to
+// request its tunnel configuration: the literal string "PUSH_REQUEST" plus
+// one trailing NUL byte, 13 bytes total, unlike Key Method 2's own
+// length-prefixed field framing (RESEARCH Pattern 6, push.c:567,1089).
+var pushRequestLiteral = []byte("PUSH_REQUEST\x00")
 
 // sessionKey identifies a client by the pair the reference dispatches on:
 // remote UDP address and 8-byte session ID (tls_pre_decrypt_lite,
@@ -357,14 +376,14 @@ func (sess *Session) pump() {
 
 // runHandshake runs crypto/tls, unmodified, over sess's control-channel
 // Conn. Success is exactly Handshake() returning nil plus a populated
-// verified peer CommonName — not the reference's S_ACTIVE state (which
-// additionally requires Key Method 2, Phase 2 scope), and not merely having
+// verified peer CommonName — not the reference's S_ACTIVE state, which
+// additionally requires Key Method 2 (this plan) — and not merely having
 // received the client's reset (RESEARCH Pitfall 5). Once Handshake returns
-// nil, Config.OnSession is invoked exactly once. TLS application data that
-// arrives after that point — the client's own Key Method 2 payload — is the
-// client's protocol-correct next step; Session.conn simply buffers it
-// unread (see internal/ctrlconn.Conn.Deliver and Read), and this goroutine
-// never calls Read again, so it is never disturbed.
+// nil, this goroutine performs the Key Method 2 exchange (D-15: a
+// bufio.Reader scoped to this function's continuation, not a modification
+// of internal/ctrlconn.Conn) before Config.OnSession is invoked. A session
+// that cannot complete the Key Method 2 exchange is dead: sess.Close is
+// called and OnSession never fires for it.
 func (s *Server) runHandshake(sess *Session) {
 	tlsConn := tls.Server(sess.conn, s.cfg.TLSConfig)
 	err := tlsConn.Handshake()
@@ -380,9 +399,97 @@ func (s *Server) runHandshake(sess *Session) {
 	if len(state.PeerCertificates) > 0 {
 		sess.PeerCN = state.PeerCertificates[0].Subject.CommonName
 	}
+
+	if err := s.performKeyMethod2Exchange(sess, tlsConn); err != nil {
+		_ = sess.Close()
+		return
+	}
+
+	// Observe whether the client progresses past key negotiation and
+	// begins asking for its tunnel configuration — an interop diagnostic
+	// (Task 3), not yet a protocol responsibility of this plan (plan
+	// 02-02 owns answering PUSH_REQUEST with PUSH_REPLY). Runs
+	// concurrently with OnSession firing below, since a real client's
+	// PUSH_REQUEST may arrive during, not before, the post-handshake
+	// window.
+	go s.watchForPushRequest(sess, tlsConn)
+
 	if s.cfg.OnSession != nil {
 		s.callOnSession(sess)
 	}
+}
+
+// pushRequestWatchTimeout bounds watchForPushRequest's read so a client
+// that never sends PUSH_REQUEST (or a non-interop embedding) doesn't leak
+// this goroutine forever. Sized generously above
+// test/interop/server's postHandshakeSurvival (2s) so a real client's own
+// PUSH_REQUEST timer has comfortable room to fire within it.
+const pushRequestWatchTimeout = 10 * time.Second
+
+// watchForPushRequest reads the next protocol message off sess.tlsReader,
+// after the Key Method 2 exchange has completed, and records whether it is
+// the client's literal PUSH_REQUEST bytes (RESEARCH Pattern 6:
+// "PUSH_REQUEST" plus one trailing NUL, 13 bytes total — plain,
+// NUL-terminated ASCII, a different wire framing than Key Method 2's own
+// length-prefixed fields). This plan does not answer it — plan 02-02 owns
+// PUSH_REPLY — reading and discarding it here is safe: the reference
+// client retransmits PUSH_REQUEST on its own timer (push.c), so plan
+// 02-02's reply path will still see one. Nothing else reads from
+// sess.tlsReader after the Key Method 2 exchange in this plan, so this is
+// the sole reader.
+func (s *Server) watchForPushRequest(sess *Session, tlsConn *tls.Conn) {
+	_ = tlsConn.SetReadDeadline(time.Now().Add(pushRequestWatchTimeout))
+	defer func() { _ = tlsConn.SetReadDeadline(time.Time{}) }()
+
+	buf := make([]byte, len(pushRequestLiteral))
+	if _, err := io.ReadFull(sess.tlsReader, buf); err != nil {
+		return
+	}
+	if bytes.Equal(buf, pushRequestLiteral) {
+		sess.pushRequested.Store(true)
+	}
+}
+
+// performKeyMethod2Exchange runs the Key Method 2 exchange over tlsConn,
+// matching the reference server's own state-machine branch (tls_process,
+// ssl.c:3002-3031: server is "Receive Key" at S_START, "Send Key" at
+// S_GOT_KEY — the opposite order from the client, which already wrote its
+// own message immediately after its handshake completed, per 01-03's
+// documented deferral). It wraps tlsConn in a bufio.Reader retained on
+// sess.tlsReader (D-15) so plan 02-02's PUSH_REQUEST continuation reads
+// from the same buffered stream rather than losing bytes to a second
+// reader. On success, sess.dataKeys holds the derived 256-byte key
+// expansion.
+func (s *Server) performKeyMethod2Exchange(sess *Session, tlsConn *tls.Conn) error {
+	sess.tlsReader = bufio.NewReader(tlsConn)
+
+	clientKM, _, err := keyderiv.ReadClientKeyMethod2(sess.tlsReader)
+	if err != nil {
+		return fmt.Errorf("ovpn: read client Key Method 2: %w", err)
+	}
+	sess.clientKM = clientKM
+
+	serverKM, err := keyderiv.WriteServerKeyMethod2(tlsConn, serverKM2Options)
+	if err != nil {
+		return fmt.Errorf("ovpn: write server Key Method 2: %w", err)
+	}
+
+	src := &keyderiv.KeySource2{
+		Client: *clientKM,
+		Server: *serverKM,
+	}
+	// wire.SessionID / Session.SessionID are the same 8-byte
+	// control-channel session IDs DeriveKeys wants (server's own
+	// perspective: clientSID = the client's session ID we received,
+	// serverSID = our own — ssl.c:1586-1589); the pointer conversions
+	// below are between types with identical underlying [8]byte layout,
+	// no new session-ID concept is introduced.
+	dataKeys, err := keyderiv.DeriveKeys(src, (*[8]byte)(&sess.clientSessionID), (*[8]byte)(&sess.SessionID))
+	if err != nil {
+		return fmt.Errorf("ovpn: derive data-channel keys: %w", err)
+	}
+	sess.dataKeys = dataKeys
+	return nil
 }
 
 // callOnSession invokes Config.OnSession with panic recovery: this runs on

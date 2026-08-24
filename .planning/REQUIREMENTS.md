@@ -10,8 +10,8 @@ Requirements for initial release. Each maps to roadmap phases.
 ### Wire Format & Crypto Primitives
 
 - [x] **WIRE-01**: Control/data packet parsing and serialization (opcodes, session IDs, packet IDs, ACK arrays) matches the C reference byte-exactly, covered by golden-vector tests
-- [ ] **WIRE-02**: TLS 1.0 PRF (MD5+SHA1 P_hash) implemented with stdlib crypto and verified against reference test vectors
-- [ ] **WIRE-03**: Key Method 2 data-channel key derivation (master secret → key expansion → per-direction cipher/HMAC key slots incl. implicit IV extraction) verified byte-exactly against `ssl.c`/`crypto.c`
+- [x] **WIRE-02**: TLS 1.0 PRF (MD5+SHA1 P_hash) implemented with stdlib crypto and verified against reference test vectors
+- [x] **WIRE-03**: Key Method 2 data-channel key derivation (master secret → key expansion → per-direction cipher/HMAC key slots incl. implicit IV extraction) verified byte-exactly against `ssl.c`/`crypto.c`
 - [x] **WIRE-04**: tls-crypt wrap/unwrap (HMAC-SHA256 MAC-then-encrypt with AES-256-CTR, tag-as-IV) with key-file parsing and replay protection, verified against `tls_crypt.c` with isolated test vectors
 
 ### Control Channel
@@ -19,7 +19,7 @@ Requirements for initial release. Each maps to roadmap phases.
 - [x] **CTRL-01**: Reliability layer delivers control payloads in order with ACK piggybacking and retransmission, surviving 5–10% synthetic packet loss
 - [x] **CTRL-02**: Control-channel framing exposed as a `net.Conn` byte stream with fragmentation/reassembly, handling multi-KB TLS records (realistic cert chains)
 - [x] **CTRL-03**: A real OpenVPN 2.6 client completes the full TLS handshake (HARD_RESET_V2 through TLS established) with certificate-based mutual auth via stdlib `crypto/tls`
-- [ ] **CTRL-04**: Key Method 2 exchange over TLS application data completes (random material, options string, peer-info parsing)
+- [x] **CTRL-04**: Key Method 2 exchange over TLS application data completes (random material, options string, peer-info parsing)
 - [ ] **CTRL-05**: PUSH_REQUEST/PUSH_REPLY works: client receives tunnel IP (`topology subnet`), explicit `cipher AES-256-GCM` push, keepalive parameters, and brings its tunnel up
 
 ### Data Channel
@@ -97,9 +97,9 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CTRL-03 | Phase 1 | Complete |
 | SESS-01 | Phase 1 | Complete |
 | VRFY-01 | Phase 1 | Complete |
-| WIRE-02 | Phase 2 | Pending |
-| WIRE-03 | Phase 2 | Pending |
-| CTRL-04 | Phase 2 | Pending |
+| WIRE-02 | Phase 2 | Complete |
+| WIRE-03 | Phase 2 | Complete |
+| CTRL-04 | Phase 2 | Complete |
 | CTRL-05 | Phase 2 | Pending |
 | DATA-01 | Phase 2 | Pending |
 | DATA-02 | Phase 2 | Pending |

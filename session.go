@@ -1,13 +1,16 @@
 package ovpn
 
 import (
+	"bufio"
 	"crypto/tls"
 	"errors"
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 
 	"github.com/8upio/govpn/internal/ctrlconn"
+	"github.com/8upio/govpn/internal/keyderiv"
 	"github.com/8upio/govpn/internal/tlscrypt"
 	"github.com/8upio/govpn/internal/wire"
 )
@@ -95,6 +98,46 @@ type Session struct {
 	// stopOnce guards stopCh so repeated or concurrent calls to Close are
 	// safe and idempotent.
 	stopOnce sync.Once
+
+	// tlsReader is a bufio.Reader wrapping the session's tls.Conn, scoped
+	// to runHandshake's Key Method 2 / PUSH_REQUEST continuation (D-15).
+	// It is created once, in runHandshake, and retained here so plan
+	// 02-02's PUSH_REQUEST/PUSH_REPLY continuation reads from the SAME
+	// buffered stream rather than starting a second bufio.Reader over
+	// tlsConn — a second reader would lose whatever bytes the first one
+	// already pulled into its internal buffer. internal/ctrlconn.Conn
+	// itself is not modified by this plan.
+	tlsReader *bufio.Reader
+
+	// dataKeys is this session's derived 256-byte Key Method 2 key
+	// expansion, per-session like wrapper above, never server-global. It
+	// is the single input plan 02-03's internal/datachan.Wrapper will
+	// consume. nil until the Key Method 2 exchange completes.
+	dataKeys *keyderiv.Key2
+
+	// clientKM is the client's own Key Method 2 pre_master/random1/random2,
+	// retained only for diagnostics after DeriveKeys has consumed it.
+	clientKM *keyderiv.KeySource
+
+	// pushRequested records whether this session's client has sent its
+	// PUSH_REQUEST (observed, read and discarded — plan 02-02 owns
+	// answering it with PUSH_REPLY). Set from a background goroutine
+	// watching sess.tlsReader concurrently with Config.OnSession firing
+	// (the request may arrive during, not before, the post-handshake
+	// window), so it is an atomic.Bool rather than a plain bool — see
+	// watchForPushRequest in ovpn.go. Diagnostic only in this plan (Task
+	// 3's interop gate); exposed to embedders via PushRequestSeen.
+	pushRequested atomic.Bool
+}
+
+// PushRequestSeen reports whether this session's client has sent its
+// PUSH_REQUEST (RESEARCH Pattern 6) since the Key Method 2 exchange
+// completed. It is diagnostic-only in this plan — the server does not yet
+// answer PUSH_REQUEST with PUSH_REPLY (plan 02-02) — and exists so the
+// interop harness can observe that the real client progressed past key
+// negotiation and began asking for its tunnel configuration.
+func (s *Session) PushRequestSeen() bool {
+	return s.pushRequested.Load()
 }
 
 // Read is a placeholder: Phase 1 has no data channel to read raw IP packets

@@ -113,9 +113,22 @@ func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorder
 		case <-time.After(postHandshakeSurvival):
 		}
 
+		// km2=ok is unconditional here: Config.OnSession only fires after
+		// runHandshake's Key Method 2 exchange has already succeeded (a
+		// session whose exchange fails is closed and never reaches
+		// OnSession) — no key material, only this boolean status, is ever
+		// printed (threat T-02-03). push_request status reflects
+		// Session.PushRequestSeen(), which a background goroutine may
+		// still be setting concurrently with this print (the real
+		// client's own PUSH_REQUEST timer can fire anywhere inside the
+		// postHandshakeSurvival window just elapsed above).
+		pushStatus := "not-seen"
+		if sess.PushRequestSeen() {
+			pushStatus = "seen"
+		}
 		log.Printf(
-			"PASS: session established and stable %s past handshake completion; peer_cn=%s tls_version=%s tls_version_raw=0x%04x cipher_suite=%s",
-			postHandshakeSurvival, sess.PeerCN, tls.VersionName(state.Version), state.Version, tls.CipherSuiteName(state.CipherSuite),
+			"PASS: session established and stable %s past handshake completion; peer_cn=%s tls_version=%s tls_version_raw=0x%04x cipher_suite=%s km2=ok push_request=%s",
+			postHandshakeSurvival, sess.PeerCN, tls.VersionName(state.Version), state.Version, tls.CipherSuiteName(state.CipherSuite), pushStatus,
 		)
 
 		_ = srv.Close()
