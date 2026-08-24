@@ -18,6 +18,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"runtime/debug"
 	"sync"
@@ -460,9 +461,13 @@ func (s *Server) runHandshake(sess *Session) {
 // second "PUSH_REQUEST" to already be sitting in sess.tlsReader's buffer
 // by the time this function replies to the first one, it answers that
 // retransmit with the SAME assigned IP and peer-id rather than allocating
-// again (T-02-06, TestOnSessionFiresExactlyOnce) before returning — it
-// never blocks waiting for a retransmit that isn't already buffered.
-func (s *Server) performPushExchange(sess *Session, tlsConn *tls.Conn) error {
+// again (T-02-06, TestOnSessionFiresExactlyOnce/TestPerformPushExchange
+// AnswersBufferedRetransmitWithSameIP) before returning — it never blocks
+// waiting for a retransmit that isn't already buffered. w takes only the
+// io.Writer subset of *tls.Conn (its only actual runHandshake calls this
+// with) so the retransmit-loop behavior above is directly, deterministically
+// unit-testable without a live network round trip.
+func (s *Server) performPushExchange(sess *Session, w io.Writer) error {
 	if s.pool == nil {
 		return errors.New("ovpn: Config.Network is not set; cannot answer PUSH_REQUEST")
 	}
@@ -492,7 +497,7 @@ func (s *Server) performPushExchange(sess *Session, tlsConn *tls.Conn) error {
 		}
 
 		reply := buildPushReply(sess.assignedIP, s.cfg.Network, sess.peerID, cipher)
-		if _, err := tlsConn.Write(reply); err != nil {
+		if _, err := w.Write(reply); err != nil {
 			return fmt.Errorf("ovpn: write push reply: %w", err)
 		}
 
