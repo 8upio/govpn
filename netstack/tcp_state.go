@@ -65,6 +65,23 @@ func buildRSTSegment(offending tcpSegment) tcpSegment {
 	return rst
 }
 
+// rstInWindowLocked reports whether an inbound RST's sequence number falls
+// within RFC 9293 §3.10.7.4's acceptable range for this connection's own
+// receive window (WR-03) — the classic blind-reset mitigation. A zero
+// receive window still accepts an RST whose sequence exactly matches
+// rcvNxt, mirroring the same "zero window probe" special case RFC 9293
+// §3.4's general segment-acceptability test uses for zero-length segments
+// against a zero window (an empty range would otherwise reject even the
+// single sequence number a well-behaved peer could legitimately reset
+// from). Called with mu held.
+func (c *tcpConn) rstInWindowLocked(seg tcpSegment) bool {
+	wnd := uint32(c.advertisedWindowLocked())
+	if wnd == 0 {
+		return seg.seq == c.rcvNxt
+	}
+	return seqGE(seg.seq, c.rcvNxt) && seqGT(c.rcvNxt+wnd, seg.seq)
+}
+
 // handleSegment is tcpConn's single entry point for an inbound segment
 // already routed to it by the 4-tuple demux (tcp_listener.go). It takes
 // c.mu for the whole state evaluation, decides what (if anything) to
@@ -75,6 +92,21 @@ func (c *tcpConn) handleSegment(seg tcpSegment) {
 	c.mu.Lock()
 
 	if seg.flags&flagRST != 0 {
+		// WR-03: RFC 9293 §3.10.7.4 requires validating an inbound RST's
+		// sequence number falls within the receive window before
+		// accepting it (the classic blind-reset mitigation) — this stack
+		// previously tore the connection down for ANY inbound RST
+		// regardless of SEG.SEQ. Dispatch already restricts a segment's
+		// 4-tuple to the session that owns this connection (spoofed
+		// source IPs are dropped in Stack.deliver before reaching here),
+		// so the practical blast radius was limited to a peer resetting
+		// its own connection out of sequence — but it is still a spec
+		// deviation worth closing, especially if this code is ever reused
+		// behind a less-restrictive dispatch boundary.
+		if !c.rstInWindowLocked(seg) {
+			c.mu.Unlock()
+			return
+		}
 		c.demux.stats.rstsReceived.Add(1)
 		c.err = ErrTCPConnReset
 		c.state = stateClosed
@@ -95,6 +127,15 @@ func (c *tcpConn) handleSegment(seg tcpSegment) {
 			rst := buildRSTSegment(seg)
 			c.state = stateClosed
 			c.stopTimersLocked()
+			// WR-03: every other terminal-state transition in this file
+			// (and in tcp_timer.go) calls broadcastLocked() before
+			// unlocking — this branch didn't. Currently harmless (a
+			// SYN_RCVD connection has never been handed to an
+			// application, so no Read/Write caller can be blocked on
+			// notifyCh yet), but a later change exposing pre-Accept
+			// connection state to a waiter would otherwise silently
+			// reintroduce a missed-wakeup bug here.
+			c.broadcastLocked()
 			c.mu.Unlock()
 			c.demux.removeConn(c)
 			c.sendSegments([]tcpSegment{rst})

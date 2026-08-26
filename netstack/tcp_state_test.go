@@ -814,6 +814,105 @@ func TestTCPReceiveWindowEnforcedOnIngress(t *testing.T) {
 	}
 }
 
+// TestTCPRSTOutOfWindowIgnored (WR-03): an inbound RST whose sequence
+// number falls outside the receive window is ignored — the connection
+// stays ESTABLISHED and keeps accepting legitimate traffic — rather than
+// tearing the connection down for any RST regardless of SEG.SEQ (RFC 9293
+// §3.10.7.4's in-window validation, the classic blind-reset mitigation).
+func TestTCPRSTOutOfWindowIgnored(t *testing.T) {
+	stack := newTestStack(t)
+	defer stack.Close()
+	ln, err := stack.ListenTCP(8080)
+	if err != nil {
+		t.Fatalf("ListenTCP: %v", err)
+	}
+	defer ln.Close()
+	fs := newFakeSession()
+	if err := stack.Attach(fs, testClientAddr()); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	client := newTCPTestClient(t, fs, testClientAddr(), 34567, testServerIP(), 8080)
+	client.connect()
+	conn, err := acceptWithTimeout(t, ln, time.Second)
+	if err != nil {
+		t.Fatalf("Accept: %v", err)
+	}
+	defer conn.Close()
+
+	// A RST far outside the connection's current receive window
+	// (client.sndNext is exactly the server's rcvNxt right after the
+	// handshake) — a well-behaved peer would never send this.
+	client.sendRaw(tcpSegment{
+		srcPort: client.localPort, dstPort: client.remotePort,
+		seq: client.sndNext + defaultReceiveWindow*4, flags: flagRST, window: 65535,
+	})
+	time.Sleep(30 * time.Millisecond) // let the async read-loop deliver it before proceeding
+
+	// The connection must still be usable: a subsequent legitimate data
+	// exchange succeeds exactly as if the out-of-window RST had never
+	// arrived.
+	payload := []byte("still alive")
+	client.sendData(payload)
+	buf := make([]byte, len(payload))
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("ReadFull after out-of-window RST: %v", err)
+	}
+	if string(buf) != string(payload) {
+		t.Fatalf("got %q, want %q", buf, payload)
+	}
+}
+
+// TestTCPSynRcvdBadAckBroadcastsBeforeUnlock (WR-03): the SYN_RCVD
+// bad-ACK teardown branch must call broadcastLocked() before releasing
+// c.mu, exactly like every other terminal-state transition in this file —
+// asserted directly by capturing the pre-existing notifyCh and confirming
+// it closes, since no external Read/Write caller can currently observe
+// this branch's own effect any other way (a SYN_RCVD connection has never
+// been handed to an application). A future change exposing pre-Accept
+// connection state to a waiter would otherwise silently reintroduce a
+// missed-wakeup bug here.
+func TestTCPSynRcvdBadAckBroadcastsBeforeUnlock(t *testing.T) {
+	stack := newTestStack(t)
+	defer stack.Close()
+	ln, err := stack.ListenTCP(8080)
+	if err != nil {
+		t.Fatalf("ListenTCP: %v", err)
+	}
+	defer ln.Close()
+	fs := newFakeSession()
+	if err := stack.Attach(fs, testClientAddr()); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	client := newTCPTestClient(t, fs, testClientAddr(), 34567, testServerIP(), 8080)
+
+	client.sendRaw(tcpSegment{srcPort: client.localPort, dstPort: client.remotePort, seq: client.isn, flags: flagSYN, window: 65535})
+	synack := client.recvRaw(time.Second)
+	client.serverISN = synack.seq
+
+	d := demuxOf(t, stack)
+	key := fourTuple{remoteIP: mustAddr(testClientAddr()), remotePort: client.localPort, localPort: 8080}
+	conn := connOf(t, d, key)
+	notify := func() chan struct{} {
+		conn.mu.Lock()
+		defer conn.mu.Unlock()
+		return conn.notifyCh
+	}()
+
+	// A completing ACK with a deliberately wrong acknowledgement number —
+	// the SYN_RCVD bad-ACK branch under test.
+	client.sendRaw(tcpSegment{srcPort: client.localPort, dstPort: client.remotePort, seq: client.isn + 1, ack: synack.seq + 999, flags: flagACK, window: 65535})
+	client.recvRaw(time.Second) // the resulting RST
+
+	select {
+	case <-notify:
+	case <-time.After(time.Second):
+		t.Fatal("notifyCh was never closed — the SYN_RCVD bad-ACK branch did not call broadcastLocked() before unlocking")
+	}
+}
+
 // TestTCPNoSACKOptionEmitted: no segment this stack emits, across a mix of
 // handshake/data/retransmit/reorder/zero-window scenarios, carries a TCP
 // option other than MSS on a SYN-ACK — asserted by walking the options
