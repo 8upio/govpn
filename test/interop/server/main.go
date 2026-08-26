@@ -29,11 +29,14 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/8upio/govpn"
+	"github.com/8upio/govpn/examples/tunnelweb/site"
 	"github.com/8upio/govpn/internal/wire"
 	"github.com/8upio/govpn/netstack"
 )
@@ -62,15 +65,17 @@ func main() {
 	reorderRate := flag.Float64("reorder-rate", 0, "server-to-client synthetic packet reordering, as a percentage (0-100) of non-dropped datagrams delayed before transmission")
 	reorderDelay := flag.Duration("reorder-delay", 10*time.Millisecond, "delay applied to a datagram selected for reordering by -reorder-rate")
 	seed := flag.Int64("seed", 1, "seed for the server-to-client loss/reorder decorator's PRNG, so a failing lossy run is reproducible")
+	httpPort := flag.Uint("http-port", 8080, "TCP port the tunnelweb example site listens on, over the netstack (03-06-PLAN.md Task 1)")
+	udpPort := flag.Uint("udp-port", 9999, "UDP port the echo service listens on, over the netstack (03-06-PLAN.md Task 2)")
 	flag.Parse()
 
-	if err := run(*pkiDir, *listenAddr, *deadline, *dropRate, *reorderRate, *reorderDelay, *seed); err != nil {
+	if err := run(*pkiDir, *listenAddr, *deadline, *dropRate, *reorderRate, *reorderDelay, *seed, uint16(*httpPort), uint16(*udpPort)); err != nil {
 		fmt.Fprintln(os.Stderr, "interop-server:", err)
 		os.Exit(1)
 	}
 }
 
-func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorderRatePct float64, reorderDelay time.Duration, seed int64) error {
+func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorderRatePct float64, reorderDelay time.Duration, seed int64, httpPort, udpPort uint16) error {
 	tlsCfg, tlsCryptKey, err := loadConfig(pkiDir)
 	if err != nil {
 		return fmt.Errorf("load PKI material: %w", err)
@@ -109,6 +114,29 @@ func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorder
 		return fmt.Errorf("create netstack: %w", err)
 	}
 	defer stack.Close()
+
+	// The harness serves the same examples/tunnelweb/site pages a developer
+	// loads in a browser (03-06-PLAN.md Task 1) — no markup is duplicated
+	// into the harness, so a curl content-marker assertion checks the page
+	// that actually shipped. ListenTCP is created before srv.Serve starts
+	// (below) so a client that connects instantly cannot race the listener
+	// into existence.
+	httpLn, err := stack.ListenTCP(httpPort)
+	if err != nil {
+		return fmt.Errorf("listen tcp %d over netstack: %w", httpPort, err)
+	}
+	defer httpLn.Close()
+
+	var httpRequests atomic.Int64
+	instrumented := newRequestCountingHandler(site.Handler(site.Options{
+		Cipher:    "AES-256-GCM",
+		StartedAt: time.Now(),
+	}), &httpRequests)
+	go func() {
+		if serveErr := http.Serve(httpLn, instrumented); serveErr != nil {
+			log.Printf("tunnelweb http.Serve exited: %v", serveErr)
+		}
+	}()
 
 	sessions := make(chan *ovpn.Session, 1)
 	srv := ovpn.NewServer(ovpn.Config{
@@ -191,9 +219,9 @@ func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorder
 		// assertPingRoundTrip keep working unchanged.
 		netStats := stack.Stats()
 		log.Printf(
-			"PASS: session established and stable %s past handshake completion; peer_cn=%s tls_version=%s tls_version_raw=0x%04x cipher_suite=%s km2=ok push_request=%s assigned_ip=%s peer_id=%d ping_rx=%d ping_tx=%d",
+			"PASS: session established and stable %s past handshake completion; peer_cn=%s tls_version=%s tls_version_raw=0x%04x cipher_suite=%s km2=ok push_request=%s assigned_ip=%s peer_id=%d ping_rx=%d ping_tx=%d http_requests=%d",
 			postHandshakeSurvival, sess.PeerCN, tls.VersionName(state.Version), state.Version, tls.CipherSuiteName(state.CipherSuite), pushStatus, sess.AssignedIP(), sess.PeerID(),
-			netStats.ICMPEchoRequests, netStats.ICMPEchoReplies,
+			netStats.ICMPEchoRequests, netStats.ICMPEchoReplies, httpRequests.Load(),
 		)
 
 		_ = srv.Close()
@@ -396,6 +424,34 @@ func (l *lossyPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 func (l *lossyPacketConn) Close() error {
 	l.wg.Wait()
 	return l.PacketConn.Close()
+}
+
+// statusCapturingResponseWriter wraps an http.ResponseWriter purely to
+// observe the status code a handler wrote, so the per-request log line
+// (below) reports it — WriteHeader is not otherwise observable from outside
+// net/http.
+type statusCapturingResponseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusCapturingResponseWriter) WriteHeader(status int) {
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+// newRequestCountingHandler wraps h in a small middleware that increments
+// reqCount on every request and logs one line per request with method,
+// path, and status (03-06-PLAN.md Task 1) — the counter feeds the PASS
+// line's http_requests= field, and the log lines are what a human reads
+// first when a probe fails.
+func newRequestCountingHandler(h http.Handler, reqCount *atomic.Int64) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqCount.Add(1)
+		sw := &statusCapturingResponseWriter{ResponseWriter: w, status: http.StatusOK}
+		h.ServeHTTP(sw, r)
+		log.Printf("http %s %s -> %d", r.Method, r.URL.Path, sw.status)
+	})
 }
 
 // firstHostIP returns network's first host address (base+1) — the same

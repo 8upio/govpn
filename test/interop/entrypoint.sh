@@ -29,6 +29,11 @@ TUNNEL_SERVER_IP="${TUNNEL_SERVER_IP:-10.8.0.1}"
 # coin flip on whichever single packet happened to survive.
 PING_COUNT="${PING_COUNT:-10}"
 
+# HTTP_PORT is the tunnelweb example site's port over the netstack's TCP
+# listener (test/interop/server/main.go's -http-port, 03-06-PLAN.md Task 1).
+# The probes below curl it through the tunnel at $TUNNEL_SERVER_IP.
+HTTP_PORT="${HTTP_PORT:-8080}"
+
 CAPTURE_DIR="${CAPTURE_DIR:-/captures}"
 CAPTURE_FILE="${CAPTURE_DIR}/interop.pcap"
 CONFIG="${OVPN_CONFIG:-/pki/client.conf}"
@@ -117,6 +122,26 @@ if ip addr show tun0 2>/dev/null | grep -q 'inet '; then
 	fi
 else
 	echo "entrypoint: tun0 never came up within the wait window; skipping ping"
+fi
+
+# Probe block (03-06-PLAN.md): every probe below emits one structured line,
+#   entrypoint: PROBE <name> result=<ok|fail> <key>=<value>...
+# so test/interop/interop_test.go's parser needs no new regexp when a later
+# task adds another probe. Every curl/nc invocation is guarded against
+# set -eu (a bare non-zero exit would abort this script and lose the
+# cleanup/wait path below that flushes the pcap).
+#
+# http_landing (Task 1): curl the tunnelweb landing page through the tunnel
+# and check for its locked <h1> text (UI-SPEC §1). --retry/--retry-all-errors
+# gives the lossy scenario's synthetic loss room to succeed on a later
+# attempt rather than failing on the first dropped/reordered segment.
+LANDING_BODY=$(curl -s --max-time 10 --retry 2 --retry-all-errors "http://$TUNNEL_SERVER_IP:$HTTP_PORT/" 2>/dev/null || true)
+if [ -n "$LANDING_BODY" ] && printf '%s' "$LANDING_BODY" | grep -q '<h1>govpn tunnelweb</h1>'; then
+	echo "entrypoint: PROBE http_landing result=ok marker=found"
+	echo "entrypoint: landing page probe succeeded"
+else
+	echo "entrypoint: PROBE http_landing result=fail reason=marker_not_found"
+	echo "entrypoint: landing page probe failed (see body above, if any)"
 fi
 
 set +e

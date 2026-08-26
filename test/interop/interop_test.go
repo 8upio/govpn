@@ -52,10 +52,16 @@ type scenario struct {
 // (RESEARCH Pattern 3) rather than tuned to one observed run's timing —
 // lossy-large's is intentionally the largest, since retransmission under
 // loss is exactly what it needs room for.
+// contextTimeout values are raised over 01-04-PLAN.md's originals
+// (2/3/8 minutes) by 03-06-PLAN.md Task 1 to absorb the new HTTP/UDP/
+// negative probes this plan adds after the existing ping: these are outer
+// bounds on a context.WithTimeout, not sleeps, so raising them costs
+// nothing on a passing run and only prevents a slow CI machine's timeout
+// from looking like a protocol failure.
 var scenarios = []scenario{
-	{name: "clean-small", profile: "small", lossy: false, largeCert: false, contextTimeout: 2 * time.Minute},
-	{name: "clean-large", profile: "large", lossy: false, largeCert: true, contextTimeout: 3 * time.Minute},
-	{name: "lossy-large", profile: "large", lossy: true, largeCert: true, contextTimeout: 8 * time.Minute},
+	{name: "clean-small", profile: "small", lossy: false, largeCert: false, contextTimeout: 3 * time.Minute},
+	{name: "clean-large", profile: "large", lossy: false, largeCert: true, contextTimeout: 4 * time.Minute},
+	{name: "lossy-large", profile: "large", lossy: true, largeCert: true, contextTimeout: 10 * time.Minute},
 }
 
 // scenarioResult is one scenario's completed run: docker compose's combined
@@ -303,6 +309,14 @@ func TestInteropScenarios(t *testing.T) {
 			// only that at least one reply returned.
 			assertPingRoundTrip(t, res, !sc.lossy)
 
+			// 03-06-PLAN.md Task 1 (VRFY-02, XMPL-01 live half): a real
+			// client's curl load of the tunnelweb landing page through
+			// the tunnel, required on every scenario including the
+			// lossy one — the netstack's fixed-RTO retransmission is
+			// precisely what should carry a page load across a 5-10%
+			// loss link.
+			assertHTTPPageLoad(t, res)
+
 			assertServerStaysUnprivileged(t, res)
 
 			if sc.largeCert {
@@ -538,6 +552,90 @@ func assertPingRoundTrip(t *testing.T, res scenarioResult, strict bool) {
 	}
 	t.Logf("data-channel round trip: client received %d/%d ping replies (%d%% loss); server observed ping_rx=%d ping_tx=%d", received, transmitted, lossPct, pingRx, pingTx)
 }
+
+// probeResultRe matches entrypoint.sh's structured probe-result line format
+// (03-06-PLAN.md Task 1): "entrypoint: PROBE <name> result=<ok|fail> ...".
+// One regexp for every probe this phase adds, so a later probe needs no new
+// parser — only a new call to assertProbe below.
+var probeResultRe = regexp.MustCompile(`PROBE (\w+) result=(\w+)`)
+
+// parseProbeResults extracts every "PROBE <name> result=<ok|fail>" line from
+// composeOut into a name->result map. A probe that never printed its line at
+// all (e.g. the script aborted before reaching it) is simply absent from the
+// map, which assertProbe treats as a failure for a required probe.
+func parseProbeResults(composeOut string) map[string]string {
+	results := make(map[string]string)
+	for _, m := range probeResultRe.FindAllStringSubmatch(composeOut, -1) {
+		results[m[1]] = m[2]
+	}
+	return results
+}
+
+// assertProbe fails the test when a required probe is missing or did not
+// report result=ok. required=false records a non-ok/missing result as a
+// log line instead of a failure — used for probes this plan's own strictness
+// convention tolerates on the lossy scenario (mirroring assertPingRoundTrip's
+// strict bool, interop_test.go:479).
+func assertProbe(t *testing.T, res scenarioResult, name string, required bool) {
+	t.Helper()
+	results := parseProbeResults(res.composeOut)
+	got, ok := results[name]
+	if ok && got == "ok" {
+		t.Logf("probe %s: result=ok", name)
+		return
+	}
+	if !ok {
+		got = "missing"
+	}
+	if required {
+		t.Fatalf("probe %s: result=%s, want ok — see log above", name, got)
+	}
+	t.Logf("probe %s: result=%s (tolerated on this scenario) — see log above", name, got)
+}
+
+// landingPageH1 is the tunnelweb landing page's locked <h1> text (UI-SPEC §1
+// "Landing"), the content marker http_landing's curl probe checks for — a
+// named constant so a future copy change has one place to update and a
+// reviewer can see the marker is contractual rather than arbitrary.
+const landingPageH1 = "<h1>govpn tunnelweb</h1>"
+
+// assertHTTPPageLoad is 03-06-PLAN.md Task 1's verification: a real,
+// unmodified OpenVPN 2.6.14 client's curl request for the tunnelweb landing
+// page, issued through the tunnel by entrypoint.sh's http_landing probe,
+// returned a body containing the page's own locked <h1> text — served by
+// examples/tunnelweb/site.Handler over the netstack's TCP listener, not a
+// private stand-in page (XMPL-01 live half). It additionally asserts the
+// server's own PASS line reports http_requests= greater than zero, so a
+// probe that somehow reports ok without the server having served anything
+// still fails.
+func assertHTTPPageLoad(t *testing.T, res scenarioResult) {
+	t.Helper()
+
+	if res.composeErr != nil {
+		// assertHandshakeCompleted already fails loudly on this; avoid a
+		// second, redundant fatal here obscuring the first.
+		return
+	}
+
+	assertProbe(t, res, "http_landing", true)
+
+	m := httpRequestsRe.FindStringSubmatch(res.composeOut)
+	if m == nil {
+		t.Fatal("server output does not contain a parsable http_requests= field — see log above")
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		t.Fatalf("parse http_requests=%q: %v", m[1], err)
+	}
+	if n == 0 {
+		t.Fatal("server output reports http_requests=0, want greater than zero — the probe reported ok without the server having served anything")
+	}
+	t.Logf("server observed http_requests=%d", n)
+}
+
+// httpRequestsRe extracts the http_requests= field test/interop/server's
+// PASS line carries (03-06-PLAN.md Task 1).
+var httpRequestsRe = regexp.MustCompile(`http_requests=(\d+)`)
 
 // assertServerStaysUnprivileged is plan 01-02's runtime privilege check,
 // re-asserted in every scenario including the lossy one — the
