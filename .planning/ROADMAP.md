@@ -100,7 +100,7 @@ Plans:
   3. `ListenTCP(port)` returns a `net.Listener` that stdlib `http.Serve` accepts on, and the example web server — one command to run — serves an interactive landing page plus 3–5 subpages that load in a browser inside the client container and are unreachable from outside the tunnel
   4. One automated harness run verifies ICMP, a UDP round-trip, and an HTTP page load through the tunnel from the real client, with no `/dev/net/tun` and no `CAP_NET_ADMIN` in the server container
 
-**Plans**: 5/6 plans executed
+**Plans**: 6/6 plans executed
 **UI hint**: yes
 
 Plans:
@@ -123,7 +123,7 @@ Plans:
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
-- [ ] 03-06-PLAN.md — Interop harness: one run verifying ICMP, UDP round-trip, and HTTP page loads from the real client, with no TUN device and no CAP_NET_ADMIN (VRFY-02)
+- [x] 03-06-PLAN.md — Interop harness: one run verifying ICMP, UDP round-trip, and HTTP page loads from the real client, with no TUN device and no CAP_NET_ADMIN (VRFY-02)
 
 ### Phase 4: Durable Sessions
 
@@ -148,7 +148,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 |-------|----------------|--------|-----------|
 | 1. Handshake | 4/4 | Complete    | 2026-08-24 |
 | 2. Tunnel Up | 4/4 | Complete    | 2026-08-25 |
-| 3. In-Process Termination | 5/6 | In Progress|  |
+| 3. In-Process Termination | 6/6 | In Progress|  |
 | 4. Durable Sessions | 0/TBD | Not started | - |
 
 ## Requirement Coverage
