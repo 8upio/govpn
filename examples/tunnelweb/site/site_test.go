@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -406,5 +407,141 @@ func TestLongHeaderValueWraps(t *testing.T) {
 	}
 	if strings.Contains(body, "nowrap") {
 		t.Error("stylesheet contains a nowrap rule that would force horizontal scroll")
+	}
+}
+
+// --- Task 3: echo ---
+
+func TestEchoEmptyState(t *testing.T) {
+	h := Handler(testOptions())
+	body := doRequest(h, http.MethodGet, "/echo", "").Body.String()
+
+	if !strings.Contains(body, `<textarea id="msg" name="msg" placeholder="Type something to echo through the tunnel…">`) {
+		t.Errorf("echo page missing the empty, placeholder-carrying textarea:\n%s", body)
+	}
+	if !strings.Contains(body, "Nothing to echo yet") {
+		t.Error("echo page missing the empty-state heading 'Nothing to echo yet'")
+	}
+	if !strings.Contains(body, echoEmptyBodyCopy) {
+		t.Error("echo page missing the exact empty-state body copy")
+	}
+	if strings.Contains(body, "You sent:") {
+		t.Error("initial GET should not show a prior echoed value")
+	}
+}
+
+func TestEchoFormShape(t *testing.T) {
+	h := Handler(testOptions())
+	body := doRequest(h, http.MethodGet, "/echo", "").Body.String()
+
+	if !strings.Contains(body, `<form method="post" action="/echo">`) {
+		t.Error(`echo page missing <form method="post" action="/echo">`)
+	}
+	if !strings.Contains(body, `<label for="msg">Message to echo</label>`) {
+		t.Error("echo page missing the explicit label for msg")
+	}
+	if !strings.Contains(body, `<textarea id="msg" name="msg"`) {
+		t.Error("textarea id does not match the label's for attribute")
+	}
+	if !strings.Contains(body, `<button type="submit">Send echo</button>`) {
+		t.Error(`submit button text is not exactly "Send echo"`)
+	}
+}
+
+func TestEchoRoundTrip(t *testing.T) {
+	h := Handler(testOptions())
+	form := url.Values{"msg": {"hello tunnel"}}
+	w := doRequest(h, http.MethodPost, "/echo", form.Encode())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "You sent: hello tunnel") {
+		t.Errorf("echo response missing the round-tripped value:\n%s", w.Body.String())
+	}
+}
+
+func TestEchoEscapesSubmittedValue(t *testing.T) {
+	h := Handler(testOptions())
+	form := url.Values{"msg": {"<script>alert(1)</script>"}}
+	w := doRequest(h, http.MethodPost, "/echo", form.Encode())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	body := w.Body.String()
+	if strings.Contains(body, "<script>alert(1)</script>") {
+		t.Fatal("submitted script tag rendered unescaped")
+	}
+	if !strings.Contains(body, "alert(1)") {
+		t.Fatal("escaped submitted value not present as visible text")
+	}
+}
+
+func TestEchoEmptyBodyError(t *testing.T) {
+	h := Handler(testOptions())
+	form := url.Values{"msg": {""}}
+	w := doRequest(h, http.MethodPost, "/echo", form.Encode())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (the page re-renders rather than erroring the request)", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), echoErrorCopy) {
+		t.Errorf("expected the exact error copy, got:\n%s", w.Body.String())
+	}
+}
+
+func TestEchoOversizedBodyError(t *testing.T) {
+	h := Handler(testOptions())
+	big := strings.Repeat("a", maxEchoMsgBytes+1000)
+	form := url.Values{"msg": {big}}
+	w := doRequest(h, http.MethodPost, "/echo", form.Encode())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, echoErrorCopy) {
+		t.Errorf("expected the exact error copy, got:\n%s", body)
+	}
+	if strings.Contains(body, big) {
+		t.Error("oversized value must not be rendered back")
+	}
+}
+
+func TestEchoAtSizeBoundary(t *testing.T) {
+	h := Handler(testOptions())
+
+	exact := strings.Repeat("a", maxEchoMsgBytes)
+	w1 := doRequest(h, http.MethodPost, "/echo", url.Values{"msg": {exact}}.Encode())
+	if w1.Code != http.StatusOK || !strings.Contains(w1.Body.String(), "You sent: "+exact) {
+		t.Errorf("a message of exactly %d bytes should be accepted and echoed", maxEchoMsgBytes)
+	}
+
+	over := strings.Repeat("a", maxEchoMsgBytes+1)
+	w2 := doRequest(h, http.MethodPost, "/echo", url.Values{"msg": {over}}.Encode())
+	if w2.Code != http.StatusOK || !strings.Contains(w2.Body.String(), echoErrorCopy) {
+		t.Errorf("a message of %d bytes should be rejected with the error copy", maxEchoMsgBytes+1)
+	}
+}
+
+func TestEchoIsStateless(t *testing.T) {
+	h := Handler(testOptions())
+
+	w1 := doRequest(h, http.MethodPost, "/echo", url.Values{"msg": {"first"}}.Encode())
+	w2 := doRequest(h, http.MethodPost, "/echo", url.Values{"msg": {"second"}}.Encode())
+
+	if !strings.Contains(w1.Body.String(), "You sent: first") || strings.Contains(w1.Body.String(), "second") {
+		t.Error("first response is not independent of the second request")
+	}
+	if !strings.Contains(w2.Body.String(), "You sent: second") || strings.Contains(w2.Body.String(), "You sent: first") {
+		t.Error("second response is not independent of the first request")
+	}
+	if cookies := w1.Result().Cookies(); len(cookies) != 0 {
+		t.Error("echo handler set a cookie — the page must be stateless")
+	}
+}
+
+func TestEchoNoJavaScript(t *testing.T) {
+	h := Handler(testOptions())
+	body := doRequest(h, http.MethodGet, "/echo", "").Body.String()
+	if strings.Contains(body, "<script") {
+		t.Error("echo page contains a <script> element")
 	}
 }

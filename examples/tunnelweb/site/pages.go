@@ -294,12 +294,125 @@ func (s *site) handleHeaders(w http.ResponseWriter, r *http.Request) {
 	renderPage(w, http.StatusOK, headersTmpl, "Headers", data)
 }
 
-// echoTmpl is a placeholder for this task, matching statusTmpl above;
-// fully implemented (the interactive echo-test form) in Task 3.
-var echoTmpl = template.Must(template.New("echo").Parse(`<h2>Echo test</h2>
-<p>Coming in Task 3: send a message through the tunnel and get it back.</p>
+const (
+	// echoEmptyBodyCopy and echoErrorCopy are the Copywriting Contract's
+	// exact, locked strings — defined once here so both the template
+	// (which renders them) and the test suite (which asserts on them)
+	// share a single source of truth rather than risking drift between
+	// two independently-typed copies of the same locked text.
+	echoEmptyBodyCopy = "Type a message above and submit — it travels through the tunnel to this server and back before the page reloads with the result."
+	echoErrorCopy     = "Echo failed — the message was empty or too large. Type something under 4KB and try again."
+
+	// echoPlaceholder is the empty textarea's locked placeholder text
+	// (UI-SPEC UI Considerations, `empty` row).
+	echoPlaceholder = "Type something to echo through the tunnel…"
+
+	// maxEchoMsgBytes is the exact 4KB rule asserted on both sides of the
+	// boundary (UI-SPEC §4, T-03-26): a message of exactly this many
+	// bytes is accepted, one byte over is rejected.
+	maxEchoMsgBytes = 4096
+
+	// maxEchoBodyBytesLimit bounds http.MaxBytesReader at read time, "a
+	// little above" maxEchoMsgBytes so the size rule is enforced before
+	// ParseForm ever buffers an arbitrarily large body (T-03-26) — not
+	// merely after. Roughly double maxEchoMsgBytes: enough headroom for
+	// the "msg=" key and ordinary form-encoding overhead, while still a
+	// small, fixed ceiling that can never let an attacker force megabytes
+	// into memory before the value's own length is even inspected. A
+	// request that trips this reader produces the same error copy as the
+	// exact-4096 check below — the two paths are indistinguishable to the
+	// client by design, since both mean "too large".
+	maxEchoBodyBytesLimit = maxEchoMsgBytes * 2
+)
+
+// echoPageData carries the echo page's one dynamic axis: which of the
+// three UI-SPEC states (empty, populated, error) to render, plus the
+// value/error text that state needs. EmptyBody is threaded through data
+// (rather than hardcoded twice, once here and once in the template) so
+// echoEmptyBodyCopy stays the single source of truth for that locked
+// string.
+type echoPageData struct {
+	State     string // "empty", "populated", or "error"
+	Value     string
+	EmptyBody string
+	ErrorMsg  string
+}
+
+// echoTmpl is UI-SPEC §4's locked echo-test page: a plain
+// method="post" form with an explicit, visible <label> (never
+// placeholder-only — Accessibility Basics) whose for/id match, and a
+// state-dependent block above it. There is no client-side loading
+// indicator to build (UI-SPEC's `loading` row: a plain form POST triggers
+// the browser's own native full-page-reload indicator) — the comment
+// below the form exists so a later contributor does not add a spinner and
+// a fetch call, which would require JavaScript this site deliberately
+// never ships.
+var echoTmpl = template.Must(template.New("echo").Parse(`{{if eq .State "empty"}}<h2>Nothing to echo yet</h2>
+<p>{{.EmptyBody}}</p>
+{{else if eq .State "error"}}<h2>Echo test</h2>
+<p class="echo-error">{{.ErrorMsg}}</p>
+{{else}}<h2>Echo test</h2>
+<p class="echo-result">You sent: {{.Value}}</p>
+{{end}}
+<!-- No JavaScript here on purpose: a plain form POST triggers the
+     browser's own full-page-reload loading indicator (UI-SPEC's loading
+     row). Do not add a spinner or a fetch call. -->
+<form method="post" action="/echo">
+<label for="msg">Message to echo</label>
+<textarea id="msg" name="msg" placeholder="` + echoPlaceholder + `"></textarea>
+<button type="submit">Send echo</button>
+</form>
 `))
 
+// handleEcho serves the echo page's GET (always the empty state — no
+// echoed value is ever shown on a fresh load) and POST (round-trip)
+// behavior. The page is idempotent and stateless: no cookie, no
+// server-side store, nothing that outlives a single request/response.
 func (s *site) handleEcho(w http.ResponseWriter, r *http.Request) {
-	renderPage(w, http.StatusOK, echoTmpl, "Echo test", nil)
+	if r.Method != http.MethodPost {
+		renderPage(w, http.StatusOK, echoTmpl, "Echo test", echoPageData{
+			State:     "empty",
+			EmptyBody: echoEmptyBodyCopy,
+		})
+		return
+	}
+	s.handleEchoPost(w, r)
+}
+
+// handleEchoPost bounds the request body with http.MaxBytesReader before
+// ever calling ParseForm — enforcing the size rule at read time rather
+// than after buffering an arbitrarily large body (T-03-26) — then applies
+// the exact 4096-byte rule to the decoded msg value itself, independent of
+// the reader's own bound. An empty, whitespace-only, or oversized value
+// renders the error state and — deliberately — a 200, not a 400: UI-SPEC's
+// `error` row specifies the page re-renders with error copy rather than
+// producing a blank/broken response, and a browser showing a bare 400
+// body is a worse demo than a page that explains what went wrong.
+func (s *site) handleEchoPost(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxEchoBodyBytesLimit)
+
+	if err := r.ParseForm(); err != nil {
+		s.renderEchoError(w)
+		return
+	}
+
+	msg := r.FormValue("msg")
+	if strings.TrimSpace(msg) == "" || len(msg) > maxEchoMsgBytes {
+		s.renderEchoError(w)
+		return
+	}
+
+	renderPage(w, http.StatusOK, echoTmpl, "Echo test", echoPageData{
+		State: "populated",
+		Value: msg,
+	})
+}
+
+// renderEchoError renders the exact Copywriting Contract error string —
+// always 200, never the submitted value (UI-SPEC §4).
+func (s *site) renderEchoError(w http.ResponseWriter) {
+	renderPage(w, http.StatusOK, echoTmpl, "Echo test", echoPageData{
+		State:    "error",
+		ErrorMsg: echoErrorCopy,
+	})
 }
