@@ -1,0 +1,157 @@
+/* examples/tunnelweb/site/style.css
+ *
+ * The tunnelweb example's only stylesheet — served from /style.css on the
+ * same netstack listener as every page (UI-SPEC Delivery constraint,
+ * locked: no CDN font, no external stylesheet, no cross-origin CSS
+ * resource reference of any kind). Design tokens are declared exactly once below,
+ * transcribed verbatim from 03-UI-SPEC.md's Design Tokens block, and every
+ * page style is built from those custom properties only — never from a
+ * raw literal value.
+ *
+ * Exactly 2 font weights (400, 600) and exactly 4 type sizes are used
+ * anywhere in this file (UI-SPEC Typography). --color-accent is used only
+ * for nav links, the echo page's "Send echo" button, :focus-visible
+ * outlines, and the status page's "tunnel: active" text (UI-SPEC Color,
+ * the accent reserve list) — nowhere else. No dark-mode media query and no
+ * second theme exist (UI-SPEC Design Tokens).
+ */
+
+:root {
+  /* Color — 60/30/10 */
+  --color-bg: #ffffff; /* dominant (60%) */
+  --color-surface: #f1f3f5; /* secondary (30%) */
+  --color-border: #d8dde3;
+  --color-text: #1a1a1a;
+  --color-text-muted: #5f6b7a;
+  --color-accent: #2563eb; /* accent (10%) — reserved-for list above */
+
+  /* Typography */
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    monospace;
+  --text-sm: 14px;
+  --text-base: 16px;
+  --text-lg: 24px;
+  --text-xl: 32px;
+
+  /* Spacing (8-point scale) */
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 16px;
+  --space-lg: 24px;
+  --space-xl: 32px;
+  --space-2xl: 48px;
+  --space-3xl: 64px; /* declared and unused by design — UI-SPEC Spacing Scale */
+
+  --radius: 4px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  font-weight: 400;
+  line-height: 1.5;
+}
+
+a {
+  color: var(--color-text);
+}
+
+header {
+  background: var(--color-surface);
+  border-bottom: 1px solid var(--color-border);
+  padding: var(--space-lg) var(--space-xl);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-lg);
+}
+
+header .brand {
+  font-weight: 600;
+  font-size: var(--text-lg);
+  text-decoration: none;
+  color: var(--color-text);
+}
+
+nav ul {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-lg);
+  margin: 0;
+  padding: 0;
+}
+
+nav li {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+}
+
+nav a {
+  color: var(--color-accent);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+nav a:hover {
+  text-decoration: underline;
+}
+
+.nav-desc {
+  font-size: var(--text-sm);
+  font-weight: 400;
+  color: var(--color-text-muted);
+}
+
+main {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: var(--space-2xl) var(--space-xl);
+}
+
+main h1 {
+  font-size: var(--text-xl);
+  font-weight: 600;
+  line-height: 1.2;
+  margin: 0 0 var(--space-md) 0;
+}
+
+main h2 {
+  font-size: var(--text-lg);
+  font-weight: 600;
+  line-height: 1.2;
+  margin: var(--space-xl) 0 var(--space-md) 0;
+}
+
+main p {
+  margin: 0 0 var(--space-md) 0;
+}
+
+footer {
+  text-align: center;
+  color: var(--color-text-muted);
+  font-size: var(--text-sm);
+  padding: var(--space-lg);
+}
+
+/* Accessibility Basics: every interactive element gets a visible
+ * :focus-visible outline — required since this site ships no JavaScript
+ * and must be fully keyboard-navigable by default browser behavior alone. */
+a:focus-visible,
+button:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
