@@ -402,6 +402,94 @@ func TestPhase3CoreDoesNotImportNetstack(t *testing.T) {
 // is currently stdlib-only; if a future plan adopts a packet library for
 // test assertions it must live in a separate module with its own go.mod
 // (CLAUDE.md's own stated policy), not be excepted here.
+// serverServiceBlock isolates test/interop/docker-compose.yml's server:
+// service block — from its own 2-space-indented "  server:" key line up to
+// (but excluding) the next 2-space-indented top-level service key —
+// following this file's own header-comment precedent (line 1-13) of
+// reading a specific non-Go file with plain text handling rather than
+// pulling in a YAML-parsing dependency this project doesn't otherwise need.
+func serverServiceBlock(t *testing.T, composeYAML string) string {
+	t.Helper()
+	lines := strings.Split(composeYAML, "\n")
+
+	start := -1
+	for i, line := range lines {
+		if strings.HasPrefix(line, "  server:") {
+			start = i
+			break
+		}
+	}
+	if start == -1 {
+		t.Fatal("test/interop/docker-compose.yml does not contain a top-level \"  server:\" service key")
+	}
+
+	end := len(lines)
+	for i := start + 1; i < len(lines); i++ {
+		line := lines[i]
+		trimmed := strings.TrimLeft(line, " ")
+		if trimmed == "" {
+			continue
+		}
+		indent := len(line) - len(trimmed)
+		if indent == 2 {
+			end = i
+			break
+		}
+	}
+	return strings.Join(lines[start:end], "\n")
+}
+
+// stripYAMLCommentLines drops every line whose first non-space character is
+// '#' — the server service block's own comments (docker-compose.yml:14-21)
+// NAME every one of the forbidden keys below as part of explaining why they
+// are deliberately absent, so a naive substring scan over the raw block
+// would flag that rationale as a violation. This mirrors the hazard this
+// file's own header comment already documents for AST versus raw text
+// matching elsewhere in this file — here applied to YAML instead of Go.
+func stripYAMLCommentLines(block string) string {
+	var kept []string
+	for _, line := range strings.Split(block, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, "\n")
+}
+
+// TestPhase3ServerContainerRequestsNoPrivileges is 03-06-PLAN.md Task 3's
+// static gate: test/interop/docker-compose.yml's server service block, AS
+// COMMITTED, must declare no capability-add key, no devices key, and no
+// privileged mode, and must still pin a non-root user: value. This is
+// independent of test/interop/interop_test.go's assertServerStaysUnprivileged,
+// which re-asserts the container's posture AS LAUNCHED via `docker
+// inspect` — the two fail independently, one on the file, one on the
+// running container, and this one runs on every `make test` with no Docker
+// required (the `gates` target's filter already matches
+// 'TestPhase2|TestPhase3', widened by 03-01-PLAN.md Task 3).
+func TestPhase3ServerContainerRequestsNoPrivileges(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("test", "interop", "docker-compose.yml"))
+	if err != nil {
+		t.Fatalf("read test/interop/docker-compose.yml: %v", err)
+	}
+
+	block := serverServiceBlock(t, string(data))
+	stripped := stripYAMLCommentLines(block)
+
+	for _, forbidden := range []string{"cap_add:", "devices:", "privileged:"} {
+		if strings.Contains(stripped, forbidden) {
+			t.Errorf(
+				"test/interop/docker-compose.yml's server service block declares %q — the server must run entirely unprivileged (no added capabilities, no device mappings, no privileged mode); the client service legitimately needs both because it is the real OpenVPN client creating a kernel tun interface, and that asymmetry must never be mirrored onto the server to make a run pass (T-01-07)",
+				forbidden,
+			)
+		}
+	}
+
+	if !strings.Contains(stripped, "user:") {
+		t.Error("test/interop/docker-compose.yml's server service block does not declare a user: value — a pinned non-root uid/gid is part of the server's unprivileged posture")
+	}
+}
+
 func TestPhase3StdlibOnlyImports(t *testing.T) {
 	walkGoFiles(t, func(path string, file *ast.File, fset *token.FileSet) {
 		for _, imp := range file.Imports {

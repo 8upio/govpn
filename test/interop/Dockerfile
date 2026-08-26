@@ -7,22 +7,37 @@ FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639
 # debian:bookworm-slim` (manifest-list digest, multi-arch — safe to build on
 # both amd64 CI runners and arm64 developer machines).
 
-# Resolved openvpn/tcpdump/iproute2/iputils-ping package versions as of
-# 2026-08-23 (`apt-cache policy` against this exact base digest) —
-# recorded here so a future version drift shows up in a diff of this
-# file, not silently:
-#   openvpn       2.6.14-0+deb12u2
-#   tcpdump       4.99.3-1
-#   iproute2      6.1.0-3
-#   iputils-ping  3:20221126-1+deb12u1
+# Resolved openvpn/tcpdump/iproute2/iputils-ping/curl/netcat-openbsd package
+# versions as of 2026-08-27 (`apt-cache policy` against this exact base
+# digest) — recorded here so a future version drift shows up in a diff of
+# this file, not silently:
+#   openvpn         2.6.14-0+deb12u2
+#   tcpdump         4.99.3-1
+#   iproute2        6.1.0-3
+#   iputils-ping    3:20221126-1+deb12u1
+#   curl            7.88.1-10+deb12u15
+#   netcat-openbsd  1.219-1
 #
 # iputils-ping is added for 02-03-PLAN.md Task 1's live data-channel round
 # trip: the entrypoint pings the server's pushed tunnel IP once the real
 # client's tun0 interface is up, proving Session.Read/Write carry genuine
 # encrypted IP traffic, not merely that the control-channel handshake
 # completed.
+#
+# curl is added for 03-06-PLAN.md Task 1's HTTP page-load probes
+# (RESEARCH.md flagged it absent from this image, with "add to the
+# Dockerfile" as the stated fallback): entrypoint.sh uses it to load the
+# tunnelweb site's pages through the tunnel and assert on their content
+# markers.
+#
+# netcat-openbsd is added for 03-06-PLAN.md Task 2's UDP round-trip probe:
+# this image's /bin/sh is dash, which has no /dev/udp support (that is a
+# bash feature), and curl cannot drive a raw UDP round trip — `nc -u`
+# connects the UDP socket so a reply from the same (address, port) the
+# datagram was sent to is received and printed, exactly what the netstack's
+# WriteTo produces.
 RUN apt-get update && \
-    apt-get install --no-install-recommends -y openvpn tcpdump iproute2 iputils-ping && \
+    apt-get install --no-install-recommends -y openvpn tcpdump iproute2 iputils-ping curl netcat-openbsd && \
     rm -rf /var/lib/apt/lists/*
 
 COPY entrypoint.sh /entrypoint.sh
