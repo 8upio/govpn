@@ -358,18 +358,31 @@ func (l *tcpListener) handleSYN(a *attachment, remoteIP netip.Addr, seg tcpSegme
 // queued unboundedly or delivered to a closed listener (T-03-14) — this
 // runs on the stack's single per-session read-loop goroutine by way of
 // handleSegment, so it must never block.
+//
+// WR-01: the closed-check and the (non-blocking) backlog send happen
+// under the SAME l.mu critical section Close uses to set l.closed —
+// previously the check and the send were two separate steps with the
+// lock released in between, so Close could observe an empty backlog and
+// return right as a concurrent enqueue's check-then-send raced in behind
+// it, leaving a connection queued in a channel Close had already finished
+// draining and that no future Accept would ever read from again (Accept
+// had already unblocked via closeCh). Holding l.mu across both steps
+// forces a total order between the two: any enqueue call either completes
+// entirely before Close observes/sets l.closed (so Close's subsequent
+// drain loop is guaranteed to see it in the backlog), or entirely after
+// (so it observes l.closed already true and aborts without sending).
 func (l *tcpListener) enqueue(c *tcpConn) {
 	l.mu.Lock()
-	closed := l.closed
-	l.mu.Unlock()
-	if closed {
+	if l.closed {
+		l.mu.Unlock()
 		c.abort()
 		return
 	}
-
 	select {
 	case l.backlog <- c:
+		l.mu.Unlock()
 	default:
+		l.mu.Unlock()
 		c.abort()
 		l.demux.stats.backlogOverflow.Add(1)
 	}

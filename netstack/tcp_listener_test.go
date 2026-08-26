@@ -2,6 +2,7 @@ package netstack
 
 import (
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -570,5 +571,115 @@ func TestTCPLiveConnCapPerSession(t *testing.T) {
 
 	if got := stack.TCPStats().LiveConnCapHits; got < before+1 {
 		t.Fatalf("LiveConnCapHits = %d, want at least %d", got, before+1)
+	}
+}
+
+// TestTCPListenerEnqueueCloseRaceLeavesNothingBehind (WR-01) races a
+// handshake's completing ACK — processed asynchronously on the stack's own
+// read-loop goroutine, where enqueue() is called — against a concurrent
+// Close() from the test goroutine, across many trials. The SYN/SYN-ACK
+// step runs synchronously BEFORE the race window opens (a half-open
+// connection safely sitting in the demux is not what WR-01 is about;
+// racing the SYN itself against Close would instead exercise handleSYN's
+// own separate, unrelated closed-check, misattributing any flake to the
+// wrong fix) — only the completing ACK races Close, isolating exactly the
+// enqueue/Close interaction WR-01 fixes.
+//
+// Before WR-01, enqueue's closed-check and its backlog send were two
+// separate steps with l.mu released in between: Close could observe an
+// empty backlog and return right as a concurrently-racing enqueue's send
+// landed behind it, leaving that connection ESTABLISHED in the demux's
+// conns map — neither reachable via Accept (already unblocked via
+// closeCh) nor aborted by Close's own drain loop (which had already
+// finished). This is a lost update between two lock-protected steps, not
+// a data race in the sync/race-detector sense, so the regression signal
+// is the FUNCTIONAL assertion below (the demux's conns map must end up
+// empty), not `-race` itself; many trials make the race window
+// overwhelmingly likely to be hit at least once if the two operations are
+// not properly serialized.
+//
+// The completing-ACK goroutine below only ever calls sendRaw (never
+// recvRaw/t.Fatalf) — calling FailNow-family methods from a goroutine
+// other than the test's own is unsupported by the testing package.
+func TestTCPListenerEnqueueCloseRaceLeavesNothingBehind(t *testing.T) {
+	// The race window this closes is narrow (a handful of instructions
+	// between releasing l.mu and the backlog send in the pre-fix code) —
+	// empirically, several thousand trials are needed to reliably land in
+	// it under normal goroutine scheduling. 5000 trials reproduced the
+	// pre-fix leak within ~400 trials in local testing and this whole
+	// test still runs in low single-digit seconds under -race.
+	const trials = 5000
+	for trial := 0; trial < trials; trial++ {
+		stack := newTestStack(t)
+		ln, err := stack.ListenTCP(8080)
+		if err != nil {
+			t.Fatalf("trial %d: ListenTCP: %v", trial, err)
+		}
+		fs := newFakeSession()
+		if err := stack.Attach(fs, testClientAddr()); err != nil {
+			t.Fatalf("trial %d: Attach: %v", trial, err)
+		}
+		client := newTCPTestClient(t, fs, testClientAddr(), uint16(26000+trial), testServerIP(), 8080)
+
+		client.sendRaw(tcpSegment{srcPort: client.localPort, dstPort: client.remotePort, seq: client.isn, flags: flagSYN, window: 65535})
+		synack, ok := client.tryRecvRaw(time.Second)
+		if !ok {
+			t.Fatalf("trial %d: no SYN-ACK received", trial)
+		}
+		client.serverISN = synack.seq
+		client.rcvNext = synack.seq + 1
+		client.sndNext = client.isn + 1
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			client.sendRaw(tcpSegment{srcPort: client.localPort, dstPort: client.remotePort, seq: client.sndNext, ack: client.rcvNext, flags: flagACK, window: 65535})
+		}()
+		go func() {
+			defer wg.Done()
+			ln.Close()
+		}()
+		wg.Wait()
+
+		// Drain whatever a well-behaved caller's Accept loop would see —
+		// exactly what net/http's own Serve loop does until Accept
+		// errors — and close it. The property under test is not "the
+		// handshake always wins" (it may legitimately lose the race to
+		// Close outright) but "nothing is left ESTABLISHED and
+		// unreachable."
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				break
+			}
+			c.Close()
+		}
+
+		// The completing ACK's actual processing (handleSegment, then
+		// enqueue/abort) happens asynchronously on the stack's own
+		// read-loop goroutine — sendRaw only queues the packet and
+		// returns, so wg.Wait() above does not guarantee that processing
+		// has finished yet. Poll briefly (bounded, no fixed sleep) rather
+		// than asserting immediately: with WR-01's fix this always
+		// reaches zero quickly; without it, a leaked connection never
+		// clears and the deadline below fires.
+		deadline := time.Now().Add(time.Second)
+		var remaining int
+		for {
+			d := demuxOf(t, stack)
+			d.mu.Lock()
+			remaining = len(d.conns)
+			d.mu.Unlock()
+			if remaining == 0 || time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		if remaining != 0 {
+			t.Fatalf("trial %d: %d connection(s) still tracked in the demux a full second after Close and an Accept-drain loop — a connection was enqueued after Close's own drain finished (WR-01)", trial, remaining)
+		}
+
+		stack.Close()
 	}
 }
