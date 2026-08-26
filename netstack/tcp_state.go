@@ -248,28 +248,56 @@ func (c *tcpConn) handleEstablishedDataLocked(seg tcpSegment, toSend *[]tcpSegme
 
 	switch {
 	case seg.seq == c.rcvNxt:
+		// CR-01: admission is clamped to what this stack itself last
+		// advertised (recvWindowRemainingLocked), not just appended
+		// unconditionally — a peer that ignores the advertised window
+		// (compromised client, buggy stack, or an application that never
+		// drains Read) can otherwise grow recvBuf without bound. Bytes
+		// beyond the remaining window are dropped, exactly as if they had
+		// never arrived; the peer's own retransmission timer redelivers
+		// them once the application drains enough of recvBuf to reopen
+		// the window (mirroring how sendPendingLocked already clamps the
+		// send side to allowedInFlightLocked()).
+		fullyAccepted := dataLen == 0
 		if dataLen > 0 {
-			c.recvBuf = append(c.recvBuf, seg.payload...)
-			c.rcvNxt += dataLen
-		}
-		for {
-			data, ok := c.reorder[c.rcvNxt]
-			if !ok {
-				break
+			avail := c.recvWindowRemainingLocked()
+			accept := dataLen
+			if accept > avail {
+				accept = avail
 			}
-			delete(c.reorder, c.rcvNxt)
-			c.recvBuf = append(c.recvBuf, data...)
-			c.rcvNxt += uint32(len(data))
+			if accept > 0 {
+				c.recvBuf = append(c.recvBuf, seg.payload[:accept]...)
+				c.rcvNxt += accept
+			}
+			fullyAccepted = accept == dataLen
 		}
-		if seg.flags&flagFIN != 0 && seg.seq+dataLen == c.rcvNxt {
-			c.rcvNxt++
-			c.peerClosed = true
-			finConsumed = true
-		} else if c.hasPendingFIN && c.rcvNxt == c.pendingFINSeq {
-			c.rcvNxt++
-			c.peerClosed = true
-			c.hasPendingFIN = false
-			finConsumed = true
+		// Only drain reordered segments once this segment's own data was
+		// fully admitted — draining while this segment was itself
+		// truncated for lack of room would immediately re-exceed the
+		// same window this branch just enforced.
+		if fullyAccepted {
+			for {
+				data, ok := c.reorder[c.rcvNxt]
+				if !ok {
+					break
+				}
+				if uint32(len(data)) > c.recvWindowRemainingLocked() {
+					break
+				}
+				delete(c.reorder, c.rcvNxt)
+				c.recvBuf = append(c.recvBuf, data...)
+				c.rcvNxt += uint32(len(data))
+			}
+			if seg.flags&flagFIN != 0 && seg.seq+dataLen == c.rcvNxt {
+				c.rcvNxt++
+				c.peerClosed = true
+				finConsumed = true
+			} else if c.hasPendingFIN && c.rcvNxt == c.pendingFINSeq {
+				c.rcvNxt++
+				c.peerClosed = true
+				c.hasPendingFIN = false
+				finConsumed = true
+			}
 		}
 		*toSend = append(*toSend, c.buildACKLocked())
 		c.broadcastLocked()
@@ -277,7 +305,7 @@ func (c *tcpConn) handleEstablishedDataLocked(seg tcpSegment, toSend *[]tcpSegme
 
 	case seqGT(seg.seq, c.rcvNxt):
 		if _, exists := c.reorder[seg.seq]; !exists {
-			if uint32(len(c.reorder)) >= maxReorderSegments {
+			if uint32(len(c.reorder)) >= maxReorderSegments || dataLen > c.recvWindowRemainingLocked() {
 				c.demux.stats.reorderDropped.Add(1)
 				*toSend = append(*toSend, c.buildACKLocked())
 				return false

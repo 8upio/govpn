@@ -549,15 +549,30 @@ func (c *tcpConn) broadcastLocked() {
 	c.notifyCh = make(chan struct{})
 }
 
-// advertisedWindowLocked returns min(defaultReceiveWindow, free space in
-// recvBuf) — the window shrinks honestly as an unread buffer fills
-// (D-07's fixed window, made honest rather than a constant lie).
-func (c *tcpConn) advertisedWindowLocked() uint16 {
+// recvWindowRemainingLocked returns the number of bytes still admissible
+// under defaultReceiveWindow, counting both recvBuf (in-order, undelivered
+// bytes) and every byte currently held in reorder (out-of-order-but-in-
+// window segments) — CR-01: the receive window bounds everything this
+// connection is holding on the peer's behalf, not just the in-order
+// portion, so admission checks and the advertised window itself must agree
+// on what "buffered" means.
+func (c *tcpConn) recvWindowRemainingLocked() uint32 {
 	used := uint32(len(c.recvBuf))
+	for _, buf := range c.reorder {
+		used += uint32(len(buf))
+	}
 	if used >= defaultReceiveWindow {
 		return 0
 	}
-	return uint16(defaultReceiveWindow - used)
+	return defaultReceiveWindow - used
+}
+
+// advertisedWindowLocked returns min(defaultReceiveWindow, free space
+// remaining across recvBuf and reorder) — the window shrinks honestly as
+// an unread buffer fills (D-07's fixed window, made honest rather than a
+// constant lie).
+func (c *tcpConn) advertisedWindowLocked() uint16 {
+	return uint16(c.recvWindowRemainingLocked())
 }
 
 // buildACKLocked builds a bare (no payload) cumulative ACK reflecting the

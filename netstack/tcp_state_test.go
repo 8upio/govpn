@@ -738,6 +738,82 @@ func TestTCPAdvertisedWindowShrinksWithBuffer(t *testing.T) {
 	}
 }
 
+// TestTCPReceiveWindowEnforcedOnIngress (CR-01): a peer that ignores the
+// advertised window and sends far more in-order data than the receive
+// window has room for must not grow recvBuf past defaultReceiveWindow —
+// the excess is dropped, not buffered, and only defaultReceiveWindow bytes
+// are ever delivered to the application. Without CR-01's clamp in
+// handleEstablishedDataLocked, this test's Read would return the full
+// oversized payload (a receive-side memory-growth vector for a
+// slow/malicious reader).
+func TestTCPReceiveWindowEnforcedOnIngress(t *testing.T) {
+	stack := newTestStack(t)
+	defer stack.Close()
+	ln, err := stack.ListenTCP(8080)
+	if err != nil {
+		t.Fatalf("ListenTCP: %v", err)
+	}
+	defer ln.Close()
+	fs := newFakeSession()
+	if err := stack.Attach(fs, testClientAddr()); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	client := newTCPTestClient(t, fs, testClientAddr(), 34567, testServerIP(), 8080)
+	client.connect()
+	conn, err := acceptWithTimeout(t, ln, time.Second)
+	if err != nil {
+		t.Fatalf("Accept: %v", err)
+	}
+	defer conn.Close()
+
+	// Each chunk stays comfortably under readBufferSize (2048, stack.go)
+	// so this test exercises CR-01's window enforcement in isolation from
+	// WR-04's separate short-read-buffer handling — chunks are sent
+	// in-order, back-to-back, with the application never reading in
+	// between, exactly the "slow reader" scenario CR-01 closes. 33 chunks
+	// of 2000 bytes (66000 total) push the connection just past
+	// defaultReceiveWindow (65535).
+	const chunkSize = 2000
+	const chunkCount = 33
+	var totalSent uint32
+	var lastAck tcpSegment
+	for i := 0; i < chunkCount; i++ {
+		chunk := bytes.Repeat([]byte{byte(i)}, chunkSize)
+		client.sendRaw(tcpSegment{
+			srcPort: client.localPort,
+			dstPort: client.remotePort,
+			seq:     client.sndNext,
+			ack:     client.rcvNext,
+			flags:   flagACK,
+			window:  65535,
+			payload: chunk,
+		})
+		client.sndNext += chunkSize
+		totalSent += chunkSize
+		lastAck = client.recvRaw(time.Second)
+	}
+	if totalSent <= defaultReceiveWindow {
+		t.Fatalf("test setup error: totalSent (%d) must exceed defaultReceiveWindow (%d)", totalSent, defaultReceiveWindow)
+	}
+
+	admitted := lastAck.ack - client.isn - 1
+	if admitted != defaultReceiveWindow {
+		t.Fatalf("cumulative ACK admitted %d bytes across %d chunks (%d bytes sent), want exactly defaultReceiveWindow (%d) — CR-01 requires dropping bytes beyond the advertised window rather than buffering them", admitted, chunkCount, totalSent, defaultReceiveWindow)
+	}
+	if lastAck.window != 0 {
+		t.Fatalf("advertised window after filling the buffer = %d, want 0", lastAck.window)
+	}
+
+	buf := make([]byte, totalSent)
+	if err := conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	n, _ := io.ReadFull(conn, buf)
+	if uint32(n) != defaultReceiveWindow {
+		t.Fatalf("Read delivered %d bytes, want exactly defaultReceiveWindow (%d) — the excess must be dropped, not buffered", n, defaultReceiveWindow)
+	}
+}
+
 // TestTCPNoSACKOptionEmitted: no segment this stack emits, across a mix of
 // handshake/data/retransmit/reorder/zero-window scenarios, carries a TCP
 // option other than MSS on a SYN-ACK — asserted by walking the options
