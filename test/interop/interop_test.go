@@ -317,6 +317,15 @@ func TestInteropScenarios(t *testing.T) {
 			// loss link.
 			assertHTTPPageLoad(t, res)
 
+			// 03-06-PLAN.md Task 2 (NET-01, VRFY-02): a UDP round trip
+			// and the three remaining HTTP subpages, both parameterized
+			// by the same !sc.lossy strictness convention
+			// assertPingRoundTrip already established — see each
+			// function's own doc comment for exactly what is tolerated
+			// on the lossy scenario and why.
+			assertUDPRoundTrip(t, res, !sc.lossy)
+			assertHTTPSubpages(t, res, !sc.lossy)
+
 			assertServerStaysUnprivileged(t, res)
 
 			if sc.largeCert {
@@ -599,6 +608,26 @@ func assertProbe(t *testing.T, res scenarioResult, name string, required bool) {
 // reviewer can see the marker is contractual rather than arbitrary.
 const landingPageH1 = "<h1>govpn tunnelweb</h1>"
 
+// statusActiveMarker is the tunnelweb status page's locked "tunnel: active"
+// indicator text (UI-SPEC §2 "Status"), entrypoint.sh's http_status probe's
+// content marker.
+const statusActiveMarker = "tunnel: active"
+
+// echoProbeMsg is the fixed message entrypoint.sh's http_echo probe POSTs to
+// /echo; echoRoundTripMarker is its expected populated-state rendering
+// (UI-SPEC §4 "Echo-test", pages.go's "You sent: {{.Value}}" template) — kept
+// in sync with entrypoint.sh's own ECHO_PROBE_MSG value.
+const (
+	echoProbeMsg        = "govpn-echo-probe-msg"
+	echoRoundTripMarker = "You sent: " + echoProbeMsg
+)
+
+// headersReceivedFragment is the tunnelweb headers page's locked "{N}
+// headers received" heading, checked as a fragment since N varies by
+// request (UI-SPEC §5 "Headers"), entrypoint.sh's http_headers probe's
+// content marker.
+const headersReceivedFragment = "headers received"
+
 // assertHTTPPageLoad is 03-06-PLAN.md Task 1's verification: a real,
 // unmodified OpenVPN 2.6.14 client's curl request for the tunnelweb landing
 // page, issued through the tunnel by entrypoint.sh's http_landing probe,
@@ -636,6 +665,78 @@ func assertHTTPPageLoad(t *testing.T, res scenarioResult) {
 // httpRequestsRe extracts the http_requests= field test/interop/server's
 // PASS line carries (03-06-PLAN.md Task 1).
 var httpRequestsRe = regexp.MustCompile(`http_requests=(\d+)`)
+
+// udpRxTxRe extracts the udp_rx=/udp_tx= fields test/interop/server's PASS
+// line carries (03-06-PLAN.md Task 2, test/interop/server/main.go's
+// runUDPEcho).
+var udpRxTxRe = regexp.MustCompile(`udp_rx=(\d+) udp_tx=(\d+)`)
+
+// assertUDPRoundTrip is 03-06-PLAN.md Task 2's UDP verification (NET-01 live
+// half): a real client's fixed payload, sent via entrypoint.sh's udp_echo
+// probe, is echoed back by the netstack's UDP demux/runUDPEcho and observed
+// by the server's own udp_rx=/udp_tx= counters. strict follows
+// assertPingRoundTrip's own convention (interop_test.go:479): the clean
+// scenarios require the probe to succeed and both counters greater than
+// zero; the lossy scenario tolerates a failed probe — a bare UDP datagram
+// has no retransmission by design, and the lossy scenario injects 5-10%
+// loss on top of entrypoint.sh's own 3-attempt retry — logging loudly
+// either way so a persistent failure stays visible rather than silently
+// accepted (both choices recorded here per the plan's own instruction).
+func assertUDPRoundTrip(t *testing.T, res scenarioResult, strict bool) {
+	t.Helper()
+
+	if res.composeErr != nil {
+		return
+	}
+
+	assertProbe(t, res, "udp_echo", strict)
+
+	m := udpRxTxRe.FindStringSubmatch(res.composeOut)
+	if !strict {
+		if m == nil {
+			t.Log("server output does not contain a parsable udp_rx=/udp_tx= field on the lossy scenario — tolerated, see the udp_echo probe result logged above")
+			return
+		}
+		t.Logf("server observed udp_rx=%s udp_tx=%s on the lossy scenario (probe result logged above)", m[1], m[2])
+		return
+	}
+
+	if m == nil {
+		t.Fatal("server output does not contain a parsable udp_rx=/udp_tx= field — see log above")
+	}
+	udpRx, err := strconv.Atoi(m[1])
+	if err != nil {
+		t.Fatalf("parse udp_rx=%q: %v", m[1], err)
+	}
+	udpTx, err := strconv.Atoi(m[2])
+	if err != nil {
+		t.Fatalf("parse udp_tx=%q: %v", m[2], err)
+	}
+	if udpRx == 0 || udpTx == 0 {
+		t.Fatalf("server output reports udp_rx=%d udp_tx=%d, want both greater than zero — see log above", udpRx, udpTx)
+	}
+	t.Logf("server observed udp_rx=%d udp_tx=%d", udpRx, udpTx)
+}
+
+// assertHTTPSubpages is 03-06-PLAN.md Task 2's remaining HTTP verification:
+// /status, /echo (a form POST whose request and response bodies both cross
+// the netstack's TCP — the strongest single proof in this run), and
+// /headers, each checked against its UI-SPEC content marker by
+// entrypoint.sh and asserted here via Task 1's assertProbe helper. Required
+// on the clean scenarios (strict=true); tolerated as non-fatal log lines on
+// the lossy scenario, whose own Task 2 acceptance criteria assert only
+// http_landing and udp_echo explicitly for that scenario.
+func assertHTTPSubpages(t *testing.T, res scenarioResult, strict bool) {
+	t.Helper()
+
+	if res.composeErr != nil {
+		return
+	}
+
+	assertProbe(t, res, "http_status", strict)
+	assertProbe(t, res, "http_echo", strict)
+	assertProbe(t, res, "http_headers", strict)
+}
 
 // assertServerStaysUnprivileged is plan 01-02's runtime privilege check,
 // re-asserted in every scenario including the lossy one — the

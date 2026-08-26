@@ -33,6 +33,9 @@ PING_COUNT="${PING_COUNT:-10}"
 # listener (test/interop/server/main.go's -http-port, 03-06-PLAN.md Task 1).
 # The probes below curl it through the tunnel at $TUNNEL_SERVER_IP.
 HTTP_PORT="${HTTP_PORT:-8080}"
+# UDP_PORT is the netstack UDP echo service's port (test/interop/server/
+# main.go's -udp-port, 03-06-PLAN.md Task 2).
+UDP_PORT="${UDP_PORT:-9999}"
 
 CAPTURE_DIR="${CAPTURE_DIR:-/captures}"
 CAPTURE_FILE="${CAPTURE_DIR}/interop.pcap"
@@ -142,6 +145,78 @@ if [ -n "$LANDING_BODY" ] && printf '%s' "$LANDING_BODY" | grep -q '<h1>govpn tu
 else
 	echo "entrypoint: PROBE http_landing result=fail reason=marker_not_found"
 	echo "entrypoint: landing page probe failed (see body above, if any)"
+fi
+
+# udp_echo (Task 2): send a fixed payload to the server's netstack UDP echo
+# service and check the reply carries the server's udpEchoMarker prefix
+# (test/interop/server/main.go's runUDPEcho). UDP has no retransmission by
+# design, and the lossy scenario injects 5-10% loss on top, so this tries up
+# to 3 attempts before giving up — interop_test.go's assertion tolerates a
+# fail here only on the lossy scenario (both choices commented there).
+#
+# nc -u -w <N> blocks for the FULL N seconds even after it has already
+# received a reply — UDP is connectionless, so nc has no EOF signal telling
+# it "no more data is coming" and simply waits out its own idle timer
+# (confirmed empirically against a real UDP echo server before choosing this
+# value). A 1-second timeout keeps each attempt's unavoidable block short —
+# a reply on this local Docker bridge network arrives in single-digit
+# milliseconds, so 1 second is generous headroom, not a tight race — while
+# keeping the probe-driven survival window's settle delay
+# (test/interop/server/main.go's probeSettleDelay) small enough to still
+# finish faster than the old fixed window.
+UDP_PROBE_PAYLOAD="govpn-udp-probe"
+udp_ok=0
+attempt=1
+while [ "$attempt" -le 3 ]; do
+	UDP_REPLY=$(printf '%s' "$UDP_PROBE_PAYLOAD" | nc -u -w 1 "$TUNNEL_SERVER_IP" "$UDP_PORT" 2>/dev/null || true)
+	if printf '%s' "$UDP_REPLY" | grep -qF "govpn-udp-echo:${UDP_PROBE_PAYLOAD}"; then
+		udp_ok=1
+		break
+	fi
+	attempt=$((attempt + 1))
+done
+if [ "$udp_ok" -eq 1 ]; then
+	echo "entrypoint: PROBE udp_echo result=ok"
+	echo "entrypoint: UDP echo probe succeeded"
+else
+	echo "entrypoint: PROBE udp_echo result=fail reason=no_echo_after_3_attempts"
+	echo "entrypoint: UDP echo probe failed after 3 attempts"
+fi
+
+# http_status (Task 2): curl /status and check for the locked "tunnel:
+# active" indicator text (UI-SPEC §2).
+STATUS_BODY=$(curl -s --max-time 10 --retry 2 --retry-all-errors "http://$TUNNEL_SERVER_IP:$HTTP_PORT/status" 2>/dev/null || true)
+if [ -n "$STATUS_BODY" ] && printf '%s' "$STATUS_BODY" | grep -q 'tunnel: active'; then
+	echo "entrypoint: PROBE http_status result=ok"
+	echo "entrypoint: status page probe succeeded"
+else
+	echo "entrypoint: PROBE http_status result=fail reason=marker_not_found"
+	echo "entrypoint: status page probe failed"
+fi
+
+# http_echo (Task 2): POST a fixed message to /echo and check for the
+# populated-state rendering of that exact string (UI-SPEC §4) — the
+# strongest single proof in this run, since a request body and a response
+# body both cross the netstack's TCP in one exchange.
+ECHO_PROBE_MSG="govpn-echo-probe-msg"
+ECHO_BODY=$(curl -s --max-time 10 --retry 2 --retry-all-errors -d "msg=$ECHO_PROBE_MSG" "http://$TUNNEL_SERVER_IP:$HTTP_PORT/echo" 2>/dev/null || true)
+if [ -n "$ECHO_BODY" ] && printf '%s' "$ECHO_BODY" | grep -qF "You sent: $ECHO_PROBE_MSG"; then
+	echo "entrypoint: PROBE http_echo result=ok"
+	echo "entrypoint: echo POST probe succeeded"
+else
+	echo "entrypoint: PROBE http_echo result=fail reason=marker_not_found"
+	echo "entrypoint: echo POST probe failed"
+fi
+
+# http_headers (Task 2): curl /headers and check for the "{N} headers
+# received" heading fragment (UI-SPEC §5).
+HEADERS_BODY=$(curl -s --max-time 10 --retry 2 --retry-all-errors "http://$TUNNEL_SERVER_IP:$HTTP_PORT/headers" 2>/dev/null || true)
+if [ -n "$HEADERS_BODY" ] && printf '%s' "$HEADERS_BODY" | grep -q 'headers received'; then
+	echo "entrypoint: PROBE http_headers result=ok"
+	echo "entrypoint: headers page probe succeeded"
+else
+	echo "entrypoint: PROBE http_headers result=fail reason=marker_not_found"
+	echo "entrypoint: headers page probe failed"
 fi
 
 set +e

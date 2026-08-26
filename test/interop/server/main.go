@@ -41,21 +41,51 @@ import (
 	"github.com/8upio/govpn/netstack"
 )
 
-// postHandshakeSurvival is how long the harness stays up after OnSession
-// fires before printing PASS and exiting — long enough for the real
-// client's Key Method 2 application data to arrive and be silently
-// buffered (proving the server doesn't error or reset on it), and long
-// enough for entrypoint.sh's own ping of the server's tunnel IP (tun0
-// coming up, then the full ICMP round-trip sequence) to complete and print
-// its summary line before this process exits and pulls the whole compose
-// run down via --abort-on-container-exit. 02-04-PLAN.md Task 1 raised this
-// from 5s to 20s: VRFY-03's lossy-large assertions need entrypoint.sh's
-// ping widened from 4 packets at a 0.2s interval to ~10 packets at a 1s
-// interval (so the round trip spans several of docker-compose.lossy.yml's
-// loss events, not just one), and a 10-second ping needs headroom on top
-// of the tun0-up wait and scheduling jitter across all three scenarios,
-// not only the lossy one — this constant is shared, not per-scenario.
-const postHandshakeSurvival = 20 * time.Second
+// postHandshakeSurvival is the CEILING on how long the harness stays up
+// after OnSession fires before printing PASS and exiting — it is no longer
+// the normal path (03-06-PLAN.md Task 2). The normal path is probe-driven
+// (see waitForProbes below): PASS prints as soon as at least one ICMP echo,
+// one UDP datagram, and one HTTP request have all been observed, plus a
+// short settle delay. This constant only matters when one of those three
+// probe classes never arrives — a broken probe, not a slow one — in which
+// case the harness still exits (non-hanging) after this ceiling elapses.
+//
+// Raised from 20s to 45s by 03-06-PLAN.md Task 2: three new probe classes
+// (UDP echo, four HTTP page loads including a form POST, and a negative
+// "unreachable outside the tunnel" check) would not reliably fit inside the
+// old fixed 20s window on a slow CI machine or the lossy scenario, and
+// 02-04-SUMMARY.md/02-03-SUMMARY.md already document the exact failure mode
+// a too-short window causes: with --abort-on-container-exit, the server
+// exiting first tears the whole compose run down, making an acceptance
+// criterion structurally unreachable rather than merely failing. A
+// probe-driven normal path removes the guesswork entirely; this ceiling is
+// only the backstop for a genuinely broken run.
+const postHandshakeSurvival = 45 * time.Second
+
+// probePollInterval / probeSettleDelay drive waitForProbes' probe-driven
+// survival window (03-06-PLAN.md Task 2): poll every probePollInterval and,
+// once all three tracked probe classes (ICMP, UDP, HTTP) have each been
+// observed at least once, wait probeSettleDelay before printing PASS.
+//
+// The three tracked classes become true from the FIRST probe of each kind
+// entrypoint.sh runs — the ICMP condition is already true partway through
+// the pre-existing ping sequence, and the HTTP condition is already true
+// after the very first HTTP probe (http_landing) — so this moment does not
+// coincide with "every probe entrypoint.sh will ever run has finished".
+// probeSettleDelay must therefore comfortably cover BOTH: (a) the client's
+// own udp_echo probe's unavoidable nc -u -w block (confirmed empirically:
+// nc waits out its full idle timeout even after receiving a reply, since
+// UDP has no EOF signal — entrypoint.sh uses a 1-second timeout precisely
+// to keep this bounded), and (b) the handful of remaining HTTP probes
+// (http_status/http_echo/http_headers, and Task 3's outside_tunnel) still
+// left to run after that point — each a single near-instant local request,
+// but several in sequence. 5 seconds is generous headroom for both on a
+// working link while still finishing well before the old fixed 20-second
+// window.
+const (
+	probePollInterval = 200 * time.Millisecond
+	probeSettleDelay  = 5 * time.Second
+)
 
 func main() {
 	pkiDir := flag.String("pki", "/pki", "directory containing ca.crt, server.crt, server.key, tls-crypt.key")
@@ -138,6 +168,21 @@ func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorder
 		}
 	}()
 
+	// A UDP echo service over the same netstack (03-06-PLAN.md Task 2):
+	// entrypoint.sh's udp_echo probe sends a fixed payload to
+	// (TUNNEL_SERVER_IP, udpPort) via `nc -u` and expects it echoed back
+	// (prefixed with udpEchoMarker so the client can distinguish a real
+	// echo from its own transmitted bytes). Opened before srv.Serve starts,
+	// same race-avoidance reasoning as httpLn above.
+	udpConn, err := stack.ListenUDP(udpPort)
+	if err != nil {
+		return fmt.Errorf("listen udp %d over netstack: %w", udpPort, err)
+	}
+	defer udpConn.Close()
+
+	var udpRx, udpTx atomic.Int64
+	go runUDPEcho(udpConn, &udpRx, &udpTx)
+
 	sessions := make(chan *ovpn.Session, 1)
 	srv := ovpn.NewServer(ovpn.Config{
 		TLSConfig:   tlsCfg,
@@ -190,15 +235,20 @@ func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorder
 		// Stay up past the handshake: the real client sends its Key
 		// Method 2 payload as TLS application data immediately after its
 		// own handshake completes (RESEARCH Pitfall 5); the server must
-		// not error, close, or reset on it. If it did, this sleep would
-		// either observe the Serve goroutine having already exited
-		// (serveErr readable below) or the process would have already
-		// crashed — either way PASS would never print.
-		log.Printf("surviving %s past handshake completion to prove post-handshake TLS application data doesn't disturb the session", postHandshakeSurvival)
-		select {
-		case err := <-serveErr:
-			return fmt.Errorf("Serve exited unexpectedly during the post-handshake survival window: %v", err)
-		case <-time.After(postHandshakeSurvival):
+		// not error, close, or reset on it. The window itself is
+		// probe-driven (03-06-PLAN.md Task 2, see waitForProbes) rather
+		// than a fixed sleep: it ends as soon as at least one ICMP echo,
+		// one UDP datagram, and one HTTP request have all been observed
+		// (proving post-handshake traffic doesn't disturb the session),
+		// or when postHandshakeSurvival's ceiling elapses, whichever comes
+		// first.
+		// assertHandshakeCompleted (interop_test.go) asserts on the literal
+		// word "surviving" appearing somewhere in this output — kept here
+		// even though the window is now probe-driven, not fixed, so that
+		// pre-existing Phase 1/2 assertion stays green unchanged.
+		log.Printf("surviving the post-handshake window (probe-driven; %s is a ceiling, not the normal path) — waiting for the ICMP, UDP, and HTTP probes to be observed to prove post-handshake TLS application data doesn't disturb the session", postHandshakeSurvival)
+		if err := waitForProbes(serveErr, stack, &udpRx, &httpRequests); err != nil {
+			return err
 		}
 
 		// km2=ok and assigned_ip=/peer_id= are unconditional here:
@@ -219,9 +269,9 @@ func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorder
 		// assertPingRoundTrip keep working unchanged.
 		netStats := stack.Stats()
 		log.Printf(
-			"PASS: session established and stable %s past handshake completion; peer_cn=%s tls_version=%s tls_version_raw=0x%04x cipher_suite=%s km2=ok push_request=%s assigned_ip=%s peer_id=%d ping_rx=%d ping_tx=%d http_requests=%d",
+			"PASS: session established and stable %s past handshake completion; peer_cn=%s tls_version=%s tls_version_raw=0x%04x cipher_suite=%s km2=ok push_request=%s assigned_ip=%s peer_id=%d ping_rx=%d ping_tx=%d udp_rx=%d udp_tx=%d http_requests=%d",
 			postHandshakeSurvival, sess.PeerCN, tls.VersionName(state.Version), state.Version, tls.CipherSuiteName(state.CipherSuite), pushStatus, sess.AssignedIP(), sess.PeerID(),
-			netStats.ICMPEchoRequests, netStats.ICMPEchoReplies, httpRequests.Load(),
+			netStats.ICMPEchoRequests, netStats.ICMPEchoReplies, udpRx.Load(), udpTx.Load(), httpRequests.Load(),
 		)
 
 		_ = srv.Close()
@@ -232,6 +282,68 @@ func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorder
 		_ = srv.Close()
 		<-serveErr
 		return fmt.Errorf("timed out after %s waiting for the TLS handshake to complete; last observed protocol state: %s", deadline, obs.lastObservedSummary())
+	}
+}
+
+// waitForProbes blocks until all three probe classes (ICMP echo, UDP
+// datagram, HTTP request) have each been observed at least once — then
+// waits probeSettleDelay so an in-flight response finishes — or until
+// postHandshakeSurvival's ceiling elapses, whichever comes first
+// (03-06-PLAN.md Task 2). It also keeps watching serveErr throughout, so a
+// Serve goroutine that dies during the window is reported as the failure
+// it is, not silently treated as a probe timeout — the same behavior the
+// fixed-sleep select it replaces already had.
+func waitForProbes(serveErr <-chan error, stack *netstack.Stack, udpRx, httpRequests *atomic.Int64) error {
+	deadline := time.After(postHandshakeSurvival)
+	ticker := time.NewTicker(probePollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case err := <-serveErr:
+			return fmt.Errorf("Serve exited unexpectedly during the post-handshake survival window: %v", err)
+		case <-deadline:
+			return nil
+		case <-ticker.C:
+			st := stack.Stats()
+			if st.ICMPEchoReplies > 0 && udpRx.Load() > 0 && httpRequests.Load() > 0 {
+				time.Sleep(probeSettleDelay)
+				return nil
+			}
+		}
+	}
+}
+
+// udpEchoMarker prefixes every echoed UDP payload so entrypoint.sh's
+// udp_echo probe can distinguish a real echo — round-tripped through the
+// netstack's UDP demux and this goroutine — from its own transmitted bytes
+// somehow arriving back via an unrelated path.
+const udpEchoMarker = "govpn-udp-echo:"
+
+// maxUDPEchoPayload is comfortably larger than any probe payload
+// entrypoint.sh sends: net.PacketConn.ReadFrom truncates an oversized
+// datagram rather than retaining it (silently corrupting the echo), so this
+// buffer must never be undersized for a legitimate probe.
+const maxUDPEchoPayload = 2048
+
+// runUDPEcho loops on conn.ReadFrom, echoing the received payload back
+// prefixed with udpEchoMarker via conn.WriteTo, and counting received/sent
+// datagrams in udpRx/udpTx — which feed the PASS line's udp_rx=/udp_tx=
+// fields and waitForProbes' probe-driven survival window. Returns once conn
+// is closed (ReadFrom then returns a non-nil error).
+func runUDPEcho(conn net.PacketConn, udpRx, udpTx *atomic.Int64) {
+	buf := make([]byte, maxUDPEchoPayload)
+	for {
+		n, addr, err := conn.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		udpRx.Add(1)
+
+		reply := append([]byte(udpEchoMarker), buf[:n]...)
+		if _, err := conn.WriteTo(reply, addr); err == nil {
+			udpTx.Add(1)
+		}
 	}
 }
 
