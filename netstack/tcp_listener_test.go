@@ -520,3 +520,55 @@ func TestTCPBadAckInSynRcvdResets(t *testing.T) {
 		t.Fatalf("retry SYN drew flags %#x, want a fresh SYN-ACK", synack2.flags)
 	}
 }
+
+// TestTCPLiveConnCapPerSession (CR-02): one session that completes
+// maxLiveConnsPerSession handshakes and never closes any of them — each
+// completion releasing its own half-open slot the instant it succeeds, so
+// the half-open budget alone never blocks it — hits a separate cap on the
+// total number of live (non-CLOSED) connections it may hold at once. A
+// further SYN is silently dropped and the LiveConnCapHits counter
+// increments, exactly mirroring HalfOpenCapHits' own shape for the
+// half-open budget.
+func TestTCPLiveConnCapPerSession(t *testing.T) {
+	clock := newFakeClock(time.Unix(0, 0))
+	stack := newTestStack(t, WithClock(clock))
+	defer stack.Close()
+	ln, err := stack.ListenTCP(8080)
+	if err != nil {
+		t.Fatalf("ListenTCP: %v", err)
+	}
+	defer ln.Close()
+	fs := newFakeSession()
+	if err := stack.Attach(fs, testClientAddr()); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	before := stack.TCPStats().LiveConnCapHits
+
+	// Left open deliberately, never Close'd: stack.Close() (deferred
+	// above) tears every attachment down directly (onAttachmentDetached,
+	// no wire I/O) rather than this test driving 64 individual FIN
+	// sequences through fs.outbound's small fixed buffer, which nothing
+	// here drains.
+	for i := 0; i < maxLiveConnsPerSession; i++ {
+		client := newTCPTestClient(t, fs, testClientAddr(), uint16(25000+i), testServerIP(), 8080)
+		client.connect()
+		if _, err := acceptWithTimeout(t, ln, time.Second); err != nil {
+			t.Fatalf("handshake #%d did not complete: %v", i, err)
+		}
+	}
+
+	// Every prior handshake already completed and released its half-open
+	// slot (tcp_state.go's handleSegment calls releaseHalfOpen the moment
+	// SYN_RCVD resolves) — the half-open budget has room, but the
+	// separate live-connection budget does not.
+	extra := newTCPTestClient(t, fs, testClientAddr(), uint16(25000+maxLiveConnsPerSession), testServerIP(), 8080)
+	extra.sendRaw(tcpSegment{srcPort: extra.localPort, dstPort: extra.remotePort, seq: extra.isn, flags: flagSYN, window: 65535})
+	if _, ok := extra.tryRecvRaw(100 * time.Millisecond); ok {
+		t.Fatal("SYN beyond maxLiveConnsPerSession drew a response, want it silently dropped")
+	}
+
+	if got := stack.TCPStats().LiveConnCapHits; got < before+1 {
+		t.Fatalf("LiveConnCapHits = %d, want at least %d", got, before+1)
+	}
+}

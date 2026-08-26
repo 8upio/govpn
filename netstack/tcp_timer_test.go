@@ -216,3 +216,97 @@ func TestTCPZeroWindowDoesNotSpin(t *testing.T) {
 		t.Fatalf("after window reopened, received %q, want %q", got, payload[1:])
 	}
 }
+
+// TestTCPZeroWindowPersistGivesUpEventually (CR-02): a peer that
+// acknowledges each zero-window persist probe one byte at a time — never
+// letting sentBytes accumulate past zero, so the ordinary
+// sentBytes-greater-than-zero retransmit case (with its own
+// maxRetransmits accounting) never gets a chance to match — but never
+// reopens its window, would otherwise keep re-triggering the zero-window
+// persist branch in onRTOFired forever: that branch is not itself gated by
+// maxRetransmits. CR-02's own persistProbeCount closes exactly this gap.
+// After maxPersistProbes such probes the connection is reset (RST emitted,
+// timerLoop exits, Read fails) instead of persisting indefinitely.
+func TestTCPZeroWindowPersistGivesUpEventually(t *testing.T) {
+	clock := newFakeClock(time.Unix(0, 0))
+	stack := newTestStack(t, WithClock(clock))
+	defer stack.Close()
+	ln, err := stack.ListenTCP(8080)
+	if err != nil {
+		t.Fatalf("ListenTCP: %v", err)
+	}
+	defer ln.Close()
+	fs := newFakeSession()
+	if err := stack.Attach(fs, testClientAddr()); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	client := newTCPTestClient(t, fs, testClientAddr(), 34567, testServerIP(), 8080)
+
+	// Handshake with a zero window from the very start.
+	client.sendRaw(tcpSegment{srcPort: client.localPort, dstPort: client.remotePort, seq: client.isn, flags: flagSYN, window: 0})
+	synack := client.recvRaw(time.Second)
+	client.serverISN = synack.seq
+	client.rcvNext = synack.seq + 1
+	client.sndNext = client.isn + 1
+	client.sendRaw(tcpSegment{srcPort: client.localPort, dstPort: client.remotePort, seq: client.sndNext, ack: client.rcvNext, flags: flagACK, window: 0})
+
+	c, err := acceptWithTimeout(t, ln, time.Second)
+	if err != nil {
+		t.Fatalf("Accept: %v", err)
+	}
+	conn := c.(*tcpConn)
+
+	// A payload with a few more bytes than maxPersistProbes, so the send
+	// buffer never fully drains before the connection is expected to give
+	// up (an empty send buffer would stop the persist branch from
+	// matching at all, for an unrelated reason — "nothing left to
+	// persist," not "gave up").
+	payload := make([]byte, maxPersistProbes+5)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	go conn.Write(payload)
+	if _, ok := client.tryRecvRaw(100 * time.Millisecond); ok {
+		t.Fatal("server sent data despite a zero-window peer")
+	}
+
+	for i := 0; i < maxPersistProbes; i++ {
+		clock.Advance(maxRTO)
+		probe, ok := client.tryRecvRaw(time.Second)
+		if !ok {
+			t.Fatalf("probe #%d: no segment received (window never reopened)", i+1)
+		}
+		if len(probe.payload) != 1 {
+			t.Fatalf("probe #%d payload = %d bytes, want exactly 1", i+1, len(probe.payload))
+		}
+		// ACK the probed byte while keeping the window at zero: the
+		// server's sentBytes drops back to 0, so the NEXT RTO tick
+		// matches the zero-window persist case again rather than the
+		// ordinary sentBytes>0 retransmit case (which would otherwise
+		// give up via maxRetransmits, a different and already-bounded
+		// path CR-02 does not need to touch).
+		client.sendRaw(tcpSegment{
+			srcPort: client.localPort, dstPort: client.remotePort,
+			seq: client.sndNext, ack: probe.seq + uint32(len(probe.payload)), flags: flagACK, window: 0,
+		})
+		time.Sleep(20 * time.Millisecond) // let the async read-loop deliver the ACK before advancing again
+	}
+
+	// One more tick past maxPersistProbes: give up, RST, rather than yet
+	// another probe.
+	clock.Advance(maxRTO)
+	rst := client.recvRaw(time.Second)
+	if rst.flags&flagRST == 0 {
+		t.Fatalf("final segment flags = %#x, want RST set", rst.flags)
+	}
+
+	select {
+	case <-conn.timerDone:
+	case <-time.After(time.Second):
+		t.Fatal("timer goroutine did not exit (timerDone never closed) after giving up on persist probes")
+	}
+
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("Read after giving up on persist probes succeeded, want an error")
+	}
+}

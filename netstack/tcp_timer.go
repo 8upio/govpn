@@ -50,6 +50,31 @@ const (
 	// authenticated client cannot exhaust another's budget.
 	maxHalfOpenPerSession = 8
 
+	// maxLiveConnsPerSession bounds the number of non-CLOSED (SYN_RCVD
+	// through TIME_WAIT) TCP connections one attached session may hold
+	// open at once (CR-02) — independent of, and in addition to,
+	// maxHalfOpenPerSession: that budget is released the instant a
+	// handshake completes (tcp_state.go's handleSegment), so without this
+	// separate cap a client could complete handshakes as fast as the
+	// half-open budget allows and simply never close them, accumulating
+	// an unbounded number of live tcpConns (each backed by its own
+	// timerLoop goroutine) over time. Mirrors maxHalfOpenPerSession's own
+	// per-attachment-IP scoping style, sized generously above the
+	// half-open cap since legitimate long-lived connections (e.g.
+	// keep-alive HTTP) are expected to accumulate up to this ceiling in
+	// normal operation.
+	maxLiveConnsPerSession = 64
+
+	// maxPersistProbes bounds RFC 9293 §3.8's zero-window persist
+	// retries (CR-02): past this many consecutive probes with the peer's
+	// window still reported closed, the connection is reset rather than
+	// probed forever — RFC 9293 does not itself mandate indefinite
+	// persistence, and a permanently zero window is indistinguishable
+	// from an unresponsive or hostile peer holding the connection (and
+	// its timerLoop goroutine) open forever. Reset to zero whenever the
+	// peer's window reopens (tcp_state.go's handleAckLocked).
+	maxPersistProbes = 20
+
 	// maxReorderSegments bounds the per-connection out-of-order buffer
 	// (D-06, T-03-15) — excess out-of-order segments are dropped and
 	// re-driven by the peer's own retransmission.
@@ -289,7 +314,15 @@ func (c *tcpConn) onRTOFired() {
 	case c.sndWnd == 0 && uint32(len(c.outBuf)) > c.sentBytes:
 		// Zero-window persist (RFC 9293 §3.8): exactly one probe byte
 		// per tick, never a burst — a spin here would saturate the
-		// tunnel with a client that is merely slow, not gone.
+		// tunnel with a client that is merely slow, not gone. Bounded by
+		// maxPersistProbes (CR-02) so a peer that never reopens its
+		// window cannot hold this connection (and its timerLoop
+		// goroutine) open indefinitely.
+		c.persistProbeCount++
+		if c.persistProbeCount > maxPersistProbes {
+			giveUp = true
+			break
+		}
 		c.sendPendingLocked(&toSend, true)
 		c.rtoTimer.Reset(c.rto)
 

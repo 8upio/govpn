@@ -127,11 +127,12 @@ type tcpConn struct {
 	finAcked bool
 	finSeq   uint32
 
-	rtoTimer        Timer
-	timerArmed      bool
-	retransmitCount int
-	rto             time.Duration
-	inTimeWait      bool
+	rtoTimer          Timer
+	timerArmed        bool
+	retransmitCount   int
+	persistProbeCount int // CR-02: bounds RFC 9293 §3.8 zero-window persist retries
+	rto               time.Duration
+	inTimeWait        bool
 
 	stopTimers       chan struct{}
 	stopTimersClosed bool
@@ -139,6 +140,14 @@ type tcpConn struct {
 
 	halfOpenCounted bool
 	halfOpenIP      netip.Addr
+
+	// liveCounted mirrors halfOpenCounted's own decrement-exactly-once
+	// discipline, but for CR-02's separate maxLiveConnsPerSession budget:
+	// set once in handleSYN (tcp_listener.go) and released only by
+	// removeConn (releaseLiveConn), never by releaseHalfOpen — a
+	// completed handshake must not free this budget the way it frees the
+	// half-open one.
+	liveCounted bool
 
 	err error
 

@@ -28,6 +28,7 @@ import (
 type tcpDemuxStats struct {
 	backlogOverflow atomic.Uint64
 	halfOpenCapHits atomic.Uint64
+	liveConnCapHits atomic.Uint64
 	reorderDropped  atomic.Uint64
 	rstsSent        atomic.Uint64
 	rstsReceived    atomic.Uint64
@@ -38,6 +39,7 @@ type tcpDemuxStats struct {
 type TCPStats struct {
 	BacklogOverflow uint64
 	HalfOpenCapHits uint64
+	LiveConnCapHits uint64
 	ReorderDropped  uint64
 	RSTsSent        uint64
 	RSTsReceived    uint64
@@ -56,6 +58,7 @@ func (s *Stack) TCPStats() TCPStats {
 	return TCPStats{
 		BacklogOverflow: d.stats.backlogOverflow.Load(),
 		HalfOpenCapHits: d.stats.halfOpenCapHits.Load(),
+		LiveConnCapHits: d.stats.liveConnCapHits.Load(),
 		ReorderDropped:  d.stats.reorderDropped.Load(),
 		RSTsSent:        d.stats.rstsSent.Load(),
 		RSTsReceived:    d.stats.rstsReceived.Load(),
@@ -74,6 +77,7 @@ type tcpDemux struct {
 	listeners map[uint16]*tcpListener
 	conns     map[fourTuple]*tcpConn
 	halfOpen  map[netip.Addr]int // per-session (by remote/attachment IP) half-open count, T-03-13
+	liveConns map[netip.Addr]int // per-session live (non-CLOSED) connection count, CR-02
 
 	stats tcpDemuxStats
 }
@@ -86,6 +90,7 @@ func newTCPDemux(s *Stack) *tcpDemux {
 		listeners: make(map[uint16]*tcpListener),
 		conns:     make(map[fourTuple]*tcpConn),
 		halfOpen:  make(map[netip.Addr]int),
+		liveConns: make(map[netip.Addr]int),
 	}
 }
 
@@ -162,6 +167,7 @@ func (d *tcpDemux) removeConn(c *tcpConn) {
 	}
 	d.mu.Unlock()
 	d.releaseHalfOpen(c)
+	d.releaseLiveConn(c)
 }
 
 // releaseHalfOpen decrements c's session's half-open count exactly once,
@@ -185,6 +191,33 @@ func (d *tcpDemux) releaseHalfOpen(c *tcpConn) {
 			delete(d.halfOpen, ip)
 		} else {
 			d.halfOpen[ip] = n - 1
+		}
+	}
+	d.mu.Unlock()
+}
+
+// releaseLiveConn decrements c's session's live-connection count exactly
+// once (CR-02), the first time it is called for c — guarded by
+// c.liveCounted mirroring releaseHalfOpen's own idempotency discipline.
+// Unlike releaseHalfOpen, this is only ever called from removeConn: a
+// completed handshake does not free this budget, only the connection's
+// final teardown does.
+func (d *tcpDemux) releaseLiveConn(c *tcpConn) {
+	c.mu.Lock()
+	counted := c.liveCounted
+	c.liveCounted = false
+	ip := c.halfOpenIP
+	c.mu.Unlock()
+	if !counted {
+		return
+	}
+
+	d.mu.Lock()
+	if n, ok := d.liveConns[ip]; ok {
+		if n <= 1 {
+			delete(d.liveConns, ip)
+		} else {
+			d.liveConns[ip] = n - 1
 		}
 	}
 	d.mu.Unlock()
@@ -268,7 +301,19 @@ func (l *tcpListener) handleSYN(a *attachment, remoteIP netip.Addr, seg tcpSegme
 		d.stats.halfOpenCapHits.Add(1)
 		return
 	}
+	// CR-02: a session that completes handshakes as fast as the
+	// half-open budget allows (refilled the instant each one succeeds,
+	// tcp_state.go's handleSegment) and never closes them would otherwise
+	// accumulate an unbounded number of live connections — check this
+	// cap alongside the half-open one, under the same lock, before either
+	// counter is incremented.
+	if d.liveConns[remoteIP] >= maxLiveConnsPerSession {
+		d.mu.Unlock()
+		d.stats.liveConnCapHits.Add(1)
+		return
+	}
 	d.halfOpen[remoteIP]++
+	d.liveConns[remoteIP]++
 	d.mu.Unlock()
 
 	mss := uint16(defaultMSSWhenAbsent)
@@ -284,6 +329,7 @@ func (l *tcpListener) handleSYN(a *attachment, remoteIP netip.Addr, seg tcpSegme
 	c := newTCPConn(d, l, a, key, isn, seg.seq, seg.window, mss)
 	c.halfOpenCounted = true
 	c.halfOpenIP = remoteIP
+	c.liveCounted = true
 
 	d.mu.Lock()
 	d.conns[key] = c

@@ -225,6 +225,13 @@ func (c *tcpConn) handleAckLocked(seg tcpSegment, toSend *[]tcpSegment) {
 		}
 	}
 
+	if c.sndWnd == 0 && seg.window > 0 {
+		// CR-02: the peer's window reopened — a fresh zero-window
+		// episode (if the peer closes it again later) should get its
+		// own maxPersistProbes budget, not inherit an already-exhausted
+		// one.
+		c.persistProbeCount = 0
+	}
 	c.sndWnd = uint32(seg.window)
 	c.sendPendingLocked(toSend, false)
 }
