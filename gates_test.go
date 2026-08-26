@@ -316,3 +316,110 @@ func TestPhase2GoldenCorpusIsTestOnly(t *testing.T) {
 		t.Fatalf("walk repository for *.key files: %v", err)
 	}
 }
+
+// Phase 3's own standing prohibitions (03-01-PLAN.md Task 3), turned into
+// assertions matching gates_test.go's own AST-based discipline (file
+// header, lines 1-13): a raw text search would flag this project's own
+// planning documents and doc comments, which name every forbidden
+// construction by design when explaining why it is forbidden.
+
+// corePackage / coreInternalPrefix / netstackPackagePrefix are the import
+// paths the Phase 3 gates below check the dependency-direction boundary
+// against.
+const (
+	corePackage           = "github.com/8upio/govpn"
+	coreInternalPrefix    = "github.com/8upio/govpn/internal/"
+	netstackPackagePrefix = "github.com/8upio/govpn/netstack"
+)
+
+// isUnderDir reports whether the walked path lies under dir (a
+// slash-terminated, repo-root-relative prefix such as "netstack/") on any
+// OS, normalizing path separators first.
+func isUnderDir(path, dir string) bool {
+	return strings.HasPrefix(filepath.ToSlash(path), dir)
+}
+
+// TestPhase3NetstackDoesNotImportCoreLibrary asserts D-01/D-18: no file
+// under netstack/ imports the core ovpn module or anything under its
+// internal/ tree. The netstack proves the Session boundary is clean by
+// consuming a locally-declared structural interface (D-01/D-18), and
+// RESEARCH.md Pitfall 4: TCP sequence numbers must never be confused with
+// the control-channel reliability, tls-crypt, or data-channel packet-ID
+// spaces those internal packages own.
+func TestPhase3NetstackDoesNotImportCoreLibrary(t *testing.T) {
+	walkGoFiles(t, func(path string, file *ast.File, fset *token.FileSet) {
+		if !isUnderDir(path, "netstack/") {
+			return
+		}
+		for _, imp := range file.Imports {
+			importPath := strings.Trim(imp.Path.Value, `"`)
+			if importPath == corePackage || strings.HasPrefix(importPath, coreInternalPrefix) {
+				pos := fset.Position(imp.Pos())
+				t.Errorf(
+					"%s:%d: imports %q — netstack must never import the core ovpn module or its internal/ packages (D-01/D-18: the netstack proves the Session boundary is clean by consuming a locally-declared structural interface; RESEARCH.md Pitfall 4: TCP sequence numbers must never be confused with the control-channel reliability, tls-crypt, or data-channel packet-ID spaces those internal packages own)",
+					pos.Filename, pos.Line, importPath,
+				)
+			}
+		}
+	})
+}
+
+// TestPhase3CoreDoesNotImportNetstack asserts the dependency arrow points
+// one way only: an embedder (examples/, test/) imports both ovpn and
+// netstack, but the core library and its internal packages import
+// neither (D-01).
+func TestPhase3CoreDoesNotImportNetstack(t *testing.T) {
+	embedderDirs := []string{"netstack/", "examples/", "test/"}
+
+	walkGoFiles(t, func(path string, file *ast.File, fset *token.FileSet) {
+		for _, dir := range embedderDirs {
+			if isUnderDir(path, dir) {
+				return
+			}
+		}
+		for _, imp := range file.Imports {
+			importPath := strings.Trim(imp.Path.Value, `"`)
+			if importPath == netstackPackagePrefix || strings.HasPrefix(importPath, netstackPackagePrefix+"/") {
+				pos := fset.Position(imp.Pos())
+				t.Errorf(
+					"%s:%d: imports %q — the dependency arrow points one way only: an embedder imports both ovpn and netstack, but the core library and its internal packages import neither (D-01)",
+					pos.Filename, pos.Line, importPath,
+				)
+			}
+		}
+	})
+}
+
+// TestPhase3StdlibOnlyImports asserts every import in every walked .go
+// file is either a standard-library path or is prefixed
+// github.com/8upio/govpn — no gVisor netstack, no TUN/TAP library, no
+// third-party packet library anywhere in the module (CLAUDE.md's "What
+// NOT to Use" table, D-16). "Standard-library path" is detected
+// structurally: the first path segment of a stdlib import never contains
+// a dot, while every module path does — this single check subsumes the
+// whole "What NOT to Use" list and keeps working for names nobody has
+// thought of yet. test/interop/'s own tooling is walked by this too and
+// is currently stdlib-only; if a future plan adopts a packet library for
+// test assertions it must live in a separate module with its own go.mod
+// (CLAUDE.md's own stated policy), not be excepted here.
+func TestPhase3StdlibOnlyImports(t *testing.T) {
+	walkGoFiles(t, func(path string, file *ast.File, fset *token.FileSet) {
+		for _, imp := range file.Imports {
+			importPath := strings.Trim(imp.Path.Value, `"`)
+			if importPath == corePackage || strings.HasPrefix(importPath, corePackage+"/") {
+				continue
+			}
+			firstSegment := importPath
+			if idx := strings.Index(importPath, "/"); idx >= 0 {
+				firstSegment = importPath[:idx]
+			}
+			if strings.Contains(firstSegment, ".") {
+				pos := fset.Position(imp.Pos())
+				t.Errorf(
+					"%s:%d: imports %q — a third-party module path (its first path segment %q contains a dot); this project is stdlib-only outside its own module (CLAUDE.md's \"What NOT to Use\" table: no gVisor, no TUN/TAP library, no external packet-decoding library, no golang.org/x/*)",
+					pos.Filename, pos.Line, importPath, firstSegment,
+				)
+			}
+		}
+	})
+}
