@@ -40,8 +40,8 @@ Requirements for initial release. Each maps to roadmap phases.
 
 - [ ] **NET-01**: `ListenUDP(port)` returns a `net.PacketConn` that transparently demuxes tunnel UDP traffic (parse/build IP+UDP headers), usable by unmodified socket-based code
 - [ ] **NET-02**: Minimal server-side TCP: `ListenTCP(port)` returns a `net.Listener` sufficient to serve HTTP to tunnel clients (stdlib-only, no gVisor)
-- [ ] **NET-03**: Built-in ICMP echo responder: tunnel clients can ping the server tunnel IP
-- [ ] **NET-04**: Sessions attach/detach dynamically with IP→session routing; UDP listeners can be opened on arbitrary ports at runtime (RTP-style dynamic ports)
+- [x] **NET-03**: Built-in ICMP echo responder: tunnel clients can ping the server tunnel IP
+- [x] **NET-04**: Sessions attach/detach dynamically with IP→session routing; UDP listeners can be opened on arbitrary ports at runtime (RTP-style dynamic ports)
 
 ### Example
 
@@ -109,8 +109,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 | VRFY-03 | Phase 2 | Complete |
 | NET-01 | Phase 3 | Pending |
 | NET-02 | Phase 3 | Pending |
-| NET-03 | Phase 3 | Pending |
-| NET-04 | Phase 3 | Pending |
+| NET-03 | Phase 3 | Complete |
+| NET-04 | Phase 3 | Complete |
 | XMPL-01 | Phase 3 | Pending |
 | VRFY-02 | Phase 3 | Pending |
 | SESS-04 | Phase 4 | Pending |
