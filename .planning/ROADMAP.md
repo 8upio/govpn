@@ -100,8 +100,30 @@ Plans:
   3. `ListenTCP(port)` returns a `net.Listener` that stdlib `http.Serve` accepts on, and the example web server — one command to run — serves an interactive landing page plus 3–5 subpages that load in a browser inside the client container and are unreachable from outside the tunnel
   4. One automated harness run verifies ICMP, a UDP round-trip, and an HTTP page load through the tunnel from the real client, with no `/dev/net/tun` and no `CAP_NET_ADMIN` in the server container
 
-**Plans**: TBD
+**Plans**: 6 plans
 **UI hint**: yes
+
+Plans:
+**Wave 1**
+
+- [ ] 03-01-PLAN.md — Tracer: `netstack` package (Stack, Attach/Detach, IPv4, ICMP echo, injected Clock, `net.Error` deadlines) — a real client's ping answered by the library, harness responder relocated, import-direction gates
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [ ] 03-02-PLAN.md — `ListenUDP` as a genuine `net.PacketConn`: port demux, arbitrary runtime ports, multi-session routing, real deadlines (NET-01, NET-04)
+- [ ] 03-03-PLAN.md — Minimal server-side TCP: segment codec, passive-open state machine, fixed-RTO retransmission, bounded reorder buffer, RST rules, backlog and half-open caps (NET-02)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [ ] 03-04-PLAN.md — `net/http` conformance: real deadlines, `CloseWrite` half-close, stdlib `http.Serve` round-trip over the netstack listener (NET-02)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
+- [ ] 03-05-PLAN.md — `examples/tunnelweb`: one command, landing page plus 4 subpages per the UI-SPEC contract, reachable only through the tunnel (XMPL-01)
+
+**Wave 5** *(blocked on Wave 4 completion)*
+
+- [ ] 03-06-PLAN.md — Interop harness: one run verifying ICMP, UDP round-trip, and HTTP page loads from the real client, with no TUN device and no CAP_NET_ADMIN (VRFY-02)
 
 ### Phase 4: Durable Sessions
 
@@ -126,7 +148,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 |-------|----------------|--------|-----------|
 | 1. Handshake | 4/4 | Complete    | 2026-08-24 |
 | 2. Tunnel Up | 4/4 | Complete    | 2026-08-25 |
-| 3. In-Process Termination | 0/TBD | Not started | - |
+| 3. In-Process Termination | 0/6 | Planned | - |
 | 4. Durable Sessions | 0/TBD | Not started | - |
 
 ## Requirement Coverage
