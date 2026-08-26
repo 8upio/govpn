@@ -31,11 +31,11 @@ import (
 	"net"
 	"os"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/8upio/govpn"
 	"github.com/8upio/govpn/internal/wire"
+	"github.com/8upio/govpn/netstack"
 )
 
 // postHandshakeSurvival is how long the harness stays up after OnSession
@@ -98,6 +98,18 @@ func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorder
 		return fmt.Errorf("parse tunnel network: %w", err)
 	}
 
+	// stack is this harness's netstack.Stack, terminating the same
+	// server tunnel IP ippool.go reserves (base+1, the first host
+	// address) and entrypoint.sh pings as TUNNEL_SERVER_IP. Built once,
+	// before Serve starts, so it's ready the instant the first session's
+	// OnSession fires. Phase 3's NET-03: the ICMP echo responder now
+	// lives in netstack, not in this harness.
+	stack, err := netstack.New(firstHostIP(tunnelNetwork))
+	if err != nil {
+		return fmt.Errorf("create netstack: %w", err)
+	}
+	defer stack.Close()
+
 	sessions := make(chan *ovpn.Session, 1)
 	srv := ovpn.NewServer(ovpn.Config{
 		TLSConfig:   tlsCfg,
@@ -105,6 +117,13 @@ func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorder
 		Network:     tunnelNetwork,
 		Cipher:      "AES-256-GCM",
 		OnSession: func(sess *ovpn.Session) {
+			// D-02: the embedder attaches; nothing in ovpn.Config knows
+			// the netstack exists. AssignedIP() is guaranteed non-nil
+			// here (D-08: OnSession only fires after the PUSH_REQUEST/
+			// PUSH_REPLY exchange has already completed).
+			if err := stack.Attach(sess, sess.AssignedIP()); err != nil {
+				log.Printf("warning: netstack attach failed for %s: %v", sess.AssignedIP(), err)
+			}
 			select {
 			case sessions <- sess:
 			default:
@@ -140,14 +159,6 @@ func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorder
 			log.Printf("warning: failed to write Key Method 2 export: %v", err)
 		}
 
-		// Start the harness's own ICMP echo responder as soon as the
-		// Session is usable (D-08 guarantees it is, the moment OnSession
-		// fires): this is harness code, not library code — the real
-		// in-process ICMP responder is Phase 3's NET-03. It proves
-		// Session.Read/Write are a genuine encrypted round trip against a
-		// real client, not merely that OnSession fired.
-		pingRx, pingTx := startICMPResponder(sess)
-
 		// Stay up past the handshake: the real client sends its Key
 		// Method 2 payload as TLS application data immediately after its
 		// own handshake completes (RESEARCH Pitfall 5); the server must
@@ -174,10 +185,15 @@ func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorder
 		if sess.PushRequestSeen() {
 			pushStatus = "seen"
 		}
+		// netStats sources the PASS line's ping_rx=/ping_tx= fields from
+		// the netstack's own ICMP counters (NET-03) rather than
+		// harness-local counters — interop_test.go's pingRxTxRe/
+		// assertPingRoundTrip keep working unchanged.
+		netStats := stack.Stats()
 		log.Printf(
 			"PASS: session established and stable %s past handshake completion; peer_cn=%s tls_version=%s tls_version_raw=0x%04x cipher_suite=%s km2=ok push_request=%s assigned_ip=%s peer_id=%d ping_rx=%d ping_tx=%d",
 			postHandshakeSurvival, sess.PeerCN, tls.VersionName(state.Version), state.Version, tls.CipherSuiteName(state.CipherSuite), pushStatus, sess.AssignedIP(), sess.PeerID(),
-			atomic.LoadInt64(pingRx), atomic.LoadInt64(pingTx),
+			netStats.ICMPEchoRequests, netStats.ICMPEchoReplies,
 		)
 
 		_ = srv.Close()
@@ -382,93 +398,18 @@ func (l *lossyPacketConn) Close() error {
 	return l.PacketConn.Close()
 }
 
-// startICMPResponder starts a background goroutine that reads raw,
-// decrypted IP packets from sess and, for every ICMP echo request it
-// recognizes, writes back a well-formed echo reply through the SAME
-// Session.Write path a real embedder would use — proving Session.Read/
-// Write are a genuine encrypted round trip against a real OpenVPN client,
-// not merely that Config.OnSession fired. This is harness code, not
-// library code: the real in-process ICMP responder is Phase 3's NET-03.
-// The goroutine exits when sess.Read returns an error (the session closed,
-// via run's own srv.Close()). The returned counters are read with
-// sync/atomic — startICMPResponder's own goroutine is the only writer.
-func startICMPResponder(sess *ovpn.Session) (pingRx, pingTx *int64) {
-	pingRx = new(int64)
-	pingTx = new(int64)
-	go func() {
-		buf := make([]byte, 65536)
-		for {
-			n, err := sess.Read(buf)
-			if err != nil {
-				return
-			}
-			reply, ok := icmpEchoReply(buf[:n])
-			if !ok {
-				continue
-			}
-			atomic.AddInt64(pingRx, 1)
-			if _, err := sess.Write(reply); err != nil {
-				return
-			}
-			atomic.AddInt64(pingTx, 1)
-		}
-	}()
-	return pingRx, pingTx
-}
-
-// icmpEchoReply builds an ICMPv4 echo reply for pkt, an IPv4 packet as
-// delivered by Session.Read, if and only if pkt is a well-formed IPv4
-// packet carrying an ICMP (protocol 1) echo request (type 8). It swaps the
-// IPv4 source/destination addresses, sets the ICMP type to 0 (echo reply,
-// code unchanged), and recomputes both the IPv4 header checksum and the
-// ICMP checksum (RFC 791 §3.1, RFC 792) — everything else (identifier,
-// sequence number, payload) is left untouched, matching a real ICMP
-// echo responder. Malformed or non-ICMP-echo-request packets are ignored
-// (ok=false): this is harness code, not a production IP stack, so it does
-// not need to handle IPv4 options, fragmentation, or any other IP
-// protocol.
-func icmpEchoReply(pkt []byte) (reply []byte, ok bool) {
-	const (
-		minIPv4HeaderLen = 20
-		minICMPHeaderLen = 8
-		protocolICMP     = 1
-		icmpTypeEchoReq  = 8
-		icmpTypeEchoRepl = 0
-	)
-
-	if len(pkt) < minIPv4HeaderLen {
-		return nil, false
-	}
-	version := pkt[0] >> 4
-	ihl := int(pkt[0]&0x0F) * 4
-	if version != 4 || ihl < minIPv4HeaderLen || len(pkt) < ihl+minICMPHeaderLen {
-		return nil, false
-	}
-	if pkt[9] != protocolICMP {
-		return nil, false
-	}
-	icmp := pkt[ihl:]
-	if icmp[0] != icmpTypeEchoReq {
-		return nil, false
-	}
-
-	out := append([]byte(nil), pkt...)
-
-	var src, dst [4]byte
-	copy(src[:], out[12:16])
-	copy(dst[:], out[16:20])
-	copy(out[12:16], dst[:])
-	copy(out[16:20], src[:])
-
-	out[10], out[11] = 0, 0
-	binary.BigEndian.PutUint16(out[10:12], internetChecksum(out[:ihl]))
-
-	outICMP := out[ihl:]
-	outICMP[0] = icmpTypeEchoRepl
-	outICMP[2], outICMP[3] = 0, 0
-	binary.BigEndian.PutUint16(outICMP[2:4], internetChecksum(outICMP))
-
-	return out, true
+// firstHostIP returns network's first host address (base+1) — the same
+// value ippool.go's own serverIP reserves for the library's server-side
+// tunnel address and entrypoint.sh pings as TUNNEL_SERVER_IP. Computed
+// generically over the network's flattened uint32 host-address space
+// (mirroring ippool.go's own arithmetic, ippool.go:99-104) rather than
+// assuming a specific prefix length.
+func firstHostIP(network *net.IPNet) net.IP {
+	ip4 := network.IP.To4()
+	base := binary.BigEndian.Uint32(ip4)
+	ip := make(net.IP, net.IPv4len)
+	binary.BigEndian.PutUint32(ip, base+1)
+	return ip
 }
 
 // dataChannelKeyExportPath/keyMethod2ExportPath are fixed in-container
@@ -555,24 +496,4 @@ func writeKeyMethod2Export(sess *ovpn.Session) error {
 		return err
 	}
 	return os.WriteFile(keyMethod2ExportPath, append(data, '\n'), 0o600)
-}
-
-// internetChecksum computes the RFC 1071 Internet checksum over b: the
-// one's complement of the one's-complement sum of b's 16-bit big-endian
-// words, with a trailing odd byte treated as the high byte of a final
-// zero-padded word. Callers must zero the checksum field in b before
-// calling (as icmpEchoReply does).
-func internetChecksum(b []byte) uint16 {
-	var sum uint32
-	n := len(b)
-	for i := 0; i+1 < n; i += 2 {
-		sum += uint32(b[i])<<8 | uint32(b[i+1])
-	}
-	if n%2 == 1 {
-		sum += uint32(b[n-1]) << 8
-	}
-	for sum>>16 != 0 {
-		sum = (sum & 0xFFFF) + (sum >> 16)
-	}
-	return ^uint16(sum)
 }
