@@ -87,6 +87,22 @@ const (
 	probeSettleDelay  = 5 * time.Second
 )
 
+// newHardenedHTTPServer builds the *http.Server this harness serves the
+// tunnelweb site through, with WR-02's timeouts set — see
+// examples/tunnelweb/main.go's own copy of this function for the full
+// rationale (net/http never arms a read deadline at all unless one of
+// these fields is set). Extracted so main_test.go can assert on the
+// timeout values directly.
+func newHardenedHTTPServer(handler http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+}
+
 func main() {
 	pkiDir := flag.String("pki", "/pki", "directory containing ca.crt, server.crt, server.key, tls-crypt.key")
 	listenAddr := flag.String("listen", "0.0.0.0:1194", "UDP address to listen on")
@@ -162,8 +178,16 @@ func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorder
 		Cipher:    "AES-256-GCM",
 		StartedAt: time.Now(),
 	}), &httpRequests)
+	// WR-02: an *http.Server with explicit timeouts, not the bare
+	// http.Serve(httpLn, instrumented) this harness previously used —
+	// http.Serve has no way to set them at all, so a slow/stalled client
+	// (deliberately, given -drop-rate/-reorder-rate above, or just
+	// misbehaving) could tie up a goroutine here indefinitely. Mirrors the
+	// same fix applied to examples/tunnelweb/main.go, the harness's own
+	// non-test analog.
+	httpSrv := newHardenedHTTPServer(instrumented)
 	go func() {
-		if serveErr := http.Serve(httpLn, instrumented); serveErr != nil {
+		if serveErr := httpSrv.Serve(httpLn); serveErr != nil {
 			log.Printf("tunnelweb http.Serve exited: %v", serveErr)
 		}
 	}()

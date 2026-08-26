@@ -48,6 +48,26 @@ func main() {
 	}
 }
 
+// newHardenedHTTPServer builds the *http.Server this example serves the
+// tunnelweb site through, with WR-02's timeouts set: without
+// ReadHeaderTimeout (and, defensively, ReadTimeout/WriteTimeout/
+// IdleTimeout), net/http never arms a read deadline on an accepted
+// connection at all, so a client that opens a connection and sends headers
+// slowly (or never) ties up a goroutine indefinitely — a Slowloris-style
+// resource-exhaustion path anyone copying this example would otherwise
+// inherit. Extracted to its own function so main_test.go can assert on the
+// timeout values directly, without needing a live netstack/OpenVPN session
+// to exercise them end to end.
+func newHardenedHTTPServer(handler http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+}
+
 func run(pkiDir, listenAddr, networkCIDR string, httpPort uint16) error {
 	if pkiDir == "" {
 		return errors.New("missing -pki: generate a PKI first with `go run ./cmd/gentestpki -out <dir> -profile small`, then pass that directory here")
@@ -78,10 +98,10 @@ func run(pkiDir, listenAddr, networkCIDR string, httpPort uint16) error {
 		return fmt.Errorf("listen tcp :%d over the netstack: %w", httpPort, err)
 	}
 
-	httpSrv := &http.Server{Handler: site.Handler(site.Options{
+	httpSrv := newHardenedHTTPServer(site.Handler(site.Options{
 		Cipher:    "AES-256-GCM",
 		StartedAt: time.Now(),
-	})}
+	}))
 	httpDone := make(chan error, 1)
 	go func() { httpDone <- httpSrv.Serve(ln) }()
 
