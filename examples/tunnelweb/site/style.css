@@ -234,7 +234,7 @@ button {
 .echo-error {
   color: var(--color-text);
   background: var(--color-surface);
-  border-left: 4px solid var(--color-accent);
+  border-left: 4px solid var(--color-text-muted);
   padding: var(--space-md);
   border-radius: var(--radius);
 }
