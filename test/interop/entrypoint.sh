@@ -219,6 +219,25 @@ else
 	echo "entrypoint: headers page probe failed"
 fi
 
+# outside_tunnel (Task 3): a direct curl at the server container's own
+# Docker-network alias (govpn-interop-server, which this client container
+# already resolves) on the same HTTP port must FAIL — the tunnelweb site
+# binds no OS TCP socket for HTTP at all; its only listener lives inside the
+# netstack's own 4-tuple table, reachable only via a packet arriving on an
+# attached Session. result=ok means the connection was refused or timed out
+# (the correct, desired outcome, proving the site is unreachable outside
+# the tunnel); result=fail means a response actually came back. The sense
+# is deliberately inverted from every other probe above — commented clearly
+# because a probe whose SUCCESS is a command's FAILURE is exactly the kind
+# of code a later reader "fixes" by accident.
+if curl -s --max-time 3 "http://govpn-interop-server:$HTTP_PORT/" >/dev/null 2>&1; then
+	echo "entrypoint: PROBE outside_tunnel result=fail reason=response_received"
+	echo "entrypoint: outside-tunnel probe failed: the server responded to a direct connection outside the tunnel"
+else
+	echo "entrypoint: PROBE outside_tunnel result=ok"
+	echo "entrypoint: outside-tunnel probe succeeded: direct connection to the server container was refused or timed out"
+fi
+
 set +e
 wait "$OVPN_PID"
 OVPN_EXIT=$?

@@ -326,6 +326,12 @@ func TestInteropScenarios(t *testing.T) {
 			assertUDPRoundTrip(t, res, !sc.lossy)
 			assertHTTPSubpages(t, res, !sc.lossy)
 
+			// 03-06-PLAN.md Task 3 (ROADMAP Phase 3 success criterion 3):
+			// required on every scenario including the lossy one — see
+			// the function's own doc comment for why the lossy link has
+			// no bearing on this assertion.
+			assertUnreachableOutsideTunnel(t, res)
+
 			assertServerStaysUnprivileged(t, res)
 
 			if sc.largeCert {
@@ -738,6 +744,27 @@ func assertHTTPSubpages(t *testing.T, res scenarioResult, strict bool) {
 	assertProbe(t, res, "http_headers", strict)
 }
 
+// assertUnreachableOutsideTunnel is 03-06-PLAN.md Task 3's negative proof
+// (ROADMAP Phase 3 success criterion 3's "unreachable from outside the
+// tunnel" clause): entrypoint.sh's outside_tunnel probe curls the server
+// container's own Docker-network alias directly, bypassing the tunnel
+// entirely, and its result=ok means that connection was refused or timed
+// out — the genuine, desired outcome, since the tunnelweb site binds no OS
+// TCP socket for HTTP at all. Required on EVERY scenario including the
+// lossy one: the lossy link only affects the client<->server UDP tunnel
+// port, and has no bearing on whether a direct TCP connection to the
+// server container's own network address is refused, so there is no reason
+// to relax this probe there.
+func assertUnreachableOutsideTunnel(t *testing.T, res scenarioResult) {
+	t.Helper()
+
+	if res.composeErr != nil {
+		return
+	}
+
+	assertProbe(t, res, "outside_tunnel", true)
+}
+
 // assertServerStaysUnprivileged is plan 01-02's runtime privilege check,
 // re-asserted in every scenario including the lossy one — the
 // server-to-client loss decorator lives entirely in this harness's own
@@ -748,10 +775,19 @@ func assertHTTPSubpages(t *testing.T, res scenarioResult, strict bool) {
 // tears it down) — by the time this Test function runs, the container is
 // already gone, so the captured string is asserted here instead of
 // re-inspecting a container that no longer exists.
+//
+// The failure message names this phase's own claim explicitly (03-06-
+// PLAN.md Task 3): the server container serves real ICMP, UDP, and TCP
+// traffic through a userspace netstack with zero added capabilities and
+// zero mapped devices — so a future failure here reads as "the deployment
+// premise broke", not merely "a string did not match".
 func assertServerStaysUnprivileged(t *testing.T, res scenarioResult) {
 	t.Helper()
 	if res.privilegeCheck != "false 0 0" {
-		t.Fatalf("server container privilege check = %q, want \"false 0 0\"", res.privilegeCheck)
+		t.Fatalf(
+			"server container privilege check = %q, want \"false 0 0\" (not privileged, zero added capabilities, zero mapped devices) — this is the deployment premise the whole phase rests on: the server serves real ICMP, UDP, and TCP traffic through a userspace netstack while running as an ordinary, unprivileged process, with no /dev/net/tun and no CAP_NET_ADMIN",
+			res.privilegeCheck,
+		)
 	}
 }
 
