@@ -251,11 +251,18 @@ func (d *tcpDemux) sendRST(a *attachment, localIP, remoteIP netip.Addr, seg tcpS
 func (l *tcpListener) handleSYN(a *attachment, remoteIP netip.Addr, seg tcpSegment) {
 	d := l.demux
 
-	d.mu.Lock()
-	if l.closed {
-		d.mu.Unlock()
+	// l.closed is guarded by l.mu (the same lock Close/enqueue use for
+	// it), a DIFFERENT lock from d.mu below which guards the demux's own
+	// halfOpen/conns maps — reading it under d.mu instead would be a
+	// data race with Close's l.mu.Lock() write.
+	l.mu.Lock()
+	closed := l.closed
+	l.mu.Unlock()
+	if closed {
 		return
 	}
+
+	d.mu.Lock()
 	if d.halfOpen[remoteIP] >= maxHalfOpenPerSession {
 		d.mu.Unlock()
 		d.stats.halfOpenCapHits.Add(1)
