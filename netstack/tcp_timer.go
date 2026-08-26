@@ -93,6 +93,18 @@ func (c *tcpConn) sendPendingLocked(toSend *[]tcpSegment, forceProbe bool) {
 	limit := c.allowedInFlightLocked()
 	if limit == 0 {
 		if !forceProbe || c.sentBytes >= uint32(len(c.outBuf)) {
+			// Nothing can go out right now, but if data is queued
+			// behind a fully-closed window, the persist timer (RFC
+			// 9293 §3.8) must still be armed — otherwise nothing
+			// would ever wake onRTOFired's zero-window case to probe
+			// once the peer reopens the window. A Write() that lands
+			// entirely inside a zero window would otherwise stall
+			// forever with no timer running at all.
+			if uint32(len(c.outBuf)) > c.sentBytes && !c.timerArmed {
+				c.timerArmed = true
+				c.rto = initialRTO
+				c.rtoTimer.Reset(c.rto)
+			}
 			return
 		}
 		limit = c.sentBytes + 1

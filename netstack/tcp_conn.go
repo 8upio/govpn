@@ -224,9 +224,17 @@ func (c *tcpConn) Read(p []byte) (int, error) {
 }
 
 // Write queues p onto the send buffer and emits segments up to
-// min(sendMSS, peer window, maxInFlightBytes) (D-07); it blocks while the
-// window is fully closed rather than buffering p without bound, waking on
-// every ACK/window-update via cond.
+// min(sendMSS, peer window, maxInFlightBytes) (D-07). Queueing itself is
+// bounded by sendBufferCap (maxInFlightBytes) rather than by the peer's
+// CURRENT window: a send buffer and a transmission window are distinct
+// concepts (matching an ordinary socket's SO_SNDBUF vs. the peer's
+// advertised window) — decoupling them is what lets Write() still queue
+// (and thus have something to zero-window-persist-probe with,
+// tcp_timer.go's onRTOFired) even while the peer's window is fully closed.
+// Write blocks once the send buffer itself is full rather than buffering p
+// without bound (D-07's own "blocks while the window is closed" language,
+// read here as bounded by the send buffer, not by the instantaneous
+// window), waking on every ACK/window-update via cond.
 func (c *tcpConn) Write(p []byte) (int, error) {
 	c.mu.Lock()
 	if c.err != nil {
@@ -248,15 +256,13 @@ func (c *tcpConn) Write(p []byte) (int, error) {
 				c.mu.Unlock()
 				return n, err
 			}
-			limit := c.allowedInFlightLocked()
-			if uint32(len(c.outBuf)) < limit {
+			if uint32(len(c.outBuf)) < maxInFlightBytes {
 				break
 			}
 			c.cond.Wait()
 		}
 
-		limit := c.allowedInFlightLocked()
-		capacity := int(limit) - len(c.outBuf)
+		capacity := maxInFlightBytes - len(c.outBuf)
 		remaining := len(p) - total
 		if capacity > remaining {
 			capacity = remaining
