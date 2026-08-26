@@ -3,8 +3,17 @@ package site
 import (
 	"bytes"
 	"html/template"
+	"net"
 	"net/http"
+	"sort"
+	"strings"
+	"time"
 )
+
+// emDash is UI-SPEC's fallback rendering for a locked field that is
+// genuinely unavailable — the row stays, its value becomes this, and the
+// handler never panics or omits the row (UI-SPEC's `partial` state rule).
+const emDash = "—"
 
 // layoutTmpl is the one shared layout every page renders through: a
 // <header> carrying the site brand and the site-wide <nav> (with its
@@ -128,27 +137,161 @@ func (s *site) handleNotFound(w http.ResponseWriter, r *http.Request) {
 	renderPage(w, http.StatusNotFound, notFoundTmpl, "Not Found", nil)
 }
 
-// statusTmpl is a placeholder for this task: registered now so
-// TestAllRoutesReturn200 passes from this task forward (a route that
-// 404s until a later task would make the tracer's own end-to-end claim
-// false), fully implemented with live tunnel/session facts and the
-// em-dash fallback rule in Task 2.
-var statusTmpl = template.Must(template.New("status").Parse(`<h2>Status</h2>
-<p>Coming in Task 2: live facts about your tunnel session.</p>
-`))
-
-func (s *site) handleStatus(w http.ResponseWriter, r *http.Request) {
-	renderPage(w, http.StatusOK, statusTmpl, "Status", nil)
+// statusPageData carries the status page's locked fields (assigned tunnel
+// IP, server tunnel IP, cipher, the "tunnel: active" indicator — always
+// rendered literally, not from this struct) plus the discretionary fields
+// this plan's objective table names as cheaply available: client source
+// port, request time, and server uptime. Every field is a string so the
+// em-dash fallback (see emDash above) is representable uniformly; deriving
+// these values is fallible (an unparseable RemoteAddr, a missing context
+// value), and every failure path renders emDash for that one value while
+// the row itself always stays (UI-SPEC's `partial` state rule).
+type statusPageData struct {
+	AssignedIP  string
+	ServerIP    string
+	Cipher      string
+	SourcePort  string
+	RequestedAt string
+	Uptime      string
 }
 
-// headersTmpl is a placeholder for this task, matching statusTmpl above;
-// fully implemented (sorted, escaped request-header table) in Task 2.
-var headersTmpl = template.Must(template.New("headers").Parse(`<h2>Headers</h2>
-<p>Coming in Task 2: the raw HTTP headers this server received from you.</p>
+// statusTmpl is UI-SPEC §2's locked status page: a definition-style table
+// (<th scope="row">) of the four locked fields plus the discretionary
+// ones, in the order the plan's objective assumption table lists them.
+// IP/identifier values carry the "mono" class (font-family: var(--font-
+// mono); word-break: break-all — UI-SPEC's `overflow` row) rather than a
+// fifth type role; the "tunnel: active" indicator is text in
+// --color-accent, never a colored dot alone (UI-SPEC's no-color-only-
+// signaling rule).
+var statusTmpl = template.Must(template.New("status").Parse(`<h2>Status</h2>
+<table>
+<tbody>
+<tr><th scope="row">Assigned tunnel IP</th><td class="mono">{{.AssignedIP}}</td></tr>
+<tr><th scope="row">Server tunnel IP</th><td class="mono">{{.ServerIP}}</td></tr>
+<tr><th scope="row">Cipher</th><td>{{.Cipher}}</td></tr>
+<tr><th scope="row">Session</th><td class="status-active">tunnel: active</td></tr>
+<tr><th scope="row">Client source port</th><td class="mono">{{.SourcePort}}</td></tr>
+<tr><th scope="row">Request time</th><td>{{.RequestedAt}}</td></tr>
+<tr><th scope="row">Server uptime</th><td>{{.Uptime}}</td></tr>
+</tbody>
+</table>
 `))
 
+// splitHostPortOrEmDash splits hostport into its host and port halves,
+// returning emDash for both on any parse failure — the single fallback
+// path every fallible address derivation on the status page shares, so a
+// malformed or missing address never panics the handler and never omits
+// its row (UI-SPEC's `partial` state rule).
+func splitHostPortOrEmDash(hostport string) (host, port string) {
+	h, p, err := net.SplitHostPort(hostport)
+	if err != nil {
+		return emDash, emDash
+	}
+	return h, p
+}
+
+// handleStatus computes every fact synchronously, before the response is
+// written — there is no async loading state on this stack (UI-SPEC's
+// `loading` row). The assigned tunnel IP and its source port come from
+// r.RemoteAddr; for a netstack conn this IS the client's assigned tunnel
+// IP (this plan's own objective, "Planner assumption" table). The server
+// tunnel IP comes from http.LocalAddrContextKey, which net/http populates
+// from the accepted conn's own LocalAddr() — the same *net.TCPAddr plan
+// 03-03 proved the netstack's TCP conn returns.
+func (s *site) handleStatus(w http.ResponseWriter, r *http.Request) {
+	data := statusPageData{
+		Cipher:      s.opts.Cipher,
+		RequestedAt: time.Now().Format("2006-01-02 15:04:05 MST"),
+		Uptime:      time.Since(s.opts.StartedAt).Round(time.Second).String(),
+	}
+	if data.Cipher == "" {
+		data.Cipher = emDash
+	}
+
+	data.AssignedIP, data.SourcePort = splitHostPortOrEmDash(r.RemoteAddr)
+
+	data.ServerIP = emDash
+	if addr, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok {
+		if ip, _ := splitHostPortOrEmDash(addr.String()); ip != emDash {
+			data.ServerIP = ip
+		}
+	}
+
+	renderPage(w, http.StatusOK, statusTmpl, "Status", data)
+}
+
+// headerRow is one row of the headers page's table: a single header name
+// and its (possibly comma-joined, for multi-valued headers) value.
+type headerRow struct {
+	Name  string
+	Value string
+}
+
+// headersPageData carries the headers page's proof line (method, path,
+// Host) and its sorted row set. Count is rendered separately from
+// len(Rows) so the "{N} headers received" heading still reads correctly
+// in the same shape even if a future change renders rows differently.
+type headersPageData struct {
+	Method string
+	Path   string
+	Host   string
+	Count  int
+	Rows   []headerRow
+}
+
+// headersTmpl is UI-SPEC §5's locked headers page: the method/path/Host
+// proof line, the numeral-only "{N} headers received" heading (no
+// singular/plural branching), and — when at least one header exists — a
+// two-column <table> with <th scope="col">. The empty case (🧪 backstop:
+// expected to never trigger against a real HTTP client, but implemented
+// and unit-tested rather than merely hoped for) renders "No headers
+// received" instead of an empty table. The value column carries the
+// "wrap" class (overflow-wrap: anywhere), covering both UI-SPEC's
+// `overflow` and `long-text` rows with one CSS rule.
+var headersTmpl = template.Must(template.New("headers").Parse(`<p>{{.Method}} {{.Path}} via Host: {{.Host}}</p>
+<h2>{{.Count}} headers received</h2>
+{{if .Rows}}
+<table>
+<thead><tr><th scope="col">Header</th><th scope="col">Value</th></tr></thead>
+<tbody>
+{{range .Rows}}<tr><td>{{.Name}}</td><td class="wrap">{{.Value}}</td></tr>
+{{end}}</tbody>
+</table>
+{{else}}
+<p>No headers received</p>
+{{end}}
+`))
+
+// handleHeaders collects header names from r.Header, sorts them with
+// sort.Strings, and joins multi-valued headers with a comma and a space
+// rather than dropping duplicates. Sorting is not cosmetic — it is what
+// makes the page's output deterministic and byte-identical across two
+// renders of the same request (TestHeadersPageSorted), and therefore
+// assertable by plan 03-06's curl content-marker probe. Escaping is
+// automatic through html/template (see renderPage); a future refactor to
+// text/template or string concatenation for "performance" would fail
+// TestHeadersPageEscapesValues rather than shipping a reflected-XSS
+// surface on a page whose entire content is attacker-supplied (T-03-25).
 func (s *site) handleHeaders(w http.ResponseWriter, r *http.Request) {
-	renderPage(w, http.StatusOK, headersTmpl, "Headers", nil)
+	names := make([]string, 0, len(r.Header))
+	for name := range r.Header {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	rows := make([]headerRow, 0, len(names))
+	for _, name := range names {
+		rows = append(rows, headerRow{Name: name, Value: strings.Join(r.Header[name], ", ")})
+	}
+
+	data := headersPageData{
+		Method: r.Method,
+		Path:   r.URL.Path,
+		Host:   r.Host,
+		Count:  len(rows),
+		Rows:   rows,
+	}
+	renderPage(w, http.StatusOK, headersTmpl, "Headers", data)
 }
 
 // echoTmpl is a placeholder for this task, matching statusTmpl above;

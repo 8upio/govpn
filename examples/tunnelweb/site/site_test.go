@@ -6,6 +6,8 @@
 package site
 
 import (
+	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -195,5 +197,214 @@ func TestSitePackageDoesNotNeedOvpn(t *testing.T) {
 		if w.Code != http.StatusOK {
 			t.Errorf("GET %s = %d, want 200 (site.Handler must be fully self-contained and driven only by httptest)", route, w.Code)
 		}
+	}
+}
+
+// --- Task 2: status and headers ---
+
+func TestStatusPageLockedFields(t *testing.T) {
+	h := Handler(testOptions())
+	r := httptest.NewRequest(http.MethodGet, "/status", nil)
+	r.RemoteAddr = "10.8.0.2:41000"
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	body := w.Body.String()
+	for _, want := range []string{"Assigned tunnel IP", "Server tunnel IP", "Cipher", "tunnel: active"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("status page missing locked field %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestStatusPageDerivesAddresses(t *testing.T) {
+	h := Handler(testOptions())
+	r := httptest.NewRequest(http.MethodGet, "/status", nil)
+	r.RemoteAddr = "10.8.0.2:41000"
+	localAddr := &net.TCPAddr{IP: net.ParseIP("10.8.0.1"), Port: 8080}
+	r = r.WithContext(context.WithValue(r.Context(), http.LocalAddrContextKey, net.Addr(localAddr)))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	body := w.Body.String()
+	if !strings.Contains(body, "10.8.0.2") {
+		t.Errorf("status page does not show the assigned tunnel IP 10.8.0.2:\n%s", body)
+	}
+	if !strings.Contains(body, "10.8.0.1") {
+		t.Errorf("status page does not show the server tunnel IP 10.8.0.1:\n%s", body)
+	}
+}
+
+func TestStatusPagePartialFallback(t *testing.T) {
+	h := Handler(testOptions())
+	r := httptest.NewRequest(http.MethodGet, "/status", nil)
+	r.RemoteAddr = "not-a-valid-remote-addr"
+	w := httptest.NewRecorder()
+
+	func() {
+		defer func() {
+			if p := recover(); p != nil {
+				t.Fatalf("status handler panicked on an unparseable RemoteAddr: %v", p)
+			}
+		}()
+		h.ServeHTTP(w, r)
+	}()
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, emDash) {
+		t.Errorf("status page does not fall back to an em dash for an unavailable value:\n%s", body)
+	}
+	for _, want := range []string{"Assigned tunnel IP", "Server tunnel IP", "Cipher", "tunnel: active"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("status page dropped locked row %q on fallback", want)
+		}
+	}
+}
+
+func TestStatusPageComputedSynchronously(t *testing.T) {
+	h := Handler(testOptions())
+	r := httptest.NewRequest(http.MethodGet, "/status", nil)
+	r.RemoteAddr = "10.8.0.2:41000"
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Body.Len() == 0 {
+		t.Fatal("status page body is empty immediately after ServeHTTP returns — expected a fully synchronous response")
+	}
+}
+
+func TestStatusValuesUseMonospace(t *testing.T) {
+	h := Handler(testOptions())
+	r := httptest.NewRequest(http.MethodGet, "/status", nil)
+	r.RemoteAddr = "10.8.0.2:41000"
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	body := w.Body.String()
+	if !strings.Contains(body, `class="mono"`) {
+		t.Errorf("status page does not mark IP/identifier values with the mono class:\n%s", body)
+	}
+	css := doRequest(h, http.MethodGet, "/style.css", "").Body.String()
+	if !strings.Contains(css, "var(--font-mono)") || !strings.Contains(css, "word-break: break-all") {
+		t.Error("stylesheet does not define the mono value rule (font-family: var(--font-mono); word-break: break-all)")
+	}
+}
+
+func TestHeadersPageSorted(t *testing.T) {
+	h := Handler(testOptions())
+	mk := func() *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "/headers", nil)
+		r.Header.Set("X-Zeta", "1")
+		r.Header.Set("Accept", "text/html")
+		r.Header.Set("User-Agent", "test-agent")
+		return r
+	}
+
+	w1 := httptest.NewRecorder()
+	h.ServeHTTP(w1, mk())
+	w2 := httptest.NewRecorder()
+	h.ServeHTTP(w2, mk())
+
+	body1, body2 := w1.Body.String(), w2.Body.String()
+	if body1 != body2 {
+		t.Fatal("two renders of the same request produced different output — output must be byte-identical")
+	}
+
+	iAccept := strings.Index(body1, "Accept")
+	iUA := strings.Index(body1, "User-Agent")
+	iZeta := strings.Index(body1, "X-Zeta")
+	if iAccept < 0 || iUA < 0 || iZeta < 0 {
+		t.Fatalf("one or more headers missing from rendered table:\n%s", body1)
+	}
+	if !(iAccept < iUA && iUA < iZeta) {
+		t.Fatalf("headers not sorted alphabetically: Accept=%d User-Agent=%d X-Zeta=%d", iAccept, iUA, iZeta)
+	}
+}
+
+func TestHeadersPageHeadingCount(t *testing.T) {
+	h := Handler(testOptions())
+	r := httptest.NewRequest(http.MethodGet, "/headers", nil)
+	r.Header.Set("X-Test", "1")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	body := w.Body.String()
+	if !strings.Contains(body, "1 headers received") {
+		t.Errorf("expected the numeral-only heading '1 headers received', got:\n%s", body)
+	}
+}
+
+func TestHeadersPageProofLine(t *testing.T) {
+	h := Handler(testOptions())
+	r := httptest.NewRequest(http.MethodGet, "/headers", nil)
+	r.Host = "10.8.0.1:8080"
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	body := w.Body.String()
+	if !strings.Contains(body, "GET /headers via Host: 10.8.0.1:8080") {
+		t.Errorf("headers page missing the method/path/Host proof line:\n%s", body)
+	}
+}
+
+func TestHeadersPageEmptyBackstop(t *testing.T) {
+	h := Handler(testOptions())
+	r := httptest.NewRequest(http.MethodGet, "/headers", nil)
+	r.Header = http.Header{}
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	body := w.Body.String()
+	if !strings.Contains(body, "No headers received") {
+		t.Errorf("expected the empty-state backstop copy 'No headers received', got:\n%s", body)
+	}
+}
+
+func TestHeadersPageEscapesValues(t *testing.T) {
+	h := Handler(testOptions())
+	r := httptest.NewRequest(http.MethodGet, "/headers", nil)
+	r.Header.Set("X-Evil", "<script>alert(1)</script>")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	body := w.Body.String()
+	if strings.Contains(body, "<script>alert(1)</script>") {
+		t.Fatal("header value rendered as unescaped markup")
+	}
+	if !strings.Contains(body, "alert(1)") {
+		t.Fatal("escaped header value is not present as visible text")
+	}
+}
+
+func TestTableSemantics(t *testing.T) {
+	h := Handler(testOptions())
+
+	statusReq := httptest.NewRequest(http.MethodGet, "/status", nil)
+	statusReq.RemoteAddr = "10.8.0.2:41000"
+	statusW := httptest.NewRecorder()
+	h.ServeHTTP(statusW, statusReq)
+	if !strings.Contains(statusW.Body.String(), `scope="row"`) {
+		t.Error(`status table missing scope="row"`)
+	}
+
+	headersReq := httptest.NewRequest(http.MethodGet, "/headers", nil)
+	headersReq.Header.Set("X-Test", "1")
+	headersW := httptest.NewRecorder()
+	h.ServeHTTP(headersW, headersReq)
+	if !strings.Contains(headersW.Body.String(), `scope="col"`) {
+		t.Error(`headers table missing scope="col"`)
+	}
+}
+
+func TestLongHeaderValueWraps(t *testing.T) {
+	h := Handler(testOptions())
+	body := doRequest(h, http.MethodGet, "/style.css", "").Body.String()
+	if !strings.Contains(body, "overflow-wrap: anywhere") {
+		t.Error("stylesheet does not define overflow-wrap: anywhere on the value column")
+	}
+	if strings.Contains(body, "nowrap") {
+		t.Error("stylesheet contains a nowrap rule that would force horizontal scroll")
 	}
 }

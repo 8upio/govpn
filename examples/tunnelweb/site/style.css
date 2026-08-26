@@ -146,6 +146,54 @@ footer {
   padding: var(--space-lg);
 }
 
+/* Status/headers tables (UI-SPEC §2, §5). table-layout: fixed plus the
+ * "wrap"/"mono" value-cell rules below are what keep long values from
+ * forcing horizontal scroll — no rule anywhere in this file pins a cell's
+ * width or forbids line breaking, which would defeat that. */
+table {
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: collapse;
+  background: var(--color-surface);
+  border-radius: var(--radius);
+}
+
+th,
+td {
+  text-align: left;
+  padding: var(--space-sm);
+  border-bottom: 1px solid var(--color-border);
+  vertical-align: top;
+}
+
+th {
+  font-weight: 600;
+  font-size: var(--text-sm);
+}
+
+/* mono is a VALUE treatment, not a fifth type role (UI-SPEC Typography):
+ * it inherits its surrounding role's size and only changes family. Used
+ * for IP/identifier values on the status page (UI-SPEC's `overflow` row:
+ * word-break: break-all inside a bounded-width cell never forces
+ * horizontal scroll). */
+.mono {
+  font-family: var(--font-mono);
+  word-break: break-all;
+}
+
+/* wrap covers both the headers page's `overflow` and `long-text` rows
+ * with the single de-duplicated resolution UI-SPEC itself notes: long
+ * values (e.g. User-Agent) wrap via overflow-wrap: anywhere instead of
+ * forcing horizontal scroll. */
+.wrap {
+  overflow-wrap: anywhere;
+}
+
+.status-active {
+  color: var(--color-accent);
+  font-weight: 600;
+}
+
 /* Accessibility Basics: every interactive element gets a visible
  * :focus-visible outline — required since this site ships no JavaScript
  * and must be fully keyboard-navigable by default browser behavior alone. */
