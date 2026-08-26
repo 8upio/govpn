@@ -38,19 +38,19 @@ Requirements for initial release. Each maps to roadmap phases.
 
 ### Userspace Netstack
 
-- [ ] **NET-01**: `ListenUDP(port)` returns a `net.PacketConn` that transparently demuxes tunnel UDP traffic (parse/build IP+UDP headers), usable by unmodified socket-based code
-- [ ] **NET-02**: Minimal server-side TCP: `ListenTCP(port)` returns a `net.Listener` sufficient to serve HTTP to tunnel clients (stdlib-only, no gVisor)
+- [x] **NET-01**: `ListenUDP(port)` returns a `net.PacketConn` that transparently demuxes tunnel UDP traffic (parse/build IP+UDP headers), usable by unmodified socket-based code
+- [x] **NET-02**: Minimal server-side TCP: `ListenTCP(port)` returns a `net.Listener` sufficient to serve HTTP to tunnel clients (stdlib-only, no gVisor)
 - [x] **NET-03**: Built-in ICMP echo responder: tunnel clients can ping the server tunnel IP
 - [x] **NET-04**: Sessions attach/detach dynamically with IP→session routing; UDP listeners can be opened on arbitrary ports at runtime (RTP-style dynamic ports)
 
 ### Example
 
-- [ ] **XMPL-01**: Example web server reachable only through the tunnel: interactive landing page plus 3–5 subpages, served via the netstack TCP listener, runnable with a single command
+- [x] **XMPL-01**: Example web server reachable only through the tunnel: interactive landing page plus 3–5 subpages, served via the netstack TCP listener, runnable with a single command
 
 ### Interop Verification
 
 - [x] **VRFY-01**: Docker harness: pinned OpenVPN 2.6 client container (self-built Debian image) connects to the library with a generated config (certs, tls-crypt key) — automatable in CI
-- [ ] **VRFY-02**: End-to-end through the real client: ping (ICMP), UDP round-trip, and HTTP page load through the tunnel all succeed
+- [x] **VRFY-02**: End-to-end through the real client: ping (ICMP), UDP round-trip, and HTTP page load through the tunnel all succeed
 - [x] **VRFY-03**: Harness includes a lossy-network scenario (5–10% packet loss/reordering) under which handshake and traffic still succeed
 
 ## v2 Requirements
@@ -107,12 +107,12 @@ Which phases cover which requirements. Updated during roadmap creation.
 | SESS-02 | Phase 2 | Complete |
 | SESS-03 | Phase 2 | Complete |
 | VRFY-03 | Phase 2 | Complete |
-| NET-01 | Phase 3 | Pending |
-| NET-02 | Phase 3 | Pending |
+| NET-01 | Phase 3 | Complete |
+| NET-02 | Phase 3 | Complete |
 | NET-03 | Phase 3 | Complete |
 | NET-04 | Phase 3 | Complete |
-| XMPL-01 | Phase 3 | Pending |
-| VRFY-02 | Phase 3 | Pending |
+| XMPL-01 | Phase 3 | Complete |
+| VRFY-02 | Phase 3 | Complete |
 | SESS-04 | Phase 4 | Pending |
 | SESS-05 | Phase 4 | Pending |
 
