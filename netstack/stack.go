@@ -62,15 +62,25 @@ type protocolHandler interface {
 	handlePacket(a *attachment, src, dst netip.Addr, payload []byte)
 }
 
-// readBufferSize is the per-attachment read-loop buffer size (D-14).
-// Session.Read is datagram-shaped and, per its own documented contract
-// (session.go:305-334), returns an error while RETAINING the packet if the
-// caller's buffer is too small for it — an undersized buffer here would
-// wedge the read loop on the same packet forever, since every subsequent
-// Read call would hit the identical retained, too-large packet. 2048
-// covers the pushed `tun-mtu 1500` (ovpn.go's serverKM2Options) with
-// headroom for any future MTU adjustment.
+// readBufferSize is the per-attachment read-loop buffer's starting size
+// (D-14). Session.Read is datagram-shaped and, per its own documented
+// contract (session.go:305-334), returns an error while RETAINING the
+// packet if the caller's buffer is too small for it. 2048 covers the
+// pushed `tun-mtu 1500` (ovpn.go's serverKM2Options) with headroom for any
+// future MTU adjustment — but the pushed MTU is advisory only, never
+// enforced upstream of this loop, so a non-conforming or hostile client
+// can still hand this stack a larger packet. See maxReadRetryBufferSize
+// and readLoop (WR-04) for how that outcome is handled without treating it
+// as a fatal, session-wide detach.
 const readBufferSize = 2048
+
+// maxReadRetryBufferSize bounds the one-off larger buffer readLoop
+// allocates when Session.Read reports its buffer-too-small, retained-
+// packet outcome (WR-04). 65535 is the largest IPv4 datagram this stack's
+// own parseIPv4 total-length field can express (T-03-01), so growing
+// beyond it can never help — a Read that still fails at this size is
+// treated as a genuine, terminal session failure, not a sizing problem.
+const maxReadRetryBufferSize = 65535
 
 // Typed errors returned by New and Attach.
 var (
@@ -117,6 +127,7 @@ type stats struct {
 	wrongDestinationDropped  atomic.Uint64
 	unhandledProtocolDropped atomic.Uint64
 	outboundSourceDropped    atomic.Uint64
+	shortReadBufferGrown     atomic.Uint64
 }
 
 // Stats is a point-in-time snapshot of Stack's drop/delivery counters,
@@ -131,6 +142,7 @@ type Stats struct {
 	WrongDestinationDropped  uint64
 	UnhandledProtocolDropped uint64
 	OutboundSourceDropped    uint64
+	ShortReadBufferGrown     uint64
 }
 
 // attachment is one Attach-ed session's routing state: the session itself,
@@ -354,6 +366,30 @@ func (s *Stack) readLoop(a *attachment) {
 
 		n, err := a.sess.Read(buf)
 		if err != nil {
+			// WR-04: Session.Read's documented contract (session.go:
+			// 305-334) returns an error while RETAINING the packet when
+			// the caller's buffer is too small, rather than a genuine
+			// session failure — treating every non-nil error identically
+			// as the sole detach trigger converted that documented,
+			// recoverable "retry with a bigger buffer" outcome into an
+			// unrecoverable, silent session-routing failure (the pushed
+			// tun-mtu is advisory only, never enforced upstream of this
+			// loop). Session is a locally-declared structural interface
+			// (D-01/D-18) — netstack cannot distinguish this specific
+			// error by type without importing the core ovpn module to
+			// reach its sentinel, which TestPhase3NetstackDoesNotImportCoreLibrary
+			// forbids — so instead of inspecting the error, grow the
+			// buffer once (up to maxReadRetryBufferSize, the largest
+			// IPv4 datagram this stack can even parse) and retry before
+			// treating any error as terminal. A genuinely closed/failed
+			// session fails again immediately on retry (Read on a closed
+			// session returns io.EOF without blocking), so this costs at
+			// most one extra non-blocking call, never a stall.
+			if len(buf) < maxReadRetryBufferSize {
+				buf = make([]byte, maxReadRetryBufferSize)
+				s.stats.shortReadBufferGrown.Add(1)
+				continue
+			}
 			s.detachAttachment(a)
 			return
 		}
@@ -466,6 +502,7 @@ func (s *Stack) Stats() Stats {
 		WrongDestinationDropped:  s.stats.wrongDestinationDropped.Load(),
 		UnhandledProtocolDropped: s.stats.unhandledProtocolDropped.Load(),
 		OutboundSourceDropped:    s.stats.outboundSourceDropped.Load(),
+		ShortReadBufferGrown:     s.stats.shortReadBufferGrown.Load(),
 	}
 }
 

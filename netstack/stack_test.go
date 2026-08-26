@@ -1,6 +1,7 @@
 package netstack
 
 import (
+	"bytes"
 	"errors"
 	"net"
 	"sync"
@@ -91,6 +92,59 @@ func TestICMPEchoEndToEnd(t *testing.T) {
 	if stats.ICMPEchoReplies != 1 {
 		t.Errorf("Stats().ICMPEchoReplies = %d, want 1", stats.ICMPEchoReplies)
 	}
+}
+
+// TestReadLoopRecoversFromShortBuffer (WR-04): a decrypted IP packet
+// larger than readBufferSize (2048) — which Session.Read's documented
+// contract retains and reports as an error, per its own doc comment
+// (session.go:305-334), rather than a genuine session failure — must not
+// permanently and silently detach the attachment. readLoop must instead
+// grow its buffer once and retry, successfully delivering the oversized
+// packet, and keeping the route (and the read loop) alive for whatever
+// traffic follows. Without WR-04's fix, this test's first echo request
+// would detach the attachment before ever reaching deliver, and the
+// second (small) echo request below would time out.
+func TestReadLoopRecoversFromShortBuffer(t *testing.T) {
+	stack := newTestStack(t)
+	defer stack.Close()
+
+	fs := newFakeSession()
+	clientIP := net.IPv4(10, 8, 0, 2).To4()
+	if err := stack.Attach(fs, clientIP); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	// A payload comfortably larger than readBufferSize but well under
+	// maxReadRetryBufferSize — the "non-conforming or hostile client
+	// exceeds the advisory tun-mtu" scenario WR-04 is about.
+	bigPayload := bytes.Repeat([]byte{0x7a}, readBufferSize+500)
+	req := buildICMPEchoRequest(mustAddr(clientIP), mustAddr(testServerIP()), 1, 1, bigPayload)
+	fs.inbound <- req
+
+	reply := waitForOutbound(t, fs, time.Second)
+	hdr, err := parseIPv4(reply)
+	if err != nil {
+		t.Fatalf("parseIPv4(reply): %v", err)
+	}
+	icmpMsg := reply[hdr.payloadOff:hdr.totalLen]
+	if icmpMsg[0] != icmpTypeEchoReply {
+		t.Fatalf("reply ICMP type = %d, want %d (echo reply) — the oversized request was not delivered", icmpMsg[0], icmpTypeEchoReply)
+	}
+
+	if got := stack.Stats().ShortReadBufferGrown; got < 1 {
+		t.Fatalf("Stats().ShortReadBufferGrown = %d, want at least 1", got)
+	}
+
+	// The route must still be alive: a subsequent, ordinary-sized request
+	// on the SAME attachment still gets a reply.
+	stack.mu.RLock()
+	_, exists := stack.routes[mustAddr(clientIP)]
+	stack.mu.RUnlock()
+	if !exists {
+		t.Fatal("route was removed after an oversized (but recoverable) packet — the attachment was wrongly detached")
+	}
+	fs.inbound <- buildICMPEchoRequest(mustAddr(clientIP), mustAddr(testServerIP()), 2, 1, []byte("still alive"))
+	waitForOutbound(t, fs, time.Second)
 }
 
 func TestAttachDetachRouting(t *testing.T) {
