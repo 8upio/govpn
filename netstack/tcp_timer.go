@@ -217,7 +217,7 @@ func (c *tcpConn) onRTOFired() {
 	if c.inTimeWait {
 		c.state = stateClosed
 		c.stopTimersLocked()
-		c.cond.Broadcast()
+		c.broadcastLocked()
 		c.mu.Unlock()
 		c.demux.removeConn(c)
 		return
@@ -308,7 +308,7 @@ func (c *tcpConn) onRTOFired() {
 		c.err = ErrTCPConnReset
 		c.state = stateClosed
 		c.stopTimersLocked()
-		c.cond.Broadcast()
+		c.broadcastLocked()
 		c.mu.Unlock()
 		c.demux.removeConn(c)
 		c.sendSegments([]tcpSegment{rst})
@@ -346,7 +346,7 @@ func (c *tcpConn) onAttachmentDetached() {
 	c.err = ErrTCPConnReset
 	c.state = stateClosed
 	c.stopTimersLocked()
-	c.cond.Broadcast()
+	c.broadcastLocked()
 	c.mu.Unlock()
 	c.demux.removeConn(c)
 }
@@ -372,7 +372,7 @@ func (c *tcpConn) abort() {
 	c.err = ErrTCPConnReset
 	c.state = stateClosed
 	c.stopTimersLocked()
-	c.cond.Broadcast()
+	c.broadcastLocked()
 	c.mu.Unlock()
 	c.demux.removeConn(c)
 	c.sendSegments([]tcpSegment{rst})

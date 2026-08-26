@@ -79,7 +79,7 @@ func (c *tcpConn) handleSegment(seg tcpSegment) {
 		c.err = ErrTCPConnReset
 		c.state = stateClosed
 		c.stopTimersLocked()
-		c.cond.Broadcast()
+		c.broadcastLocked()
 		c.mu.Unlock()
 		c.demux.removeConn(c)
 		return
@@ -164,7 +164,7 @@ func (c *tcpConn) handleSegment(seg tcpSegment) {
 		// from the demux, so this is only reachable via a narrow race).
 	}
 
-	c.cond.Broadcast()
+	c.broadcastLocked()
 	c.mu.Unlock()
 
 	if enqueueToListener {
@@ -212,7 +212,7 @@ func (c *tcpConn) handleAckLocked(seg tcpSegment, toSend *[]tcpSegment) {
 					c.timerArmed = true
 					c.rtoTimer.Reset(c.rto)
 				}
-				c.cond.Broadcast()
+				c.broadcastLocked()
 			}
 		}
 	}
@@ -272,7 +272,7 @@ func (c *tcpConn) handleEstablishedDataLocked(seg tcpSegment, toSend *[]tcpSegme
 			finConsumed = true
 		}
 		*toSend = append(*toSend, c.buildACKLocked())
-		c.cond.Broadcast()
+		c.broadcastLocked()
 		return finConsumed
 
 	case seqGT(seg.seq, c.rcvNxt):
