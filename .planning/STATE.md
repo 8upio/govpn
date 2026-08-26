@@ -64,6 +64,9 @@ Progress: [░░░░░░░░░░] 0%
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- Phase 3: netstack declares its own minimal session interface (structural typing) — zero coupling both directions with core ovpn, enforced by AST gates
+- Phase 3: TCP DoS bounds are named constants (defaultBacklog=16, maxHalfOpenPerSession=8, maxLiveConnsPerSession=64, maxPersistProbes=20); receive window enforced on ingress
+- Phase 3: net/http conformance = real deadlines wrapping os.ErrDeadlineExceeded + CloseWrite; SetKeepAlive not needed
 - Phase 2: Data-channel key direction is the mirror-opposite of tlscrypt's slot convention; P_DATA AEAD tag precedes ciphertext on the wire (explicit reorder around Go's Seal/Open)
 - Phase 2: handleDatagram branches on opcode class before length triage (data-channel min < 49-byte control min — CR-01); data packets route via peer-id-keyed dataSessions
 - Phase 2: Lock nesting order is sess.mu → srv.mu (WR-05 fix); allocate-then-publish in performPushExchange is atomic vs Close
@@ -93,5 +96,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-08-24
-Stopped at: Phase 2 complete (verified, validated, secured), ready to plan Phase 3
+Stopped at: Phase 3 complete (verified, validated, secured), ready to plan Phase 4
 Resume file: None

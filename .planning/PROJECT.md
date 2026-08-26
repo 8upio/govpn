@@ -22,20 +22,17 @@ A real, unmodified OpenVPN 2.6 client can connect to a Go process embedding this
 - ✓ Data-channel encryption/decryption with AES-256-GCM (classic non-epoch packet-id, replay window, fail-closed nonce counter) — Phase 2
 - ✓ Session management: per-client `Session` as `io.ReadWriteCloser` for raw IP packets, `OnSession` at tunnel-up, `AssignedIP()` exposed — Phase 2
 - ✓ Virtual tunnel-IP assignment from `Config.Network` (`topology subnet`, server = first host IP, sequential pool, release-on-close) — Phase 2 (real client logs "Initialization Sequence Completed"; encrypted pings round-trip through Session.Read/Write)
+- ✓ Userspace netstack (`netstack` package): ListenUDP net.PacketConn, minimal server-side TCP with stdlib http.Serve support, built-in ICMP echo, Attach/Detach IP→session routing — Phase 3
+- ✓ Example web server (`examples/tunnelweb`): landing + 4 subpages, reachable only through the tunnel — Phase 3 (real client pings, UDP round-trips, and loads pages live; server container unprivileged, no TUN)
 
 ### Active
 
 **Core library (`ovpn`)**
 
 **Userspace netstack (subpackage)**
-- [ ] UDP support: `ListenUDP(port) (net.PacketConn, error)` — parse/build IP+UDP headers, demux by destination, existing socket-based code works unchanged
-- [ ] Minimal server-side TCP: `ListenTCP(port) (net.Listener, error)` — enough for HTTP served through the tunnel (stdlib-only, no gVisor)
-- [ ] ICMP echo responder for the server tunnel IP (built-in, not optional) — "is the tunnel up?" testable via ping
-- [ ] `Attach(sess, assignedIP)` session registration with IP→session routing
 - [ ] Dynamic-port support for RTP-style workloads (runtime `ListenUDP` on arbitrary ports or catch-all range demux)
 
 **Example**
-- [ ] Example web server, reachable only through the tunnel: interactive landing page plus 3–5 subpages, served via the netstack's TCP listener
 
 **Interop verification**
 - [ ] Docker-based interop harness: unmodified OpenVPN 2.6 client container connects to the library; handshake, ping, and HTTP through the tunnel verified (packet captures / Wireshark where needed)
@@ -103,4 +100,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-08-25 after Phase 2 (Tunnel Up) — real client brings its tunnel up and encrypted IP packets round-trip through the embedder's Session*
+*Last updated: 2026-08-27 after Phase 3 (In-Process Termination) — tunnel traffic terminates fully in-process; real client pings, UDP round-trips, and browses the example site with an unprivileged server container*
