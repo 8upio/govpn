@@ -11,8 +11,13 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/tls"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -1195,5 +1200,103 @@ func TestEnforceRenegotiationWindowDoesNotCloseSwappedConn(t *testing.T) {
 		t.Fatal("Read unexpectedly succeeded with no data ever delivered")
 	} else if err == io.EOF {
 		t.Fatal("enforceRenegotiationWindow closed newConn even though the renegotiation had already succeeded (CR-02 regression): Read returned io.EOF instead of timing out")
+	}
+}
+
+// TestRunRenegotiationClearsPendingRenegOnWrapperFailure is 04-REVIEW.md
+// WR-03's regression test. datachan.NewWrapper cannot actually be made to
+// fail from runRenegotiation's call site today — DataKeys' cipher fields
+// are fixed-size [32]byte arrays, so aes.NewCipher/cipher.NewGCM never
+// error for it (internal/keyderiv/keyexpansion.go) — so there is no
+// runtime failure seam to inject without changing DataKeys' shape, which
+// is out of scope for this fix. This is therefore a structural assertion
+// against runRenegotiation's own source (ovpn.go): its
+// datachan.NewWrapper error-handling block must clear sess.pendingReneg
+// before closing newConn and returning, mirroring the function's other
+// early-return paths (abandon()) — exactly the omission WR-03 found. If a
+// future edit to this call site drops the pendingReneg guard again, this
+// test fails immediately, rather than waiting for a future
+// variable-length-cipher change (e.g. an NCP/cipher-negotiation phase) to
+// make the bug reachable in production with no coverage to catch it.
+func TestRunRenegotiationClearsPendingRenegOnWrapperFailure(t *testing.T) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller(0) failed")
+	}
+	srcPath := filepath.Join(filepath.Dir(thisFile), "ovpn.go")
+	src, err := os.ReadFile(srcPath)
+	if err != nil {
+		t.Fatalf("read ovpn.go: %v", err)
+	}
+
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, srcPath, src, 0)
+	if err != nil {
+		t.Fatalf("parse ovpn.go: %v", err)
+	}
+
+	var fn *ast.FuncDecl
+	for _, decl := range file.Decls {
+		if fd, ok := decl.(*ast.FuncDecl); ok && fd.Name.Name == "runRenegotiation" {
+			fn = fd
+			break
+		}
+	}
+	if fn == nil {
+		t.Fatal("runRenegotiation not found in ovpn.go")
+	}
+
+	// Find the `newWrapper, err := datachan.NewWrapper(...)` statement and
+	// the `if err != nil { ... }` block immediately following it — this is
+	// WR-03's exact call site.
+	var wrapperErrBlock *ast.BlockStmt
+	for i, stmt := range fn.Body.List {
+		assign, ok := stmt.(*ast.AssignStmt)
+		if !ok {
+			continue
+		}
+		isWrapperCall := false
+		for _, rhs := range assign.Rhs {
+			call, ok := rhs.(*ast.CallExpr)
+			if !ok {
+				continue
+			}
+			if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "NewWrapper" {
+				isWrapperCall = true
+			}
+		}
+		if !isWrapperCall {
+			continue
+		}
+		if i+1 >= len(fn.Body.List) {
+			t.Fatal("datachan.NewWrapper call has no following statement in runRenegotiation")
+		}
+		ifStmt, ok := fn.Body.List[i+1].(*ast.IfStmt)
+		if !ok {
+			t.Fatal("statement following datachan.NewWrapper call in runRenegotiation is not an if statement")
+		}
+		wrapperErrBlock = ifStmt.Body
+		break
+	}
+	if wrapperErrBlock == nil {
+		t.Fatal("could not locate datachan.NewWrapper's error-handling block in runRenegotiation")
+	}
+
+	clearsPendingReneg := false
+	ast.Inspect(wrapperErrBlock, func(n ast.Node) bool {
+		assign, ok := n.(*ast.AssignStmt)
+		if !ok {
+			return true
+		}
+		for _, lhs := range assign.Lhs {
+			if sel, ok := lhs.(*ast.SelectorExpr); ok && sel.Sel.Name == "pendingReneg" {
+				clearsPendingReneg = true
+			}
+		}
+		return true
+	})
+
+	if !clearsPendingReneg {
+		t.Fatal("runRenegotiation's datachan.NewWrapper failure branch no longer clears sess.pendingReneg (WR-03 regression) — every subsequent renegotiation attempt would be refused forever by startRenegotiation's in-flight guard")
 	}
 }

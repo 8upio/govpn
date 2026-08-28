@@ -1135,6 +1135,14 @@ func (s *Server) runRenegotiation(sess *Session, newConn *ctrlconn.Conn, keyID u
 
 	newWrapper, err := datachan.NewWrapper(dataKeys.ServerSlots(), sess.peerID, keyID)
 	if err != nil {
+		// WR-03: clear pendingReneg on this failure path too, mirroring the
+		// swap section's own guard below — otherwise every subsequent
+		// renegotiation attempt is refused forever by startRenegotiation's
+		// in-flight guard (sess.pendingReneg != nil), the same CR-01 failure
+		// mode this function's other early-returns already avoid.
+		if sess.pendingReneg == newConn {
+			sess.pendingReneg = nil
+		}
 		sess.mu.Unlock()
 		_ = newConn.Close()
 		return
