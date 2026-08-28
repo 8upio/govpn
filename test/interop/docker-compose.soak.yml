@@ -1,0 +1,26 @@
+# Overlay for the "soak" interop test (04-04-PLAN.md): drives ONE
+# long-lived server process through many real connect/use/clean-disconnect
+# cycles from a real, unmodified OpenVPN 2.6 client, proving dead sessions
+# do not accumulate (ROADMAP Phase 4 success criterion 3). Mirrors
+# docker-compose.reneg.yml's own shape and comment discipline: override
+# ONLY the server service's `command` (-soak-cycles, a -deadline sized for
+# all cycles) and the client service's `environment` (CYCLE_COUNT,
+# CYCLE_PAUSE) — the server's unprivileged posture (no cap_add, no
+# privileged, no devices) and the client's own privileges/volumes stay
+# completely untouched.
+#
+# 3 cycles here (04-04-PLAN.md Task 1's own "prove it small first"
+# instruction) — Task 2 scales this to the full 20-cycle run once the
+# mechanism itself is proven working end-to-end. The -deadline budget is
+# generous against 3 cycles' own rough per-cycle cost (a fresh client
+# handshake, a short ping, one HTTP probe, and a graceful exit-notify stop,
+# each cycle roughly 10-15s including the CYCLE_PAUSE) rather than tuned to
+# one observed run's timing.
+services:
+  client:
+    environment:
+      - CYCLE_COUNT=3
+      - CYCLE_PAUSE=2
+
+  server:
+    command: ["-pki", "/pki", "-listen", "0.0.0.0:1194", "-deadline", "180s", "-soak-cycles", "3"]

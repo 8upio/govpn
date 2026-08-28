@@ -62,6 +62,28 @@ ROUND_INTERVAL="${ROUND_INTERVAL:-0}"
 # fixed within this same task before being committed).
 EXIT_NOTIFY_STOP="${EXIT_NOTIFY_STOP:-0}"
 
+# CYCLE_COUNT/CYCLE_PAUSE (04-04-PLAN.md Task 1) drive the soak test's own
+# connect/use/clean-disconnect cycle loop (run_soak_cycles below): default
+# 1 means "not a soak run" and leaves this script's entire pre-existing
+# single-connection flow (everything below the CYCLE_COUNT branch point)
+# completely unchanged — only docker-compose.soak.yml's client environment
+# sets CYCLE_COUNT above 1. SOAK_PING_COUNT is deliberately separate from
+# the single-connection flow's own PING_COUNT (10 pings, ~10s): a soak
+# cycle's ping is only proving the tunnel is up before the HTTP probe, not
+# exercising a lossy link, so a short 3-count ping keeps 20 cycles' total
+# runtime reasonable. SOAK_FINAL_HOLD is the ceiling run_soak_cycles waits,
+# after its last cycle's client has already exited, for the SERVER's own
+# final measurement and exit to be what triggers
+# --abort-on-container-exit — the same ordering lesson 04-03-SUMMARY.md's
+# Deviations 3-4 record (the SERVER's own exit must be what tears the run
+# down, not a container that happens to exit first): in practice this
+# ceiling is never reached, since compose collapses the whole run within a
+# poll tick of the server's own clean exit.
+CYCLE_COUNT="${CYCLE_COUNT:-1}"
+CYCLE_PAUSE="${CYCLE_PAUSE:-2}"
+SOAK_PING_COUNT="${SOAK_PING_COUNT:-3}"
+SOAK_FINAL_HOLD="${SOAK_FINAL_HOLD:-300}"
+
 CAPTURE_DIR="${CAPTURE_DIR:-/captures}"
 CAPTURE_FILE="${CAPTURE_DIR}/interop.pcap"
 CONFIG="${OVPN_CONFIG:-/pki/client.conf}"
@@ -110,6 +132,90 @@ trap cleanup EXIT INT TERM
 
 # Give tcpdump a moment to attach before the client starts sending.
 sleep 1
+
+# run_soak_cycles (04-04-PLAN.md Task 1) is the soak test's own
+# connect/use/clean-disconnect loop, entirely separate from the
+# single-connection flow below it (guarded by the CYCLE_COUNT branch point
+# just after this function definition) so every pre-existing scenario's
+# behavior stays byte-for-byte unaffected by this function merely existing.
+# Each cycle: start a FRESH openvpn client process, wait for its tun0 to
+# come up, ping the server's tunnel IP (proving the tunnel round-trips
+# before probing it), run exactly one HTTP probe through it
+# (http_landing_c<cycle>, round-suffixed the same way the reneg scenario's
+# http_landing_rN already is — no new parser, only a new suffix
+# convention), issue the graceful stop that transmits the real client's own
+# explicit-exit-notify (OCC_EXIT), wait for that client process to actually
+# exit, then pause CYCLE_PAUSE seconds before starting the next cycle's
+# fresh client process.
+run_soak_cycles() {
+	cycle=1
+	while [ "$cycle" -le "$CYCLE_COUNT" ]; do
+		echo "entrypoint: soak cycle $cycle/$CYCLE_COUNT: starting client"
+		openvpn --config "$CONFIG" &
+		OVPN_PID=$!
+
+		i=0
+		tun_up=0
+		while [ "$i" -lt 30 ]; do
+			if ip addr show tun0 2>/dev/null | grep -q 'inet '; then
+				tun_up=1
+				break
+			fi
+			i=$((i + 1))
+			sleep 1
+		done
+
+		if [ "$tun_up" -eq 1 ]; then
+			echo "entrypoint: soak cycle $cycle/$CYCLE_COUNT: tun0 up, pinging $TUNNEL_SERVER_IP"
+			if ping -c "$SOAK_PING_COUNT" -i 1 -W 2 "$TUNNEL_SERVER_IP" >/dev/null 2>&1; then
+				echo "entrypoint: soak cycle $cycle/$CYCLE_COUNT: ping succeeded"
+			else
+				echo "entrypoint: soak cycle $cycle/$CYCLE_COUNT: ping failed (see above)"
+			fi
+
+			LANDING_BODY=$(curl -s --max-time 10 --retry 2 --retry-all-errors "http://$TUNNEL_SERVER_IP:$HTTP_PORT/" 2>/dev/null || true)
+			if [ -n "$LANDING_BODY" ] && printf '%s' "$LANDING_BODY" | grep -q '<h1>govpn tunnelweb</h1>'; then
+				echo "entrypoint: PROBE http_landing_c${cycle} result=ok marker=found"
+			else
+				echo "entrypoint: PROBE http_landing_c${cycle} result=fail reason=marker_not_found"
+			fi
+		else
+			echo "entrypoint: soak cycle $cycle/$CYCLE_COUNT: tun0 never came up within the wait window; skipping probe"
+			echo "entrypoint: PROBE http_landing_c${cycle} result=fail reason=tun0_not_up"
+		fi
+
+		# Graceful stop: SIGTERM so the real client transmits its own
+		# explicit-exit-notify (client.conf carries the directive via
+		# cmd/gentestpki -client-directive, wired in by the "soak" scenario
+		# entry), then wait for the client process to actually exit before
+		# this cycle counts as complete (04-04-PLAN.md Task 1's own
+		# definition of one cycle) — mirrors 04-03-PLAN.md Task 3's
+		# graceful-stop step, run once per cycle here instead of once at the
+		# very end of the whole script.
+		kill -TERM "$OVPN_PID" 2>/dev/null || true
+		set +e
+		wait "$OVPN_PID"
+		set -e
+		echo "entrypoint: soak cycle $cycle/$CYCLE_COUNT: client exited"
+
+		cycle=$((cycle + 1))
+		if [ "$cycle" -le "$CYCLE_COUNT" ]; then
+			sleep "$CYCLE_PAUSE"
+		fi
+	done
+}
+
+if [ "$CYCLE_COUNT" -gt 1 ]; then
+	run_soak_cycles
+	# Every cycle's client has already exited on its own graceful stop
+	# above; this container must stay alive until the SERVER's own final
+	# measurement and exit is what triggers --abort-on-container-exit (see
+	# SOAK_FINAL_HOLD's own doc comment above) rather than this client
+	# container exiting first and tearing the run down mid-measurement.
+	echo "entrypoint: soak: all $CYCLE_COUNT cycles complete; holding up to ${SOAK_FINAL_HOLD}s for the server's own final measurement and exit"
+	sleep "$SOAK_FINAL_HOLD"
+	exit 0
+fi
 
 # Run the real OpenVPN client in the background (not foreground, unlike
 # before 02-03-PLAN.md Task 1) so this script can drive a ping through the

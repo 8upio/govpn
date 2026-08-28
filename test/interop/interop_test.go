@@ -150,6 +150,22 @@ func repoRoot() (string, error) {
 	return filepath.Abs(filepath.Join(wd, "..", ".."))
 }
 
+// runFlagOnlyTargets reports whether the test binary's own -run flag value
+// is EXACTLY name (04-04-PLAN.md Task 1) — used by TestMain to skip the
+// pre-existing scenarios table's setup when the caller asked for only
+// TestSoak, so that test function's own timeout governs a soak run without
+// also paying for the unrelated scenario table's Docker runs. A simple
+// exact-string check rather than a full -run regexp evaluation: every
+// caller this plan cares about (its own verify commands, the Makefile's
+// `soak` target) passes exactly `-run 'TestSoak'`.
+func runFlagOnlyTargets(name string) bool {
+	f := flag.Lookup("test.run")
+	if f == nil {
+		return false
+	}
+	return f.Value.String() == name
+}
+
 func TestMain(m *testing.M) {
 	// TestMain must parse flags itself before reading -update-golden below
 	// (testing.Main normally parses flags inside m.Run(), too late for
@@ -168,8 +184,20 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	for _, sc := range scenarios {
-		scenarioResults[sc.name] = runScenario(root, interopDir, sc)
+	// TestSoak (04-04-PLAN.md Task 1) drives its own scenario directly,
+	// deliberately outside the scenarios table below — "the soak scenario
+	// is driven by its own test function, not folded into that table"
+	// (04-04-PLAN.md's own key_links). runFlagOnlyTargets guards the
+	// pre-existing scenario table's setup so `go test -run 'TestSoak'`
+	// (this plan's own verify command, and the Makefile's `soak` target)
+	// does not ALSO pay for clean-small/clean-large/lossy-large/reneg's own
+	// several minutes of Docker runs it will never assert against — the
+	// soak gets its own timeout, exactly like every other design constraint
+	// this plan states for it (D-24, T-04-19).
+	if !runFlagOnlyTargets("TestSoak") {
+		for _, sc := range scenarios {
+			scenarioResults[sc.name] = runScenario(root, interopDir, sc)
+		}
 	}
 
 	if *updateGolden {
@@ -1221,4 +1249,104 @@ func logRetransmissionEvidence(t *testing.T, res scenarioResult) {
 		return
 	}
 	t.Logf("retransmission evidence: %d duplicate reliability packet ID occurrences observed in %s — the handshake completed through genuine retransmission, not by chance", duplicates, res.capturePath)
+}
+
+// soakCycleCount must match docker-compose.soak.yml's own hardcoded
+// -soak-cycles/CYCLE_COUNT values exactly (04-04-PLAN.md Task 1) — kept as
+// one named constant here, rather than duplicated across every assertion
+// below, so a future bump to Task 2's full 20 cycles is a one-line change
+// in each of the two places (this constant, and the overlay file) that
+// must agree.
+const soakCycleCount = 3
+
+// soakContextTimeout bounds TestSoak's own `docker compose up` context —
+// generous against soakCycleCount cycles' own rough per-cycle cost (a
+// fresh client handshake, a short ping, one HTTP probe, and a graceful
+// exit-notify stop) rather than tuned to one observed run's timing.
+const soakContextTimeout = 5 * time.Minute
+
+// soakCyclesObservedRe extracts the soak_cycles_observed= field
+// test/interop/server's PASS line carries in soak mode
+// (test/interop/server/main.go's runSoak, 04-04-PLAN.md Task 1).
+var soakCyclesObservedRe = regexp.MustCompile(`soak_cycles_observed=(\d+)`)
+
+// TestSoak is 04-04-PLAN.md's own verification, and ROADMAP Phase 4
+// success criterion 3's proof: a single long-lived server process serves
+// soakCycleCount real connect/use/clean-disconnect cycles from one real,
+// unmodified OpenVPN 2.6 client, every cycle reaching tunnel-up and ending
+// through explicit-exit-notify. It is deliberately its own test function,
+// not folded into the scenarios table TestInteropScenarios drives
+// (04-04-PLAN.md's key_links) — `make test` and `make interop` never
+// invoke it; only `make soak` (04-04-PLAN.md Task 2) does, via its own
+// long timeout.
+func TestSoak(t *testing.T) {
+	root, err := repoRoot()
+	if err != nil {
+		t.Fatalf("resolve repo root: %v", err)
+	}
+	interopDir := filepath.Join(root, "test", "interop")
+
+	if err := os.MkdirAll(filepath.Join(interopDir, "captures"), 0o755); err != nil {
+		t.Fatalf("create captures dir: %v", err)
+	}
+
+	// explicit-exit-notify (via cmd/gentestpki -client-directive, the same
+	// mechanism 04-03-PLAN.md Task 3 established) is what lets each cycle's
+	// clean disconnect close the server's Session promptly through the
+	// existing OCC_EXIT teardown path (04-02-PLAN.md) rather than the 60s
+	// idle-reap timer — without it, 20 cycles in Task 2 would each cost a
+	// full reap window instead of a couple of seconds.
+	sc := scenario{
+		name:             "soak",
+		profile:          "small",
+		composeOverlay:   "docker-compose.soak.yml",
+		contextTimeout:   soakContextTimeout,
+		clientDirectives: []string{"explicit-exit-notify 1"},
+	}
+
+	res := runScenario(root, interopDir, sc)
+	t.Log(res.composeOut)
+
+	if res.composeErr != nil {
+		t.Fatalf("docker compose up did not exit cleanly — see log above: %v", res.composeErr)
+	}
+
+	assertServerStaysUnprivileged(t, res)
+	assertSoakCyclesObserved(t, res, soakCycleCount)
+	assertSoakProbesOK(t, res, soakCycleCount)
+}
+
+// assertSoakCyclesObserved is 04-04-PLAN.md Task 1's core proof: the
+// server's own soak_cycles_observed= PASS-line field must equal EXACTLY
+// want (never merely "at least") — a server that never observed the
+// cycles, or that stopped early on a partial deadline, must fail this
+// assertion rather than passing vacuously (T-04-18, this plan's own threat
+// register).
+func assertSoakCyclesObserved(t *testing.T, res scenarioResult, want int) {
+	t.Helper()
+
+	m := soakCyclesObservedRe.FindStringSubmatch(res.composeOut)
+	if m == nil {
+		t.Fatal("server output does not contain a parsable soak_cycles_observed= field — see log above")
+	}
+	got, err := strconv.Atoi(m[1])
+	if err != nil {
+		t.Fatalf("parse soak_cycles_observed=%q: %v", m[1], err)
+	}
+	if got != want {
+		t.Fatalf("server output reports soak_cycles_observed=%d, want exactly %d — see log above", got, want)
+	}
+	t.Logf("server observed %d soak cycles", got)
+}
+
+// assertSoakProbesOK requires every cycle's own http_landing_cN probe
+// (entrypoint.sh's run_soak_cycles) to report result=ok, proving each
+// cycle actually reached a working tunnel and not merely that the server
+// counted an open/close pair.
+func assertSoakProbesOK(t *testing.T, res scenarioResult, cycles int) {
+	t.Helper()
+
+	for i := 1; i <= cycles; i++ {
+		assertProbe(t, res, fmt.Sprintf("http_landing_c%d", i), true)
+	}
 }

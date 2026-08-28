@@ -31,6 +31,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -116,7 +117,21 @@ func main() {
 	udpPort := flag.Uint("udp-port", 9999, "UDP port the echo service listens on, over the netstack (03-06-PLAN.md Task 2)")
 	renegSec := flag.Duration("reneg-sec", 0, "this server's own renegotiation deadline (ovpn.Config.RenegSec); 0 means the library's own 3600s default (04-03-PLAN.md Task 1)")
 	hold := flag.Duration("hold", 0, "extra survival time the server waits AFTER waitForProbes' normal probe-driven trigger fires, before printing PASS and exiting; 0 means no extension (the pre-existing scenarios' unchanged behavior) — gives a shortened -reneg-sec's timer room to actually fire before the server tears the run down (04-03-PLAN.md Task 1)")
+	soakCycles := flag.Int("soak-cycles", 0, "number of connect/use/clean-disconnect cycles to observe from ONE long-lived server process before printing PASS and exiting; 0 keeps every pre-existing scenario's normal single-session, probe-driven behavior completely unchanged (04-04-PLAN.md Task 1)")
 	flag.Parse()
+
+	// Soak mode (04-04-PLAN.md Task 1) is dispatched to its own entry point,
+	// runSoak, entirely separate from run() below: run()'s single-OnSession,
+	// probe-driven survival window (waitForProbes) is left byte-for-byte
+	// untouched for every non-soak scenario, rather than threading a branch
+	// through its tightly-coupled single-session channel/select logic.
+	if *soakCycles > 0 {
+		if err := runSoak(*pkiDir, *listenAddr, *deadline, uint16(*httpPort), uint16(*udpPort), *soakCycles); err != nil {
+			fmt.Fprintln(os.Stderr, "interop-server:", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if err := run(*pkiDir, *listenAddr, *deadline, *dropRate, *reorderRate, *reorderDelay, *seed, uint16(*httpPort), uint16(*udpPort), *renegSec, *hold); err != nil {
 		fmt.Fprintln(os.Stderr, "interop-server:", err)
@@ -402,6 +417,218 @@ func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorder
 		<-serveErr
 		return fmt.Errorf("timed out after %s waiting for the TLS handshake to complete; last observed protocol state: %s", deadline, obs.lastObservedSummary())
 	}
+}
+
+// soakPollInterval is how often runSoak polls each open session's own
+// sessionCloseObserver for its close, and how often it would otherwise be
+// checking cycle-completion state (04-04-PLAN.md Task 1) — the same
+// granularity 04-03-PLAN.md Task 3's -hold reactive loop already
+// established for detecting a session close promptly without adding a
+// second concurrent reader of the underlying *ovpn.Session (Session.Read's
+// documented single-reader contract).
+const soakPollInterval = 200 * time.Millisecond
+
+// soakTracker counts cycles opened/closed during a soak run and records
+// each cycle's assigned tunnel IP in close order, so runSoak's PASS line
+// can report soak_cycles_observed= (this task) and, from 04-04-PLAN.md
+// Task 2 onward, feed the pool-reuse assertion something to parse. A
+// session's close is detected by polling its own sessionCloseObserver
+// (04-03-PLAN.md Task 3's own precedent), never by adding a second reader
+// of the *ovpn.Session.
+type soakTracker struct {
+	cycles int
+
+	mu     sync.Mutex
+	opens  int
+	closes int
+	ips    []string
+
+	// allClosed closes exactly once, when the configured cycle count has
+	// been observed opened AND subsequently closed.
+	allClosed chan struct{}
+}
+
+func newSoakTracker(cycles int) *soakTracker {
+	return &soakTracker{cycles: cycles, allClosed: make(chan struct{})}
+}
+
+// opened records a newly-established session and returns its 1-based
+// cycle number.
+func (s *soakTracker) opened() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.opens++
+	return s.opens
+}
+
+func (s *soakTracker) openedCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.opens
+}
+
+func (s *soakTracker) closedCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closes
+}
+
+// ipHistory returns the assigned tunnel IPs in the order each cycle's
+// session was observed CLOSED (not opened) — the order 04-04-PLAN.md
+// Task 2's pool-reuse assertion cares about, since it is Close releasing
+// the IP back to the pool that this soak run exists to prove.
+func (s *soakTracker) ipHistory() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.ips...)
+}
+
+// watchClose polls obs until this cycle's session close is observed, then
+// records it — appending the assigned IP to ips and, once every configured
+// cycle has been observed closed, closing allClosed exactly once (a second
+// close of an already-closed channel would panic, so this path only runs
+// once per soak run by construction: s.closes only ever increments here,
+// under s.mu, and the done check happens in the same critical section as
+// the increment that could make it true).
+func (s *soakTracker) watchClose(cycleNum int, obs *sessionCloseObserver) {
+	ticker := time.NewTicker(soakPollInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		if _, closed := obs.observedClose(); closed {
+			ip := obs.sess.AssignedIP().String()
+
+			s.mu.Lock()
+			s.closes++
+			s.ips = append(s.ips, ip)
+			done := s.closes == s.cycles
+			s.mu.Unlock()
+
+			log.Printf("soak cycle %d/%d: session closed (Read observed io.EOF) assigned_ip=%s", cycleNum, s.cycles, ip)
+
+			if done {
+				close(s.allClosed)
+			}
+			return
+		}
+	}
+}
+
+// runSoak is the harness's soak-mode entry point (04-04-PLAN.md Task 1):
+// instead of run()'s single OnSession firing once against a probe-driven
+// survival window, the server's survival condition becomes "cycles
+// sessions have been opened and subsequently observed closed" — proving
+// that dead sessions do not accumulate across many real connect/use/clean-
+// disconnect cycles from ONE long-lived server process (ROADMAP Phase 4
+// success criterion 3). run() above is left completely untouched; every
+// non-soak scenario's behavior is unaffected by this function's existence.
+func runSoak(pkiDir, listenAddr string, deadline time.Duration, httpPort, udpPort uint16, cycles int) error {
+	tlsCfg, tlsCryptKey, err := loadConfig(pkiDir)
+	if err != nil {
+		return fmt.Errorf("load PKI material: %w", err)
+	}
+
+	pc, err := net.ListenPacket("udp", listenAddr)
+	if err != nil {
+		return fmt.Errorf("listen udp %s: %w", listenAddr, err)
+	}
+	obs := newObservingConn(pc)
+
+	// The same throwaway tunnel-IP range run() uses (02-02-PLAN.md D-01):
+	// whatever the server pushes here is exactly what each cycle's client
+	// tun interface ends up configured with, and — because Close releases
+	// the allocation back to the pool (WR-04) — is exactly what Task 2's
+	// pool-reuse assertion expects to see repeat across cycles rather than
+	// climb.
+	_, tunnelNetwork, err := net.ParseCIDR("10.8.0.0/24")
+	if err != nil {
+		return fmt.Errorf("parse tunnel network: %w", err)
+	}
+
+	stack, err := netstack.New(firstHostIP(tunnelNetwork))
+	if err != nil {
+		return fmt.Errorf("create netstack: %w", err)
+	}
+	defer stack.Close()
+
+	httpLn, err := stack.ListenTCP(httpPort)
+	if err != nil {
+		return fmt.Errorf("listen tcp %d over netstack: %w", httpPort, err)
+	}
+	defer httpLn.Close()
+
+	var httpRequests atomic.Int64
+	instrumented := newRequestCountingHandler(site.Handler(site.Options{
+		Cipher:    "AES-256-GCM",
+		StartedAt: time.Now(),
+	}), &httpRequests)
+	httpSrv := newHardenedHTTPServer(instrumented)
+	go func() {
+		if serveErr := httpSrv.Serve(httpLn); serveErr != nil {
+			log.Printf("soak: tunnelweb http.Serve exited: %v", serveErr)
+		}
+	}()
+
+	udpConn, err := stack.ListenUDP(udpPort)
+	if err != nil {
+		return fmt.Errorf("listen udp %d over netstack: %w", udpPort, err)
+	}
+	defer udpConn.Close()
+	var udpRx, udpTx atomic.Int64
+	go runUDPEcho(udpConn, &udpRx, &udpTx)
+
+	tracker := newSoakTracker(cycles)
+
+	srv := ovpn.NewServer(ovpn.Config{
+		TLSConfig:   tlsCfg,
+		TLSCryptKey: tlsCryptKey,
+		Network:     tunnelNetwork,
+		Cipher:      "AES-256-GCM",
+		OnSession: func(sess *ovpn.Session) {
+			cycleNum := tracker.opened()
+			log.Printf("soak cycle %d/%d: session established assigned_ip=%s peer_id=%d", cycleNum, cycles, sess.AssignedIP(), sess.PeerID())
+
+			// closeObs wraps sess purely to time when netstack's own single
+			// read-loop goroutine (Attach's documented one-reader contract)
+			// observes Read returning a non-nil error — this cycle's client
+			// explicit-exit-notify closing the session (04-03-PLAN.md
+			// Task 3's own precedent, reused verbatim here).
+			closeObs := newSessionCloseObserver(sess)
+			if err := stack.Attach(closeObs, sess.AssignedIP()); err != nil {
+				log.Printf("warning: soak cycle %d: netstack attach failed for %s: %v", cycleNum, sess.AssignedIP(), err)
+			}
+
+			go tracker.watchClose(cycleNum, closeObs)
+		},
+	})
+
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(obs) }()
+
+	select {
+	case err := <-serveErr:
+		return fmt.Errorf("Serve exited unexpectedly during the soak run: %v", err)
+	case <-tracker.allClosed:
+		// Every configured cycle's session was observed opened and then
+		// closed — the soak's own survival condition (04-04-PLAN.md Task 1),
+		// in place of run()'s probe-driven waitForProbes.
+	case <-time.After(deadline):
+		_ = srv.Close()
+		<-serveErr
+		return fmt.Errorf(
+			"soak timed out after %s waiting for %d cycles to complete; observed %d opened, %d closed",
+			deadline, cycles, tracker.openedCount(), tracker.closedCount(),
+		)
+	}
+
+	ips := tracker.ipHistory()
+	log.Printf(
+		"PASS: soak completed soak_cycles_observed=%d soak_ips=%s http_requests=%d udp_rx=%d udp_tx=%d",
+		tracker.closedCount(), strings.Join(ips, ","), httpRequests.Load(), udpRx.Load(), udpTx.Load(),
+	)
+
+	_ = srv.Close()
+	<-serveErr
+	return nil
 }
 
 // waitForProbes blocks until all three probe classes (ICMP echo, UDP
