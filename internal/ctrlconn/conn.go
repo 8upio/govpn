@@ -75,6 +75,13 @@ type Conn struct {
 	remoteAddr net.Addr
 	clock      reliable.Clock
 
+	// keyID is this Conn's own TLS key-id (0..7, ssl_pkt.h:38
+	// P_KEY_ID_MASK), stamped into every outgoing header byte this Conn
+	// builds (buildControlPacket). Always 0 for a Conn built via New; a
+	// renegotiated key-id's Conn is built via NewWithKeyID instead
+	// (04-01-PLAN.md Task 1 action 4).
+	keyID uint8
+
 	sendRel *reliable.Reliable
 	recvRel *reliable.Reliable
 	acks    reliable.AckSet
@@ -92,13 +99,27 @@ type Conn struct {
 
 var _ net.Conn = (*Conn)(nil)
 
-// New builds a Conn for one client session. localSID/remoteSID are this
-// side's own and its peer's 8-byte control-channel session IDs. wrapper is
-// the session's own tls-crypt state (see internal/tlscrypt's per-session
-// Wrapper decision — a Conn never shares a Wrapper across sessions).
-// transport is used to send wire-format datagrams to remoteAddr. If clock
-// is nil, reliable.SystemClock is used.
+// New builds a Conn for one client session at key-id 0 — see NewWithKeyID,
+// which this is a thin delegate onto, so no existing caller or test
+// changes (04-01-PLAN.md Task 1 action 4).
 func New(localSID, remoteSID wire.SessionID, wrapper *tlscrypt.Wrapper, transport Transport, remoteAddr net.Addr, clock reliable.Clock) *Conn {
+	return NewWithKeyID(localSID, remoteSID, wrapper, transport, remoteAddr, clock, 0)
+}
+
+// NewWithKeyID is New, parameterized by this Conn's own TLS key-id. Every
+// outgoing header byte this Conn builds carries keyID instead of a
+// hardcoded 0 (buildControlPacket) — the renegotiation driver
+// (ovpn.go's beginRenegotiation/startRenegotiation) uses this to build a
+// second Conn, at the incremented key-id, over the SAME session-wide
+// tls-crypt wrapper and session IDs the original Conn already uses
+// (04-RESEARCH.md Pattern 3). localSID/remoteSID are this side's own and
+// its peer's 8-byte control-channel session IDs — unchanged across a
+// renegotiation. wrapper is the session's own tls-crypt state (see
+// internal/tlscrypt's per-session Wrapper decision — a Conn never
+// allocates a fresh Wrapper, it reuses the session's one). transport is
+// used to send wire-format datagrams to remoteAddr. If clock is nil,
+// reliable.SystemClock is used.
+func NewWithKeyID(localSID, remoteSID wire.SessionID, wrapper *tlscrypt.Wrapper, transport Transport, remoteAddr net.Addr, clock reliable.Clock, keyID uint8) *Conn {
 	if clock == nil {
 		clock = reliable.SystemClock{}
 	}
@@ -109,6 +130,7 @@ func New(localSID, remoteSID wire.SessionID, wrapper *tlscrypt.Wrapper, transpor
 		transport:  transport,
 		remoteAddr: remoteAddr,
 		clock:      clock,
+		keyID:      keyID,
 		sendRel:    reliable.New(clock, reliable.NSendBuffers),
 		recvRel:    reliable.New(clock, reliable.NRecBuffers),
 		closeCh:    make(chan struct{}),
@@ -313,7 +335,7 @@ func (c *Conn) buildControlPacket(opcode wire.Opcode, id reliable.PacketID, payl
 	}
 	cp := wire.ControlPacket{
 		Opcode:          opcode,
-		KeyID:           0,
+		KeyID:           c.keyID,
 		SessionID:       c.localSID,
 		Acks:            wireAcks,
 		RemoteSessionID: c.remoteSID,
@@ -322,7 +344,7 @@ func (c *Conn) buildControlPacket(opcode wire.Opcode, id reliable.PacketID, payl
 	}
 	plaintext := cp.AppendPlaintext(nil)
 
-	header := wire.AppendHeaderByte(make([]byte, 0, 1+wire.SessionIDSize), opcode, 0)
+	header := wire.AppendHeaderByte(make([]byte, 0, 1+wire.SessionIDSize), opcode, c.keyID)
 	header = append(header, c.localSID[:]...)
 
 	return c.wrapper.Wrap(nil, header, plaintext)

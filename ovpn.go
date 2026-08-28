@@ -112,11 +112,17 @@ const (
 	// link (D-06) rather than backing up handleDatagram.
 	ipInboundQueueSize = 32
 
-	// dataChannelKeyID is the TLS key slot ID written into every data
-	// packet's header. Always 0 in v1: there is no renegotiation
-	// (SESS-04, Phase 4), so every session ever has exactly one data-
-	// channel key slot.
-	dataChannelKeyID = 0
+	// keyIDMask masks a TLS key-id to its 3-bit wire range (P_KEY_ID_MASK =
+	// 0x07, ssl_pkt.h:38) before any comparison — a key-id is
+	// attacker-supplied on the wire until validated against nextKeyID's own
+	// local computation (Pitfall 4).
+	keyIDMask = 0x07
+
+	// transitionWindow is how long a demoted (lame-duck) key stays
+	// decryptable after a renegotiation (D-18).
+	// Source: options.c:881 (--tran-window default, o->transition_window
+	// = 3600).
+	transitionWindow = 3600 * time.Second
 
 	// pingIntervalSeconds is the fixed v1 keepalive schedule (D-11):
 	// push.go's buildPushReply pushes `ping N` using this exact value, and
@@ -127,6 +133,20 @@ const (
 	pingIntervalSeconds = 10
 	pingInterval        = pingIntervalSeconds * time.Second
 )
+
+// nextKeyID computes the next TLS key-id in the renegotiation sequence:
+// incrementing mod 8 (keyIDMask), but skipping back to 1 rather than 0 — 0
+// is reserved for a session's very first key.
+// Source: ssl.c:990-1002 ("key_id increments to KEY_ID_MASK then recycles
+// back to 1 ... if key_id is 0, it is the first key"), ssl_pkt.h:38
+// (P_KEY_ID_MASK = 0x07).
+func nextKeyID(current uint8) uint8 {
+	next := (current + 1) & keyIDMask
+	if next == 0 {
+		next = 1
+	}
+	return next
+}
 
 // serverKM2Options is the options string this server sends in its own Key
 // Method 2 message. Per RESEARCH.md Pitfall 4, options_cmp_equal
@@ -169,6 +189,13 @@ type Server struct {
 	// pool fails and is closed before OnSession fires (see
 	// performPushExchange).
 	pool *ipPool
+
+	// clock is a test-only override for every new Session's own clock
+	// field (Session.now, the reneg-sec timer, lame-duck mustDie, and the
+	// reneg-flood rate limit). nil in production, meaning
+	// reliable.SystemClock{}; only ever set directly by a test constructing
+	// a *Server by hand (never via NewServer/Config).
+	clock reliable.Clock
 
 	mu       sync.Mutex
 	pc       net.PacketConn
@@ -370,6 +397,7 @@ func (s *Server) handleDatagram(pc net.PacketConn, addr net.Addr, packet []byte)
 			wrapper:         wrapper,
 			key:             key,
 			srv:             s,
+			clock:           s.clock,
 			inbound:         make(chan wire.ControlPacket, inboundQueueSize),
 			doneCh:          make(chan struct{}),
 			stopCh:          make(chan struct{}),
@@ -430,6 +458,16 @@ func (s *Server) handleDatagram(pc net.PacketConn, addr net.Addr, packet []byte)
 		return
 	}
 
+	// A SOFT_RESET_V1 for an already-established session starts a
+	// renegotiation instead of flowing through the ordinary inbound queue:
+	// it must be intercepted here, before pump ever sees it, because
+	// beginRenegotiation may need to publish a brand-new Conn for the new
+	// key-id before pump can route to it (04-01-PLAN.md Task 1 action 6).
+	if opcode == wire.OpControlSoftResetV1 {
+		s.beginRenegotiation(sess, cp, addr, pc)
+		return
+	}
+
 	// Every subsequent datagram for an already-established session is fed
 	// into this session's own serialized pump, which calls conn.Deliver
 	// for each in the order handleDatagram enqueued them.
@@ -475,14 +513,23 @@ func (s *Server) handleDataDatagram(opcode wire.Opcode, packet []byte) {
 	sess.handleDataPacket(packet)
 }
 
-// pump serializes delivery of this session's inbound control packets into
-// its control-channel Conn, one at a time, in the order handleDatagram
-// enqueued them, until stopCh is closed by Session.Close.
+// pump serializes delivery of this session's inbound control packets, one
+// at a time, in the order handleDatagram enqueued them, until stopCh is
+// closed by Session.Close. Each packet is routed to the Conn matching its
+// own key-id (sess.routeControlPacket) — the initial handshake's Conn, the
+// current primary slot's Conn, a still-live lame-duck Conn, or a
+// renegotiation-in-flight Conn — so the old flight's ACKs still reach the
+// old Conn during a lame-duck window (04-RESEARCH.md key_link). A packet
+// whose key-id matches none of those is silently dropped, matching the
+// non-blocking-queue drop discipline already used throughout this package
+// (Pitfall 4: an unrecognized key-id is never trusted or acted on).
 func (sess *Session) pump() {
 	for {
 		select {
 		case cp := <-sess.inbound:
-			sess.conn.Deliver(cp)
+			if target := sess.routeControlPacket(cp.KeyID); target != nil {
+				target.Deliver(cp)
+			}
 		case <-sess.stopCh:
 			return
 		}
@@ -612,7 +659,12 @@ func (s *Server) performPushExchange(sess *Session, w io.Writer) error {
 			// atomic step gated on that single check, instead of leaving
 			// gaps between separately-published pieces of state for
 			// enforceHandshakeWindow's Close to land in.
-			dataWrapper, err := datachan.NewWrapper(sess.dataKeys.ServerSlots(), peerID, dataChannelKeyID)
+			// Key-id 0 is always this session's very first key
+			// (ssl.c:990-1002: "if key_id is 0, it is the first key") —
+			// D-25 retired the old dataChannelKeyID constant once
+			// renegotiation (SESS-04) made the key-id a per-slot value
+			// rather than a session-wide constant.
+			dataWrapper, err := datachan.NewWrapper(sess.dataKeys.ServerSlots(), peerID, 0)
 			if err != nil {
 				s.pool.release(ip, peerID)
 				return fmt.Errorf("ovpn: build data-channel wrapper: %w", err)
@@ -653,7 +705,12 @@ func (s *Server) performPushExchange(sess *Session, w io.Writer) error {
 			}
 			sess.assignedIP = ip
 			sess.peerID = peerID
-			sess.dataWrapper = dataWrapper
+			sess.primary = keySlot{
+				keyID:       0,
+				conn:        sess.conn,
+				wrapper:     dataWrapper,
+				established: sess.now(),
+			}
 			sess.ipInbound = ipInbound
 			s.mu.Lock()
 			s.dataSessions[peerID] = sess
@@ -684,30 +741,31 @@ func (s *Server) performPushExchange(sess *Session, w io.Writer) error {
 	}
 }
 
-// performKeyMethod2Exchange runs the Key Method 2 exchange over tlsConn,
-// matching the reference server's own state-machine branch (tls_process,
-// ssl.c:3002-3031: server is "Receive Key" at S_START, "Send Key" at
-// S_GOT_KEY — the opposite order from the client, which already wrote its
-// own message immediately after its handshake completed, per 01-03's
-// documented deferral). It wraps tlsConn in a bufio.Reader retained on
-// sess.tlsReader (D-15) so plan 02-02's PUSH_REQUEST continuation reads
-// from the same buffered stream rather than losing bytes to a second
-// reader. On success, sess.dataKeys holds the derived 256-byte key
-// expansion.
-func (s *Server) performKeyMethod2Exchange(sess *Session, tlsConn *tls.Conn) error {
-	sess.tlsReader = bufio.NewReader(tlsConn)
+// deriveKeyMethod2 runs the Key Method 2 exchange over tlsConn and returns
+// the resulting bufio.Reader (wrapping tlsConn, having consumed exactly the
+// client's Key Method 2 message) and the derived key expansion, plus the
+// raw client/server seed material for diagnostics — the shared core both
+// performKeyMethod2Exchange (initial handshake) and runRenegotiation (soft
+// reset) call, so a renegotiation's key derivation can never subtly diverge
+// from the initial handshake's own (04-01-PLAN.md Task 1 action 7).
+// clientSID/serverSID are the SAME control-channel session IDs for both
+// callers — they never change across a soft reset (04-RESEARCH.md
+// Pattern 3). Matches the reference server's own state-machine branch
+// (tls_process, ssl.c:3002-3031: server is "Receive Key" at S_START, "Send
+// Key" at S_GOT_KEY — the opposite order from the client, which already
+// wrote its own message immediately after its handshake completed).
+func (s *Server) deriveKeyMethod2(tlsConn *tls.Conn, clientSID, serverSID wire.SessionID) (*bufio.Reader, *keyderiv.Key2, *keyderiv.KeySource, *keyderiv.KeySource, error) {
+	tlsReader := bufio.NewReader(tlsConn)
 
-	clientKM, _, err := keyderiv.ReadClientKeyMethod2(sess.tlsReader)
+	clientKM, _, err := keyderiv.ReadClientKeyMethod2(tlsReader)
 	if err != nil {
-		return fmt.Errorf("ovpn: read client Key Method 2: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("ovpn: read client Key Method 2: %w", err)
 	}
-	sess.clientKM = clientKM
 
 	serverKM, err := keyderiv.WriteServerKeyMethod2(tlsConn, serverKM2Options)
 	if err != nil {
-		return fmt.Errorf("ovpn: write server Key Method 2: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("ovpn: write server Key Method 2: %w", err)
 	}
-	sess.serverKM = serverKM
 
 	src := &keyderiv.KeySource2{
 		Client: *clientKM,
@@ -719,11 +777,30 @@ func (s *Server) performKeyMethod2Exchange(sess *Session, tlsConn *tls.Conn) err
 	// serverSID = our own — ssl.c:1586-1589); the pointer conversions
 	// below are between types with identical underlying [8]byte layout,
 	// no new session-ID concept is introduced.
-	dataKeys, err := keyderiv.DeriveKeys(src, (*[8]byte)(&sess.clientSessionID), (*[8]byte)(&sess.SessionID))
+	dataKeys, err := keyderiv.DeriveKeys(src, (*[8]byte)(&clientSID), (*[8]byte)(&serverSID))
 	if err != nil {
-		return fmt.Errorf("ovpn: derive data-channel keys: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("ovpn: derive data-channel keys: %w", err)
 	}
+	return tlsReader, dataKeys, clientKM, serverKM, nil
+}
+
+// performKeyMethod2Exchange runs deriveKeyMethod2 for the initial handshake
+// and writes its results onto sess: sess.tlsReader (D-15, so plan
+// 02-02's PUSH_REQUEST continuation reads from the same buffered stream
+// rather than losing bytes to a second reader), sess.dataKeys,
+// sess.clientKM, and sess.serverKM. The renegotiation path
+// (runRenegotiation) calls deriveKeyMethod2 directly instead and never
+// touches sess.tlsReader (D-15's single-buffered-reader contract stays
+// scoped to the initial handshake).
+func (s *Server) performKeyMethod2Exchange(sess *Session, tlsConn *tls.Conn) error {
+	tlsReader, dataKeys, clientKM, serverKM, err := s.deriveKeyMethod2(tlsConn, sess.clientSessionID, sess.SessionID)
+	if err != nil {
+		return err
+	}
+	sess.tlsReader = tlsReader
 	sess.dataKeys = dataKeys
+	sess.clientKM = clientKM
+	sess.serverKM = serverKM
 	return nil
 }
 
@@ -746,6 +823,153 @@ func (s *Server) callOnSession(sess *Session) {
 		}
 	}()
 	s.cfg.OnSession(sess)
+}
+
+// startRenegotiation validates it is safe to begin a new key-id's handshake
+// (session not closing, primary slot fully established, no renegotiation
+// already in flight — ssl.c:3882-3900's S_GENERATED_KEYS gate), builds the
+// new key-id's ctrlconn.Conn over the SAME session-wide tls-crypt wrapper
+// and session IDs (Pattern 3, Anti-Pattern 1: never a fresh
+// tlscrypt.Wrapper), and publishes it into sess.pendingReneg so pump can
+// route to it immediately. This is the shared body beginRenegotiation (the
+// client-triggered receive path) and, from plan 04-01 Task 2 onward,
+// runReneg (the server-initiated send path) both call, so the two sides'
+// key-id counters can never drift apart by growing separately-maintained
+// copies.
+//
+// If hasWantKeyID is true, wantKeyID must equal the locally-computed next
+// key-id or startRenegotiation refuses (T-04-02, ssl.c:3983-3990) — the
+// receive path has a peer-supplied key-id to validate; the send path
+// (hasWantKeyID false) computes and uses the next key-id unconditionally,
+// since it has no peer-supplied value to check.
+func (s *Server) startRenegotiation(sess *Session, pc net.PacketConn, addr net.Addr, wantKeyID uint8, hasWantKeyID bool) (*ctrlconn.Conn, uint8, bool) {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+
+	if sess.closing() {
+		return nil, 0, false
+	}
+	if sess.primary.conn == nil || sess.primary.established.IsZero() {
+		// The reference only allows renegotiation once the previous key is
+		// fully established (ssl.c:3882-3900, S_GENERATED_KEYS) — refuse
+		// rather than renegotiate a session that hasn't finished its
+		// initial handshake yet.
+		return nil, 0, false
+	}
+	if sess.pendingReneg != nil {
+		// A renegotiation is already in flight — the in-flight one wins
+		// (D-17 "first to fire wins"); the timer tick or a second
+		// SOFT_RESET_V1 is a no-op.
+		return nil, 0, false
+	}
+
+	next := nextKeyID(sess.primary.keyID)
+	if hasWantKeyID && wantKeyID != next {
+		// Hard error, never trusted from the peer (ssl.c:3983-3990): drop
+		// and leave every field of the session untouched — no partial
+		// state, no counter advance, no new allocation.
+		return nil, 0, false
+	}
+
+	transport := packetConnTransport{pc: pc}
+	newConn := ctrlconn.NewWithKeyID(sess.SessionID, sess.clientSessionID, sess.wrapper, transport, addr, nil, next)
+	sess.pendingReneg = newConn
+	sess.pendingRenegKeyID = next
+	sess.lastRenegAccepted = sess.now()
+	return newConn, next, true
+}
+
+// beginRenegotiation is the receive-side half of D-17's bidirectional
+// renegotiation: an incoming P_CONTROL_SOFT_RESET_V1 for an established
+// session starts a new handshake at the locally-computed next key-id,
+// mirroring the reference's own receive-side symmetric reset
+// (ssl.c:3882-3900). The reply IS the ack for the client's request — the
+// same single-atomic-step discipline the initial hard reset already uses
+// (ovpn.go:429/DeliverAndRespond) — mirroring the reference's own
+// session_move_pre_start, whose first outgoing packet for a new key-id
+// carries the SAME opcode as the state transition that created it
+// (ssl.c:989, 2594).
+func (s *Server) beginRenegotiation(sess *Session, cp wire.ControlPacket, addr net.Addr, pc net.PacketConn) {
+	newConn, keyID, ok := s.startRenegotiation(sess, pc, addr, cp.KeyID, true)
+	if !ok {
+		return
+	}
+	_ = newConn.DeliverAndRespond(cp, wire.OpControlSoftResetV1, nil)
+	go s.runRenegotiation(sess, newConn, keyID)
+}
+
+// runRenegotiation drives one renegotiation's TLS handshake and Key
+// Method 2 exchange to completion over newConn (built by
+// startRenegotiation at keyID), then atomically swaps it in as the new
+// primary slot — mirroring runHandshake but STOPPING after Key Method 2
+// (Pattern 4/Anti-Pattern 2): no performPushExchange, no pool.allocate, no
+// OnSession, no write to sess.assignedIP or sess.peerID. A failed handshake
+// or a session that started closing mid-flight abandons the attempt: the
+// OLD primary key stays live and usable, exactly as if the renegotiation
+// had never been attempted (T-04-04).
+func (s *Server) runRenegotiation(sess *Session, newConn *ctrlconn.Conn, keyID uint8) {
+	abandon := func() {
+		sess.mu.Lock()
+		if sess.pendingReneg == newConn {
+			sess.pendingReneg = nil
+		}
+		sess.mu.Unlock()
+		_ = newConn.Close()
+	}
+
+	tlsConn := tls.Server(newConn, s.cfg.TLSConfig)
+	if err := tlsConn.Handshake(); err != nil {
+		abandon()
+		return
+	}
+
+	_, dataKeys, _, _, err := s.deriveKeyMethod2(tlsConn, sess.clientSessionID, sess.SessionID)
+	if err != nil {
+		abandon()
+		return
+	}
+
+	sess.mu.Lock()
+	if sess.closing() {
+		sess.mu.Unlock()
+		_ = newConn.Close()
+		return
+	}
+
+	newWrapper, err := datachan.NewWrapper(dataKeys.ServerSlots(), sess.peerID, keyID)
+	if err != nil {
+		sess.mu.Unlock()
+		_ = newConn.Close()
+		return
+	}
+
+	// Mirror ssl.c:1926-1945 exactly: free whatever is currently in the
+	// lame-duck slot (its Close is idempotent even if the expiry sweep
+	// already closed it) before the current primary takes its place —
+	// never leave two live lame-duck generations dangling.
+	oldLameDuckConn := sess.lameDuck.conn
+	sess.lameDuck = sess.primary
+	sess.lameDuck.mustDie = sess.now().Add(transitionWindow)
+	if oldLameDuckConn != nil {
+		_ = oldLameDuckConn.Close()
+	}
+
+	sess.primary = keySlot{
+		keyID:       keyID,
+		conn:        newConn,
+		wrapper:     newWrapper,
+		established: sess.now(),
+	}
+	// dataKeys backs DebugDataKeys, a debug-only accessor that should
+	// reflect the newest key (04-01-PLAN.md Task 1 action 7).
+	sess.dataKeys = dataKeys
+	if sess.pendingReneg == newConn {
+		sess.pendingReneg = nil
+	}
+	sess.mu.Unlock()
+
+	// dataSessions is keyed on peerID, which does not change across a
+	// renegotiation (D-16) — no routing-table write is needed here.
 }
 
 // enforceHandshakeWindow tears sess down and releases its state if the

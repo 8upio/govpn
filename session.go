@@ -14,9 +14,45 @@ import (
 	"github.com/8upio/govpn/internal/ctrlconn"
 	"github.com/8upio/govpn/internal/datachan"
 	"github.com/8upio/govpn/internal/keyderiv"
+	"github.com/8upio/govpn/internal/reliable"
 	"github.com/8upio/govpn/internal/tlscrypt"
 	"github.com/8upio/govpn/internal/wire"
 )
+
+// keySlot holds one TLS key-id's live data-channel state — the reference's
+// own two-slot key_state[KS_PRIMARY]/key_state[KS_LAME_DUCK] design
+// (ssl_common.h:448-451), modeled here as two named Session fields
+// (primary/lameDuck below) rather than a map (04-01-PLAN.md's
+// Claude's-discretion note: the reference itself never holds more than two
+// live slots per session).
+type keySlot struct {
+	// keyID is this slot's TLS key-id: 0 for a session's very first key,
+	// nextKeyID's 1..7 range thereafter (ssl.c:990-1002).
+	keyID uint8
+
+	// conn is this slot's own control-channel Conn: for the primary slot,
+	// the Conn its TLS handshake ran over; for the lame-duck slot, the
+	// demoted former-primary Conn, kept alive only so any of its own
+	// still-in-flight retransmits/ACKs can complete until it is closed.
+	conn *ctrlconn.Conn
+
+	// wrapper is this slot's AES-256-GCM data-channel Wrapper. nil for the
+	// primary slot until ovpn.go's performPushExchange (or a later
+	// runRenegotiation) publishes it; nil for the lame-duck slot whenever
+	// there has been no renegotiation yet.
+	wrapper *datachan.Wrapper
+
+	// established is when this slot's keys went live — the reneg-sec
+	// deadline base (ssl.c:3098-3114's ks->established).
+	established time.Time
+
+	// mustDie is the zero value for a slot that has never been demoted
+	// ("never expires"); set only when this slot is demoted into lameDuck,
+	// to now+transitionWindow (ssl.c:1932, ssl.c:1297-1322). Never extended
+	// once set — a late-arriving or rejected renegotiation must not buy the
+	// old key more time (Pitfall 5).
+	mustDie time.Time
+}
 
 // Session represents an established, TLS-authenticated client connection:
 // the value Config.OnSession is invoked with, exactly once per client, and
@@ -145,12 +181,14 @@ type Session struct {
 	// goroutine.
 	pushRequested atomic.Bool
 
-	// mu guards assignedIP, peerID, and dataWrapper below (WR-03):
-	// ovpn.go's performPushExchange (running on this session's own
-	// runHandshake goroutine) writes them, while Close — which
-	// enforceHandshakeWindow's timeout goroutine can invoke concurrently
-	// at any point until sess.doneCh closes, i.e. for the entire duration
-	// of performPushExchange — reads them. Without this lock those are an
+	// mu guards assignedIP, peerID, primary, lameDuck, pendingReneg,
+	// pendingRenegKeyID, and lastRenegAccepted below (WR-03, extended by
+	// 04-01-PLAN.md Task 1 from the single dataWrapper field it originally
+	// guarded to this phase's two-slot key state): ovpn.go's
+	// performPushExchange and runRenegotiation (running on this session's
+	// own goroutines) write them, while Close — which
+	// enforceHandshakeWindow's timeout goroutine can invoke concurrently at
+	// any point — reads them. Without this lock those are an
 	// unsynchronized concurrent read/write of the same memory from two
 	// goroutines, undefined under the Go memory model. Every other field
 	// in this struct has its own, already-established discipline (stopCh/
@@ -168,17 +206,56 @@ type Session struct {
 	// peerID is this session's 24-bit peer-id, allocated alongside
 	// assignedIP from the same Server.pool call and pushed to the client
 	// as `peer-id <n>`. Server.dataSessions keys its data-packet routing
-	// table on this same value (D-16). Guarded by mu.
+	// table on this same value (D-16), and never changes across a
+	// renegotiation (D-16 note in 04-01-PLAN.md: no dataSessions rewrite is
+	// needed on rollover). Guarded by mu.
 	peerID uint32
 
-	// dataWrapper is this session's AES-256-GCM data-channel Wrapper,
-	// built from sess.dataKeys.ServerSlots() at the same point assignedIP/
-	// peerID are allocated (ovpn.go's performPushExchange) — live before
-	// OnSession ever fires (D-08). nil until then; Read/Write on a nil
-	// dataWrapper is a bug elsewhere (Read blocks forever, Write errors)
-	// since D-08 guarantees a Session handed to an embedder always has one.
-	// Guarded by mu.
-	dataWrapper *datachan.Wrapper
+	// clock abstracts wall-clock time for this session's server-initiated
+	// reneg-sec timer, the lame-duck mustDie deadline, and the
+	// reneg-flood rate limit, so fast-tier tests can drive all three from
+	// an injected fake clock instead of real sleeps — the same
+	// internal/reliable.Clock interface internal/ctrlconn.Conn's own clock
+	// parameter already uses. nil means reliable.SystemClock{} (see now()
+	// below). Set once, at session construction (ovpn.go's
+	// handleDatagram), from a test-only Server.clock field that defaults
+	// to nil in production.
+	clock reliable.Clock
+
+	// primary is this session's currently-active key-id's data-channel
+	// state: the slot Write/emitPing seal through, and the slot
+	// handleDataPacket tries first on decrypt. Populated once, in ovpn.go's
+	// performPushExchange (key-id 0), and re-published by runRenegotiation
+	// on every subsequent successful renegotiation. Guarded by mu.
+	primary keySlot
+
+	// lameDuck is the just-demoted former-primary key-id's data-channel
+	// state, kept decryptable until mustDie (D-18) so in-flight traffic
+	// sealed under the old key during a rollover is never dropped. The
+	// zero value (wrapper == nil) means "no lame duck" — true for the
+	// whole life of a session that never renegotiates. Guarded by mu.
+	lameDuck keySlot
+
+	// pendingReneg is the new key-id's control-channel Conn while a
+	// renegotiation handshake is in flight — published by
+	// (*Server).startRenegotiation before the triggering (or
+	// server-initiated) packet is even delivered to it, so pump can route
+	// that key-id's control traffic correctly from the very first packet.
+	// Cleared once runRenegotiation's atomic swap installs it as the new
+	// primary, or abandons it on failure. nil when no renegotiation is in
+	// progress. Guarded by mu, alongside pendingRenegKeyID.
+	pendingReneg      *ctrlconn.Conn
+	pendingRenegKeyID uint8
+
+	// lastRenegAccepted is when this session last began (not necessarily
+	// finished) a renegotiation, client- or server-initiated. Enforces
+	// T-04-01's minimum-interval rate limit (Task 3): an otherwise-valid
+	// SOFT_RESET_V1 arriving within renegMinInterval of this timestamp is
+	// refused — defense in depth on top of tls-crypt's own replay window
+	// (Phase 1) against a legitimate peer's SOFT_RESET_V1 replayed
+	// rapidly. The zero value means "never renegotiated": the first one is
+	// always allowed through this check. Guarded by mu.
+	lastRenegAccepted time.Time
 
 	// ipInbound is fed decrypted IP packets by handleDataDatagram's decrypt
 	// path (ovpn.go) and drained by Read. Sized ipInboundQueueSize (D-14,
@@ -201,6 +278,17 @@ type Session struct {
 	// ordinarily rely on; concurrent Read calls on one Session are not
 	// supported (mirrors bufio.Reader's own contract).
 	pendingRead []byte
+}
+
+// now returns the current time from s.clock, or reliable.SystemClock{} if
+// no clock was injected — the same nil-defaulting convention
+// internal/ctrlconn.Conn's own clock parameter already uses (New/
+// NewWithKeyID).
+func (s *Session) now() time.Time {
+	if s.clock == nil {
+		return reliable.SystemClock{}.Now()
+	}
+	return s.clock.Now()
 }
 
 // closing reports whether Close has already started (or finished) tearing
@@ -338,10 +426,14 @@ func (s *Session) Read(p []byte) (int, error) {
 // net.PacketConn the control channel uses. It returns len(p) on success,
 // matching io.Writer's contract for a full write.
 func (s *Session) Write(p []byte) (int, error) {
-	if s.dataWrapper == nil {
+	s.mu.Lock()
+	wrapper := s.primary.wrapper
+	s.mu.Unlock()
+
+	if wrapper == nil {
 		return 0, errors.New("ovpn: data channel not yet established")
 	}
-	sealed, err := s.dataWrapper.Seal(nil, p)
+	sealed, err := wrapper.Seal(nil, p)
 	if err != nil {
 		return 0, fmt.Errorf("ovpn: seal data packet: %w", err)
 	}
@@ -363,15 +455,30 @@ func (s *Session) Write(p []byte) (int, error) {
 // exactly like a forged control packet — no allocation, no per-attacker
 // state (T-02-17).
 func (s *Session) handleDataPacket(packet []byte) {
-	if s.dataWrapper == nil {
+	s.mu.Lock()
+	primary := s.primary
+	lameDuck := s.lameDuck
+	s.mu.Unlock()
+
+	if primary.wrapper == nil {
 		return
 	}
-	plaintext, err := s.dataWrapper.Open(nil, packet)
+	plaintext, err := primary.wrapper.Open(nil, packet)
 	if err != nil {
 		// Includes datachan.ErrPingAbsorbed: a ping is absorbed inside
 		// Open, never delivered, and never counts as a delivered IP
-		// packet.
-		return
+		// packet. Fall back to the lame-duck slot (D-18) ONLY if it is
+		// still live: try primary first (the common case, cheapest),
+		// lameDuck only on failure and only before its mustDie deadline
+		// (Pitfall 5) — both failing is the existing silent drop (T-02-17):
+		// no allocation, no logging, no per-attacker state.
+		if lameDuck.wrapper == nil || !s.now().Before(lameDuck.mustDie) {
+			return
+		}
+		plaintext, err = lameDuck.wrapper.Open(nil, packet)
+		if err != nil {
+			return
+		}
 	}
 	select {
 	case s.ipInbound <- plaintext:
@@ -381,6 +488,40 @@ func (s *Session) handleDataPacket(packet []byte) {
 		// congested link would (D-06) — never block handleDatagram's
 		// per-datagram goroutine.
 	}
+}
+
+// routeControlPacket returns the Conn that should receive an inbound
+// control packet at the given key-id, or nil if none matches (in which
+// case ovpn.go's pump silently drops it — the same "queue full / no match"
+// drop discipline handleDatagram's own inbound-queue select already
+// applies). Before ovpn.go's performPushExchange populates the primary
+// slot, this session's only Conn is sess.conn at key-id 0 (the initial
+// handshake's own control channel) — route there directly rather than
+// through an as-yet-empty primary slot, so this migration changes nothing
+// about a session's pre-push-exchange behavior. Once primary is populated,
+// route by exact key-id match against primary, then lameDuck (only while
+// its Conn is still live), then a renegotiation-in-flight Conn.
+func (sess *Session) routeControlPacket(keyID uint8) *ctrlconn.Conn {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+
+	if sess.primary.conn == nil {
+		if keyID == 0 {
+			return sess.conn
+		}
+		return nil
+	}
+
+	if keyID == sess.primary.keyID {
+		return sess.primary.conn
+	}
+	if sess.lameDuck.conn != nil && keyID == sess.lameDuck.keyID {
+		return sess.lameDuck.conn
+	}
+	if sess.pendingReneg != nil && keyID == sess.pendingRenegKeyID {
+		return sess.pendingReneg
+	}
+	return nil
 }
 
 // startKeepalive starts this session's per-session keepalive goroutine
@@ -426,10 +567,14 @@ func (s *Session) runKeepalive(tickCh <-chan time.Time) {
 // through the public Write path and never affects anything Write's own
 // return value represents.
 func (s *Session) emitPing() {
-	if s.dataWrapper == nil {
+	s.mu.Lock()
+	wrapper := s.primary.wrapper
+	s.mu.Unlock()
+
+	if wrapper == nil {
 		return
 	}
-	sealed, err := s.dataWrapper.SealPing(nil)
+	sealed, err := wrapper.SealPing(nil)
 	if err != nil {
 		// ErrPacketIDExhausted or similar — nothing more to do; the next
 		// tick tries again (and will fail the same way until Phase 4's
@@ -486,7 +631,10 @@ func (s *Session) Close() error {
 			s.mu.Lock()
 			assignedIP := s.assignedIP
 			peerID := s.peerID
-			dataWrapper := s.dataWrapper
+			dataWrapper := s.primary.wrapper
+			primaryConn := s.primary.conn
+			lameDuckConn := s.lameDuck.conn
+			pendingRenegConn := s.pendingReneg
 
 			// Remove the dataSessions routing entry BEFORE releasing
 			// peerID back to the pool (WR-04): pool.release makes peerID
@@ -510,6 +658,23 @@ func (s *Session) Close() error {
 				s.srv.pool.release(assignedIP, peerID)
 			}
 			s.srv.removeSession(s)
+
+			// Close every control-channel Conn this session might have
+			// owned beyond sess.conn (closed unconditionally below): the
+			// current primary slot's Conn (identical to sess.conn until
+			// the first renegotiation), any still-live lame-duck Conn, and
+			// any renegotiation Conn still mid-handshake. ctrlconn.Conn's
+			// own Close is idempotent (sync.Once), so closing the same
+			// *ctrlconn.Conn more than once here — e.g. primaryConn ==
+			// sess.conn on a session that never renegotiated — is
+			// harmless; what matters is that none is ever left un-closed,
+			// which would leak its retransmit goroutine (04-01-PLAN.md
+			// Task 1 action 2).
+			for _, c := range [...]*ctrlconn.Conn{primaryConn, lameDuckConn, pendingRenegConn} {
+				if c != nil {
+					_ = c.Close()
+				}
+			}
 		}
 	})
 	if s.conn == nil {
