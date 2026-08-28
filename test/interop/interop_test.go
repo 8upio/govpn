@@ -44,6 +44,38 @@ type scenario struct {
 	lossy          bool
 	largeCert      bool
 	contextTimeout time.Duration
+
+	// composeOverlay (04-03-PLAN.md Task 1) names an extra docker-compose
+	// overlay file (e.g. "docker-compose.lossy.yml", "docker-compose.reneg.yml")
+	// to layer on top of docker-compose.yml, replacing the old
+	// lossy-boolean-only overlay selection so a scenario can pick an overlay
+	// without inheriting loss injection. Empty means no overlay — the
+	// clean-small/clean-large scenarios' existing behavior. lossy above is
+	// kept as its own field regardless: it drives the probe-strictness
+	// convention (assertPingRoundTrip and friends), which is orthogonal to
+	// which overlay file happens to be in play.
+	composeOverlay string
+
+	// clientDirectives (04-03-PLAN.md Task 1) are extra client.conf lines
+	// passed through to cmd/gentestpki via repeated -client-directive flags.
+	// nil for every pre-existing scenario, so their generated client.conf
+	// stays byte-identical to before this field existed.
+	clientDirectives []string
+
+	// minRenegotiations (04-03-PLAN.md Task 1/2), when greater than 0,
+	// asserts the server's PASS line reports at least this many completed
+	// soft-reset rollovers (assertRenegotiation below). 0 (every
+	// pre-existing scenario) skips the assertion entirely.
+	minRenegotiations int
+
+	// probeRounds (04-03-PLAN.md Task 2), when greater than 1, drives
+	// entrypoint.sh's ROUND_COUNT env var and switches this scenario's
+	// assertions from the single-round assertHTTPPageLoad/assertUDPRoundTrip
+	// pair to assertMultiRoundProbes (round-suffixed probe names) plus
+	// assertNoReconnect (T-04-11: a rollover satisfied by a reconnect is a
+	// failure, not a pass). 0 or 1 (every pre-existing scenario) keeps the
+	// original single-round assertions unchanged.
+	probeRounds int
 }
 
 // scenarios covers, at minimum, the clean-small/clean-large/lossy-large
@@ -58,10 +90,33 @@ type scenario struct {
 // bounds on a context.WithTimeout, not sleeps, so raising them costs
 // nothing on a passing run and only prevents a slow CI machine's timeout
 // from looking like a protocol failure.
+// The "reneg" scenario (04-03-PLAN.md, D-23) proves renegotiation and
+// exit-notify against a real client: reneg-sec 15 on both the client
+// (via clientDirectives, cmd/gentestpki -client-directive) and the server
+// (docker-compose.reneg.yml's -reneg-sec 15s), with -hold giving the
+// shortened timer room to actually fire before the server's own
+// probe-driven survival window would otherwise let it exit.
 var scenarios = []scenario{
 	{name: "clean-small", profile: "small", lossy: false, largeCert: false, contextTimeout: 3 * time.Minute},
 	{name: "clean-large", profile: "large", lossy: false, largeCert: true, contextTimeout: 4 * time.Minute},
-	{name: "lossy-large", profile: "large", lossy: true, largeCert: true, contextTimeout: 10 * time.Minute},
+	{name: "lossy-large", profile: "large", lossy: true, largeCert: true, contextTimeout: 10 * time.Minute, composeOverlay: "docker-compose.lossy.yml"},
+	{
+		name:              "reneg",
+		profile:           "small",
+		lossy:             false,
+		largeCert:         false,
+		contextTimeout:    4 * time.Minute,
+		composeOverlay:    "docker-compose.reneg.yml",
+		// explicit-exit-notify 2 (04-03-PLAN.md Task 3) is carried by this
+		// SAME scenario rather than a second one sharing the overlay: the
+		// graceful-stop step (entrypoint.sh) runs strictly after every
+		// probe round and subpage probe above has already finished, so
+		// there is no timing conflict with the multi-round renegotiation
+		// proof above — one shared run exercises both success criteria.
+		clientDirectives:  []string{"reneg-sec 15", "explicit-exit-notify 2"},
+		minRenegotiations: 2,
+		probeRounds:       5,
+	},
 }
 
 // scenarioResult is one scenario's completed run: docker compose's combined
@@ -142,7 +197,11 @@ func TestMain(m *testing.M) {
 // project down unconditionally — including on a failing run, so the next
 // scenario starts from a clean container/network state.
 func runScenario(root, interopDir string, sc scenario) scenarioResult {
-	genCmd := exec.Command("go", "run", "./cmd/gentestpki", "-out", filepath.Join("test", "interop", "pki"), "-profile", sc.profile)
+	genArgs := []string{"run", "./cmd/gentestpki", "-out", filepath.Join("test", "interop", "pki"), "-profile", sc.profile}
+	for _, d := range sc.clientDirectives {
+		genArgs = append(genArgs, "-client-directive", d)
+	}
+	genCmd := exec.Command("go", genArgs...)
 	genCmd.Dir = root
 	if out, genErr := genCmd.CombinedOutput(); genErr != nil {
 		return scenarioResult{composeOut: string(out), composeErr: fmt.Errorf("gentestpki -profile %s: %w", sc.profile, genErr)}
@@ -153,9 +212,14 @@ func runScenario(root, interopDir string, sc scenario) scenarioResult {
 		return scenarioResult{composeErr: fmt.Errorf("preserve tls-crypt key for scenario %s: %w", sc.name, cpErr)}
 	}
 
+	// composeOverlay (04-03-PLAN.md Task 1) generalizes the old
+	// sc.lossy-only overlay selection: a scenario names whichever overlay
+	// file it needs (or none), independent of whether it also carries the
+	// lossy strictness convention (lossy-large sets both; reneg sets only
+	// composeOverlay).
 	composeFiles := []string{"-f", "docker-compose.yml"}
-	if sc.lossy {
-		composeFiles = append(composeFiles, "-f", "docker-compose.lossy.yml")
+	if sc.composeOverlay != "" {
+		composeFiles = append(composeFiles, "-f", sc.composeOverlay)
 	}
 
 	upArgs := append(append([]string{"compose"}, composeFiles...), "up", "--build", "--abort-on-container-exit", "--exit-code-from", "server")
@@ -315,15 +379,28 @@ func TestInteropScenarios(t *testing.T) {
 			// lossy one — the netstack's fixed-RTO retransmission is
 			// precisely what should carry a page load across a 5-10%
 			// loss link.
-			assertHTTPPageLoad(t, res)
-
+			//
 			// 03-06-PLAN.md Task 2 (NET-01, VRFY-02): a UDP round trip
 			// and the three remaining HTTP subpages, both parameterized
 			// by the same !sc.lossy strictness convention
 			// assertPingRoundTrip already established — see each
 			// function's own doc comment for exactly what is tolerated
 			// on the lossy scenario and why.
-			assertUDPRoundTrip(t, res, !sc.lossy)
+			//
+			// 04-03-PLAN.md Task 2 (T-04-11): a scenario with probeRounds > 1
+			// (only "reneg") replaces this single-round
+			// assertHTTPPageLoad/assertUDPRoundTrip pair's probe-name
+			// checks — entrypoint.sh's round loop no longer emits the
+			// unsuffixed "http_landing"/"udp_echo" probes once
+			// ROUND_COUNT > 1 — with assertMultiRoundProbes' round-suffixed
+			// equivalent, plus assertNoReconnect's zero-reconnect proof.
+			if sc.probeRounds > 1 {
+				assertMultiRoundProbes(t, res, sc.probeRounds)
+				assertNoReconnect(t, res)
+			} else {
+				assertHTTPPageLoad(t, res)
+				assertUDPRoundTrip(t, res, !sc.lossy)
+			}
 			assertHTTPSubpages(t, res, !sc.lossy)
 
 			// 03-06-PLAN.md Task 3 (ROADMAP Phase 3 success criterion 3):
@@ -333,6 +410,27 @@ func TestInteropScenarios(t *testing.T) {
 			assertUnreachableOutsideTunnel(t, res)
 
 			assertServerStaysUnprivileged(t, res)
+
+			// 04-03-PLAN.md Task 1 (SESS-04 against a real client): the
+			// "reneg" scenario's server PASS line must report at least
+			// sc.minRenegotiations completed soft-reset rollovers. Every
+			// other scenario leaves minRenegotiations at its zero value and
+			// skips this assertion entirely.
+			if sc.minRenegotiations > 0 {
+				assertRenegotiation(t, res, sc.minRenegotiations)
+			}
+
+			// 04-03-PLAN.md Task 3 (SESS-05 against a real client): the
+			// same "reneg" scenario's client carries explicit-exit-notify,
+			// so its graceful stop (entrypoint.sh, after every probe round
+			// and subpage probe above) must close the server's Session
+			// well under the 60s idle-reap window. minRenegotiations > 0 is
+			// reused as this scenario's own marker rather than adding a
+			// third boolean field — this plan's only scenario carrying
+			// either directive carries both.
+			if sc.minRenegotiations > 0 {
+				assertExitNotifyClosesPromptly(t, res)
+			}
 
 			if sc.largeCert {
 				assertCertificateFlightFragmented(t, res)
@@ -744,6 +842,155 @@ func assertHTTPSubpages(t *testing.T, res scenarioResult, strict bool) {
 	assertProbe(t, res, "http_headers", strict)
 }
 
+// assertMultiRoundProbes is assertHTTPPageLoad/assertUDPRoundTrip's
+// multi-round analog (04-03-PLAN.md Task 2, for scenario.probeRounds > 1):
+// every round's http_landing_rN/udp_echo_rN probe must report result=ok —
+// strict, since the reneg scenario carries no loss injection, unlike
+// lossy-large — and the server's own http_requests=/udp_rx=/udp_tx=
+// PASS-line counters must each be greater than zero, exactly like the
+// single-round assertions this replaces for a multi-round scenario.
+func assertMultiRoundProbes(t *testing.T, res scenarioResult, rounds int) {
+	t.Helper()
+
+	if res.composeErr != nil {
+		return
+	}
+
+	for i := 1; i <= rounds; i++ {
+		assertProbe(t, res, fmt.Sprintf("http_landing_r%d", i), true)
+		assertProbe(t, res, fmt.Sprintf("udp_echo_r%d", i), true)
+	}
+
+	if m := httpRequestsRe.FindStringSubmatch(res.composeOut); m == nil {
+		t.Fatal("server output does not contain a parsable http_requests= field — see log above")
+	} else if n, err := strconv.Atoi(m[1]); err != nil {
+		t.Fatalf("parse http_requests=%q: %v", m[1], err)
+	} else if n == 0 {
+		t.Fatal("server output reports http_requests=0, want greater than zero — see log above")
+	} else {
+		t.Logf("server observed http_requests=%d across %d rounds", n, rounds)
+	}
+
+	m := udpRxTxRe.FindStringSubmatch(res.composeOut)
+	if m == nil {
+		t.Fatal("server output does not contain a parsable udp_rx=/udp_tx= field — see log above")
+	}
+	udpRx, err := strconv.Atoi(m[1])
+	if err != nil {
+		t.Fatalf("parse udp_rx=%q: %v", m[1], err)
+	}
+	udpTx, err := strconv.Atoi(m[2])
+	if err != nil {
+		t.Fatalf("parse udp_tx=%q: %v", m[2], err)
+	}
+	if udpRx == 0 || udpTx == 0 {
+		t.Fatalf("server output reports udp_rx=%d udp_tx=%d, want both greater than zero — see log above", udpRx, udpTx)
+	}
+	t.Logf("server observed udp_rx=%d udp_tx=%d across %d rounds", udpRx, udpTx, rounds)
+}
+
+// clientSoftResetLogLine is the real Debian-packaged OpenVPN 2.6.3-based
+// client's own renegotiation diagnostic line, captured VERBATIM from this
+// project's own Task 1 interop run against the "reneg" scenario (not
+// guessed): "TLS: soft reset sec=15/15 bytes=11024/-1 pkts=72/0" (ssl.c's
+// own key_state_soft_reset()/tls_process() diagnostic, printed once per
+// side that INITIATES a rollover — client or server). Only the fixed
+// prefix is asserted on; the sec=/bytes=/pkts= fields vary run to run.
+const clientSoftResetLogPrefix = "TLS: soft reset sec="
+
+// assertNoReconnect is 04-03-PLAN.md Task 2's zero-reconnect proof
+// (T-04-11 in this plan's own threat register): the renegotiation scenario
+// must not be satisfiable by a reconnect. It asserts BOTH that the client's
+// own log shows at least one renegotiation (clientSoftResetLogPrefix above)
+// AND that the client's log contains EXACTLY ONE occurrence of
+// "Initialization Sequence Completed" (initSequenceCompletedRe, the same
+// literal assertTunnelUp already asserts is present at least once) — a
+// SECOND occurrence would mean the tunnel was torn down and rebuilt rather
+// than rekeyed in place, which is a failure, not a pass, no matter how many
+// rollovers the server's own PASS line reports.
+func assertNoReconnect(t *testing.T, res scenarioResult) {
+	t.Helper()
+
+	if res.composeErr != nil {
+		return
+	}
+
+	if !strings.Contains(res.composeOut, clientSoftResetLogPrefix) {
+		t.Fatalf("client output does not contain %q — the client's own log shows no evidence of a renegotiation — see log above", clientSoftResetLogPrefix)
+	}
+
+	n := len(initSequenceCompletedRe.FindAllStringIndex(res.composeOut, -1))
+	if n != 1 {
+		t.Fatalf("client output contains %d occurrences of \"Initialization Sequence Completed\", want exactly 1 — more than one means the tunnel was torn down and rebuilt (a reconnect), not rekeyed in place (T-04-11) — see log above", n)
+	}
+	t.Log("client log shows renegotiation evidence and exactly one completed initialization sequence — every rollover rekeyed in place, none reconnected")
+}
+
+// exitNotifyStopIssuedRe/sessionCloseObservedRe (04-03-PLAN.md Task 3)
+// extract the two absolute Unix-second epoch timestamps
+// assertExitNotifyClosesPromptly diffs: the client's own
+// "PROBE exit_notify_stop_issued result=ok epoch=<N>" line (entrypoint.sh,
+// when the graceful SIGTERM was issued) and the server's own
+// "close_observed_epoch=<N>" field on its distinct close-observation log
+// line (test/interop/server/main.go, when Read returning io.EOF was
+// observed). Both containers share the host clock under docker compose, so
+// the two epochs are directly comparable.
+var (
+	exitNotifyStopIssuedRe = regexp.MustCompile(`PROBE exit_notify_stop_issued result=ok epoch=(\d+)`)
+	sessionCloseObservedRe = regexp.MustCompile(`close_observed_epoch=(\d+)`)
+)
+
+const exitNotifyThresholdSecs int64 = 15
+
+// assertExitNotifyClosesPromptly is 04-03-PLAN.md Task 3's proof (T-04-12
+// in this plan's own threat register): a real client's explicit-exit-notify
+// closes the server's Session within seconds of the graceful stop being
+// issued — comfortably below the 60s idle-reap window, so the close cannot
+// be explained by the reap timer having simply expired on its own schedule.
+// exitNotifyThresholdSecs (15s) is chosen well under 60s with generous
+// margin for the client's own OCC_EXIT round trip (repeated once per
+// second, sig.c:374-392) while still being far enough from 60 that a
+// regression which silently fell back to the idle-reap path would fail
+// this assertion rather than accidentally sneaking in under a threshold set
+// too close to 60.
+func assertExitNotifyClosesPromptly(t *testing.T, res scenarioResult) {
+	t.Helper()
+
+	if res.composeErr != nil {
+		return
+	}
+
+	stopMatch := exitNotifyStopIssuedRe.FindStringSubmatch(res.composeOut)
+	if stopMatch == nil {
+		t.Fatal("client output does not contain a parsable PROBE exit_notify_stop_issued epoch= field — see log above")
+	}
+	stopEpoch, err := strconv.ParseInt(stopMatch[1], 10, 64)
+	if err != nil {
+		t.Fatalf("parse exit_notify_stop_issued epoch=%q: %v", stopMatch[1], err)
+	}
+
+	closeMatch := sessionCloseObservedRe.FindStringSubmatch(res.composeOut)
+	if closeMatch == nil {
+		t.Fatal("server output does not contain a parsable close_observed_epoch= field — the server never observed the session close (Session.Read returning io.EOF) — see log above")
+	}
+	closeEpoch, err := strconv.ParseInt(closeMatch[1], 10, 64)
+	if err != nil {
+		t.Fatalf("parse close_observed_epoch=%q: %v", closeMatch[1], err)
+	}
+
+	elapsed := closeEpoch - stopEpoch
+	if elapsed < 0 {
+		t.Fatalf("server observed the session close (epoch=%d) BEFORE the client's graceful stop was issued (epoch=%d) — see log above", closeEpoch, stopEpoch)
+	}
+	if elapsed > exitNotifyThresholdSecs {
+		t.Fatalf(
+			"elapsed time from the client's graceful stop to the server observing the session close = %ds, want at most %ds — comfortably under the 60s idle-reap window; a duration this close to 60s would not distinguish exit-notify from the idle-reap timer having simply expired on its own schedule — see log above",
+			elapsed, exitNotifyThresholdSecs,
+		)
+	}
+	t.Logf("exit-notify closed the session %ds after the client's graceful stop (well under the 60s idle-reap window and the %ds threshold)", elapsed, exitNotifyThresholdSecs)
+}
+
 // assertUnreachableOutsideTunnel is 03-06-PLAN.md Task 3's negative proof
 // (ROADMAP Phase 3 success criterion 3's "unreachable from outside the
 // tunnel" clause): entrypoint.sh's outside_tunnel probe curls the server
@@ -789,6 +1036,40 @@ func assertServerStaysUnprivileged(t *testing.T, res scenarioResult) {
 			res.privilegeCheck,
 		)
 	}
+}
+
+// renegotiationsRe extracts the renegotiations= field test/interop/server's
+// PASS line carries (04-03-PLAN.md Task 1, sess.RenegotiationCount()),
+// modeled directly on the pre-existing udpRxTxRe/pingRxTxRe parsers above —
+// a new PASS-line field needs a new regexp+assertion pair here, not a
+// change to any existing one.
+var renegotiationsRe = regexp.MustCompile(`renegotiations=(\d+)`)
+
+// assertRenegotiation is 04-03-PLAN.md Task 1/2's rollover proof: the
+// server's PASS line must report at least wantMin completed soft-reset
+// rollovers (sess.RenegotiationCount(), incremented once per completed
+// rollover inside ovpn.go's runRenegotiation) — proving a real client
+// actually renegotiated against the library, not merely that the harness's
+// shortened -reneg-sec flag was set.
+func assertRenegotiation(t *testing.T, res scenarioResult, wantMin int) {
+	t.Helper()
+
+	if res.composeErr != nil {
+		return
+	}
+
+	m := renegotiationsRe.FindStringSubmatch(res.composeOut)
+	if m == nil {
+		t.Fatal("server output does not contain a parsable renegotiations= field — see log above")
+	}
+	got, err := strconv.Atoi(m[1])
+	if err != nil {
+		t.Fatalf("parse renegotiations=%q: %v", m[1], err)
+	}
+	if got < wantMin {
+		t.Fatalf("server output reports renegotiations=%d, want at least %d — see log above", got, wantMin)
+	}
+	t.Logf("server observed renegotiations=%d (want at least %d)", got, wantMin)
 }
 
 // assertCertificateFlightFragmented is 01-04-PLAN.md Task 1's fragmentation

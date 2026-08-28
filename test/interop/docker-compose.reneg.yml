@@ -1,0 +1,50 @@
+# Overlay for the "reneg" interop scenario (04-03-PLAN.md): a real,
+# unmodified OpenVPN 2.6 client, configured with a shortened `reneg-sec`
+# (and, from Task 3 onward, `explicit-exit-notify`) via
+# cmd/gentestpki's -client-directive flag, renegotiates repeatedly against
+# the library while HTTP and UDP traffic keeps flowing.
+#
+# `docker compose -f docker-compose.yml -f docker-compose.reneg.yml up`
+# mirrors docker-compose.lossy.yml's own shape and comment discipline:
+# override ONLY the server service's `command` (a shortened -reneg-sec, plus
+# -hold — the extra survival time the server waits, after its normal
+# probe-driven survival window fires, so the reneg-sec timer has room to
+# actually elapse before the server exits and tears the whole compose run
+# down). The client service's privileges/volumes and the server's
+# unprivileged posture (no cap_add, no privileged, no devices) are left
+# completely untouched, exactly like the lossy overlay.
+#
+# -reneg-sec 15s matches this scenario's own client-side `reneg-sec 15`
+# directive (cmd/gentestpki -client-directive, wired in via
+# interop_test.go's `reneg` scenario entry) — RESEARCH's D-23 calls for
+# "~20s on both sides"; 15s is chosen instead so the whole scenario (Task 2
+# widens this to at least two rollovers across several probe rounds) still
+# comfortably fits this file's own -hold/deadline budget and
+# interop_test.go's contextTimeout ceiling without needing an unusually long
+# scenario run.
+#
+# ROUND_COUNT/ROUND_INTERVAL (04-03-PLAN.md Task 2) drive the client's own
+# entrypoint.sh into 5 rounds of http_landing/udp_echo probes, 8 seconds
+# apart — a ~32-second probe span that, on top of the pre-existing ~10-second
+# ping sequence that always runs first, comfortably spans more than two
+# 15-second reneg-sec intervals (D-23's own "at least two rollovers"
+# requirement) without depending on exact per-probe timing. -hold is raised
+# from Task 1's 30s to 60s so the server survives this longer round span
+# (plus the remaining http_status/http_echo/http_headers/outside_tunnel
+# probes after it) before its probe-driven trigger's settle delay would
+# otherwise let it exit.
+# EXIT_NOTIFY_STOP=1 (04-03-PLAN.md Task 3) is this scenario's own opt-in
+# into entrypoint.sh's graceful-stop step — gated, not unconditional,
+# because an early unconditional client self-stop was discovered (running
+# this harness for real) to race the server's own probe-driven survival
+# window on every OTHER scenario, killing it via
+# --abort-on-container-exit before it ever printed PASS (Rule 1 bug fix).
+services:
+  client:
+    environment:
+      - ROUND_COUNT=5
+      - ROUND_INTERVAL=8
+      - EXIT_NOTIFY_STOP=1
+
+  server:
+    command: ["-pki", "/pki", "-listen", "0.0.0.0:1194", "-deadline", "60s", "-reneg-sec", "15s", "-hold", "60s"]

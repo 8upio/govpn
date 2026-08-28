@@ -37,6 +37,31 @@ HTTP_PORT="${HTTP_PORT:-8080}"
 # main.go's -udp-port, 03-06-PLAN.md Task 2).
 UDP_PORT="${UDP_PORT:-9999}"
 
+# ROUND_COUNT/ROUND_INTERVAL (04-03-PLAN.md Task 2) drive how many times the
+# http_landing/udp_echo probe pair below repeats, and how long to sleep
+# between rounds. Defaults (1 round, no repeat) reproduce every pre-existing
+# scenario's exact original single-round behavior byte-for-byte — only the
+# "reneg" scenario's docker-compose.reneg.yml overlay sets these above 1, so
+# its own probe span comfortably exceeds two of its shortened reneg-sec
+# intervals.
+ROUND_COUNT="${ROUND_COUNT:-1}"
+ROUND_INTERVAL="${ROUND_INTERVAL:-0}"
+
+# EXIT_NOTIFY_STOP (04-03-PLAN.md Task 3) gates the graceful-stop step
+# below: default 0 (every pre-existing scenario) leaves this script's exit
+# path completely unchanged — the client stays blocked in `wait "$OVPN_PID"`
+# until the SERVER container's own exit triggers compose's
+# --abort-on-container-exit teardown, exactly as before this task. Only the
+# "reneg" scenario's docker-compose.reneg.yml overlay sets this to 1, since
+# only that scenario's client.conf carries explicit-exit-notify at all. A
+# non-gated (unconditional) early self-stop was tried first and discovered,
+# by actually running this harness, to break every OTHER scenario: the
+# client exiting before the server had finished its own probe-driven
+# survival window made --abort-on-container-exit tear the server down
+# mid-flight, well before it ever printed PASS (Rule 1 bug, caught and
+# fixed within this same task before being committed).
+EXIT_NOTIFY_STOP="${EXIT_NOTIFY_STOP:-0}"
+
 CAPTURE_DIR="${CAPTURE_DIR:-/captures}"
 CAPTURE_FILE="${CAPTURE_DIR}/interop.pcap"
 CONFIG="${OVPN_CONFIG:-/pki/client.conf}"
@@ -134,54 +159,86 @@ fi
 # set -eu (a bare non-zero exit would abort this script and lose the
 # cleanup/wait path below that flushes the pcap).
 #
-# http_landing (Task 1): curl the tunnelweb landing page through the tunnel
-# and check for its locked <h1> text (UI-SPEC §1). --retry/--retry-all-errors
-# gives the lossy scenario's synthetic loss room to succeed on a later
-# attempt rather than failing on the first dropped/reordered segment.
-LANDING_BODY=$(curl -s --max-time 10 --retry 2 --retry-all-errors "http://$TUNNEL_SERVER_IP:$HTTP_PORT/" 2>/dev/null || true)
-if [ -n "$LANDING_BODY" ] && printf '%s' "$LANDING_BODY" | grep -q '<h1>govpn tunnelweb</h1>'; then
-	echo "entrypoint: PROBE http_landing result=ok marker=found"
-	echo "entrypoint: landing page probe succeeded"
-else
-	echo "entrypoint: PROBE http_landing result=fail reason=marker_not_found"
-	echo "entrypoint: landing page probe failed (see body above, if any)"
-fi
-
-# udp_echo (Task 2): send a fixed payload to the server's netstack UDP echo
-# service and check the reply carries the server's udpEchoMarker prefix
-# (test/interop/server/main.go's runUDPEcho). UDP has no retransmission by
-# design, and the lossy scenario injects 5-10% loss on top, so this tries up
-# to 3 attempts before giving up — interop_test.go's assertion tolerates a
-# fail here only on the lossy scenario (both choices commented there).
-#
-# nc -u -w <N> blocks for the FULL N seconds even after it has already
-# received a reply — UDP is connectionless, so nc has no EOF signal telling
-# it "no more data is coming" and simply waits out its own idle timer
-# (confirmed empirically against a real UDP echo server before choosing this
-# value). A 1-second timeout keeps each attempt's unavoidable block short —
-# a reply on this local Docker bridge network arrives in single-digit
-# milliseconds, so 1 second is generous headroom, not a tight race — while
-# keeping the probe-driven survival window's settle delay
-# (test/interop/server/main.go's probeSettleDelay) small enough to still
-# finish faster than the old fixed window.
+# http_landing/udp_echo round loop (Task 1's original single-shot probes,
+# widened by Task 2 into ROUND_COUNT repetitions): each round curls the
+# tunnelweb landing page and round-trips a UDP echo, emitting round-suffixed
+# PROBE names (http_landing_rN/udp_echo_rN) whenever ROUND_COUNT>1, so
+# test/interop/interop_test.go's one PROBE-line parser needs no change — a
+# new probe here is a new call, never a new regexp (03-06-SUMMARY.md's own
+# stated design goal). With the default ROUND_COUNT=1, round_suffix always
+# returns the empty string, so every pre-existing scenario's probe names
+# (http_landing, udp_echo) and behavior stay byte-for-byte identical to
+# before this loop existed.
 UDP_PROBE_PAYLOAD="govpn-udp-probe"
-udp_ok=0
-attempt=1
-while [ "$attempt" -le 3 ]; do
-	UDP_REPLY=$(printf '%s' "$UDP_PROBE_PAYLOAD" | nc -u -w 1 "$TUNNEL_SERVER_IP" "$UDP_PORT" 2>/dev/null || true)
-	if printf '%s' "$UDP_REPLY" | grep -qF "govpn-udp-echo:${UDP_PROBE_PAYLOAD}"; then
-		udp_ok=1
-		break
+
+round_suffix() {
+	if [ "$ROUND_COUNT" -gt 1 ]; then
+		printf '_r%s' "$1"
 	fi
-	attempt=$((attempt + 1))
+}
+
+round=1
+while [ "$round" -le "$ROUND_COUNT" ]; do
+	suffix=$(round_suffix "$round")
+
+	# http_landing (Task 1): curl the tunnelweb landing page through the
+	# tunnel and check for its locked <h1> text (UI-SPEC §1).
+	# --retry/--retry-all-errors gives the lossy scenario's synthetic loss
+	# room to succeed on a later attempt rather than failing on the first
+	# dropped/reordered segment.
+	LANDING_BODY=$(curl -s --max-time 10 --retry 2 --retry-all-errors "http://$TUNNEL_SERVER_IP:$HTTP_PORT/" 2>/dev/null || true)
+	if [ -n "$LANDING_BODY" ] && printf '%s' "$LANDING_BODY" | grep -q '<h1>govpn tunnelweb</h1>'; then
+		echo "entrypoint: PROBE http_landing${suffix} result=ok marker=found"
+		echo "entrypoint: landing page probe (round $round/$ROUND_COUNT) succeeded"
+	else
+		echo "entrypoint: PROBE http_landing${suffix} result=fail reason=marker_not_found"
+		echo "entrypoint: landing page probe (round $round/$ROUND_COUNT) failed (see body above, if any)"
+	fi
+
+	# udp_echo (Task 2): send a fixed payload to the server's netstack UDP
+	# echo service and check the reply carries the server's udpEchoMarker
+	# prefix (test/interop/server/main.go's runUDPEcho). UDP has no
+	# retransmission by design, and the lossy scenario injects 5-10% loss on
+	# top, so this tries up to 3 attempts before giving up —
+	# interop_test.go's assertion tolerates a fail here only on the lossy
+	# scenario (both choices commented there).
+	#
+	# nc -u -w <N> blocks for the FULL N seconds even after it has already
+	# received a reply — UDP is connectionless, so nc has no EOF signal
+	# telling it "no more data is coming" and simply waits out its own idle
+	# timer (confirmed empirically against a real UDP echo server before
+	# choosing this value). A 1-second timeout keeps each attempt's
+	# unavoidable block short — a reply on this local Docker bridge network
+	# arrives in single-digit milliseconds, so 1 second is generous
+	# headroom, not a tight race — while keeping the probe-driven survival
+	# window's settle delay (test/interop/server/main.go's probeSettleDelay)
+	# small enough to still finish faster than the old fixed window. This
+	# per-attempt timeout is deliberately kept at its pre-Task-2 value even
+	# inside the round loop — round PACING comes from ROUND_INTERVAL's own
+	# sleep below, never from nc's own blocking.
+	udp_ok=0
+	attempt=1
+	while [ "$attempt" -le 3 ]; do
+		UDP_REPLY=$(printf '%s' "$UDP_PROBE_PAYLOAD" | nc -u -w 1 "$TUNNEL_SERVER_IP" "$UDP_PORT" 2>/dev/null || true)
+		if printf '%s' "$UDP_REPLY" | grep -qF "govpn-udp-echo:${UDP_PROBE_PAYLOAD}"; then
+			udp_ok=1
+			break
+		fi
+		attempt=$((attempt + 1))
+	done
+	if [ "$udp_ok" -eq 1 ]; then
+		echo "entrypoint: PROBE udp_echo${suffix} result=ok"
+		echo "entrypoint: UDP echo probe (round $round/$ROUND_COUNT) succeeded"
+	else
+		echo "entrypoint: PROBE udp_echo${suffix} result=fail reason=no_echo_after_3_attempts"
+		echo "entrypoint: UDP echo probe (round $round/$ROUND_COUNT) failed after 3 attempts"
+	fi
+
+	round=$((round + 1))
+	if [ "$round" -le "$ROUND_COUNT" ]; then
+		sleep "$ROUND_INTERVAL"
+	fi
 done
-if [ "$udp_ok" -eq 1 ]; then
-	echo "entrypoint: PROBE udp_echo result=ok"
-	echo "entrypoint: UDP echo probe succeeded"
-else
-	echo "entrypoint: PROBE udp_echo result=fail reason=no_echo_after_3_attempts"
-	echo "entrypoint: UDP echo probe failed after 3 attempts"
-fi
 
 # http_status (Task 2): curl /status and check for the locked "tunnel:
 # active" indicator text (UI-SPEC §2).
@@ -236,6 +293,31 @@ if curl -s --max-time 3 "http://govpn-interop-server:$HTTP_PORT/" >/dev/null 2>&
 else
 	echo "entrypoint: PROBE outside_tunnel result=ok"
 	echo "entrypoint: outside-tunnel probe succeeded: direct connection to the server container was refused or timed out"
+fi
+
+# Graceful stop (Task 3, gated by EXIT_NOTIFY_STOP above): SIGTERM the real
+# OpenVPN client so it actually transmits its own explicit-exit-notify (the
+# classic OCC_EXIT payload, sent once per second on the DATA channel for
+# `explicit-exit-notify <n>` seconds, sig.c:352-392) rather than being
+# killed outright by compose teardown, which would never emit it at all.
+# Only the "reneg" scenario's client.conf carries the explicit-exit-notify
+# directive (cmd/gentestpki -client-directive) and sets EXIT_NOTIFY_STOP=1
+# to match; this step runs strictly after every probe round and subpage
+# probe above has already finished, so there is no timing conflict with
+# that same scenario's renegotiation proof.
+#
+# epoch=$(date +%s) gives test/interop/interop_test.go's
+# assertExitNotifyClosesPromptly an absolute, cross-container-comparable
+# timestamp (docker compose containers share the host clock) to diff
+# against the server's own close_observed_epoch= field.
+if [ "$EXIT_NOTIFY_STOP" = "1" ]; then
+	STOP_ISSUED_AT=$(date +%s)
+	echo "entrypoint: PROBE exit_notify_stop_issued result=ok epoch=$STOP_ISSUED_AT"
+	kill -TERM "$OVPN_PID" 2>/dev/null || true
+	# Give the client's own explicit-exit-notify a moment to actually reach
+	# the server before this script's own wait/cleanup path takes over
+	# below.
+	sleep 3
 fi
 
 set +e

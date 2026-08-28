@@ -77,18 +77,40 @@ const (
 	largePadding = "large-certificate-profile-generated-for-govpn-interop-multi-packet-tls-fragmentation-verification-01-04-plan-task-1"
 )
 
+// clientDirectiveFlag collects a repeatable -client-directive flag into an
+// ordered slice, so a scenario needing several extra client.conf lines (e.g.
+// both `reneg-sec 15` and `explicit-exit-notify 2`, 04-03-PLAN.md) passes
+// the flag more than once rather than needing its own comma-splitting
+// convention. flag.Value's own String()/Set() contract, mirroring every
+// other stdlib repeatable-flag implementation.
+type clientDirectiveFlag []string
+
+func (f *clientDirectiveFlag) String() string {
+	if f == nil {
+		return ""
+	}
+	return strings.Join(*f, ",")
+}
+
+func (f *clientDirectiveFlag) Set(v string) error {
+	*f = append(*f, v)
+	return nil
+}
+
 func main() {
 	out := flag.String("out", filepath.Join("test", "interop", "pki"), "output directory for generated PKI material")
 	profile := flag.String("profile", profileSmall, "certificate profile: small or large")
+	var directives clientDirectiveFlag
+	flag.Var(&directives, "client-directive", "extra client.conf directive to append verbatim (repeatable; e.g. -client-directive \"reneg-sec 15\"); default none, so the pre-existing clean-small/clean-large/lossy-large scenarios generate a byte-identical client.conf (04-03-PLAN.md Task 1)")
 	flag.Parse()
 
-	if err := run(*out, *profile); err != nil {
+	if err := run(*out, *profile, directives); err != nil {
 		fmt.Fprintln(os.Stderr, "gentestpki:", err)
 		os.Exit(1)
 	}
 }
 
-func run(outDir, profile string) error {
+func run(outDir, profile string, clientDirectives []string) error {
 	if profile != profileSmall && profile != profileLarge {
 		return fmt.Errorf("unknown -profile %q (want %q or %q)", profile, profileSmall, profileLarge)
 	}
@@ -201,7 +223,7 @@ func run(outDir, profile string) error {
 		return fmt.Errorf("tls-crypt key self-check failed: %w", err)
 	}
 
-	if err := writeClientConf(filepath.Join(outDir, "client.conf")); err != nil {
+	if err := writeClientConf(filepath.Join(outDir, "client.conf"), clientDirectives); err != nil {
 		return err
 	}
 
@@ -519,7 +541,14 @@ func verifyStaticKeyV1RoundTrip(path string, want []byte) error {
 // first run (RESEARCH: no reason to change this config when plan 01-03 and
 // Phase 2 start relying on them). Identical across both profiles — only the
 // underlying PKI material referenced by these same filenames changes shape.
-func writeClientConf(path string) error {
+//
+// extraDirectives (04-03-PLAN.md Task 1) are appended verbatim, one per
+// line, after the fixed lines above — e.g. "reneg-sec 15" or
+// "explicit-exit-notify 2" for the renegotiation/exit-notify interop
+// scenario. A nil/empty slice (every pre-existing scenario's call site)
+// appends nothing, so clean-small/clean-large/lossy-large's generated
+// client.conf stays byte-identical to before this flag existed.
+func writeClientConf(path string, extraDirectives []string) error {
 	conf := fmt.Sprintf(`client
 dev tun
 proto udp
@@ -537,6 +566,10 @@ topology subnet
 cipher AES-256-GCM
 verb 4
 `, serverAlias, serverPort, pkiMountPoint, pkiMountPoint, pkiMountPoint, pkiMountPoint)
+
+	for _, d := range extraDirectives {
+		conf += d + "\n"
+	}
 
 	return os.WriteFile(path, []byte(conf), 0o644)
 }
