@@ -215,9 +215,10 @@ type Session struct {
 	pushRequested atomic.Bool
 
 	// mu guards assignedIP, peerID, primary, lameDuck, pendingReneg,
-	// pendingRenegKeyID, and lastRenegAccepted below (WR-03, extended by
-	// 04-01-PLAN.md Task 1 from the single dataWrapper field it originally
-	// guarded to this phase's two-slot key state): ovpn.go's
+	// pendingRenegKeyID, lastRenegAccepted, and lastAuthTraffic below
+	// (WR-03, extended by 04-01-PLAN.md Task 1 from the single dataWrapper
+	// field it originally guarded to this phase's two-slot key state, and
+	// by 04-02-PLAN.md Task 2 to lastAuthTraffic — no new mutex): ovpn.go's
 	// performPushExchange and runRenegotiation (running on this session's
 	// own goroutines) write them, while Close — which
 	// enforceHandshakeWindow's timeout goroutine can invoke concurrently at
@@ -289,6 +290,19 @@ type Session struct {
 	// rapidly. The zero value means "never renegotiated": the first one is
 	// always allowed through this check. Guarded by mu.
 	lastRenegAccepted time.Time
+
+	// lastAuthTraffic is when this session last received AUTHENTICATED
+	// traffic — a delivered control packet (ovpn.go's pump) or a
+	// successfully-decrypted data packet, primary or lame-duck slot
+	// (handleDataPacket) — mirroring the reference's own two reset sites
+	// (Pattern 6: forward.c:1093-1103 control path, forward.c:1184 data
+	// path). Session.runReap compares s.now() against this to decide
+	// whether to reap (D-22). A packet that fails to authenticate never
+	// touches this (T-04-07): an attacker cannot keep a dead session alive
+	// with garbage. Initialized at the same publish point
+	// startKeepalive/startReneg are (ovpn.go's performPushExchange).
+	// Guarded by mu.
+	lastAuthTraffic time.Time
 
 	// ipInbound is fed decrypted IP packets by handleDataDatagram's decrypt
 	// path (ovpn.go) and drained by Read. Sized ipInboundQueueSize (D-14,
@@ -504,7 +518,9 @@ func (s *Session) handleDataPacket(packet []byte) {
 		// still live: try primary first (the common case, cheapest),
 		// lameDuck only on failure and only before its mustDie deadline
 		// (Pitfall 5) — both failing is the existing silent drop (T-02-17):
-		// no allocation, no logging, no per-attacker state.
+		// no allocation, no logging, no per-attacker state, and — per
+		// T-04-07 — no touch of lastAuthTraffic: an attacker cannot keep a
+		// dead session alive with garbage that never authenticates.
 		if lameDuck.wrapper == nil || !s.now().Before(lameDuck.mustDie) {
 			return
 		}
@@ -513,6 +529,11 @@ func (s *Session) handleDataPacket(packet []byte) {
 			return
 		}
 	}
+
+	// D-22/Pattern 6 (forward.c:1184): any successfully-decrypted data
+	// packet — primary or lame-duck — resets the idle-reap timer, exactly
+	// like a delivered control packet does (ovpn.go's pump).
+	s.touchAuthTraffic()
 
 	// D-21/Pattern 5 (forward.c:1196-1207): checked ONLY here, after a
 	// successful Open, before ever reaching the ipInbound delivery select
@@ -698,6 +719,66 @@ func (s *Session) checkReneg() {
 	// WriteTo error below.
 	_ = newConn.SendReset(wire.OpControlSoftResetV1)
 	go s.srv.runRenegotiation(s, newConn, keyID)
+}
+
+// touchAuthTraffic stamps lastAuthTraffic with s.now() (D-22, Pattern 6:
+// forward.c:1093-1103 control path, forward.c:1184 data path). Called only
+// from a delivered control-packet path (ovpn.go's pump) or after a
+// successful data-channel decrypt (handleDataPacket) — never for traffic
+// that failed to authenticate (T-04-07). Guarded by mu, the same lock
+// lastAuthTraffic itself is guarded by.
+func (s *Session) touchAuthTraffic() {
+	s.mu.Lock()
+	s.lastAuthTraffic = s.now()
+	s.mu.Unlock()
+}
+
+// startReap starts this session's idle-session reaper goroutine (D-22): a
+// real time.Ticker at reapPollInterval feeds runReap below. Called once,
+// from ovpn.go's performPushExchange, at the same point
+// startKeepalive/startReneg are — alongside the data wrapper going live —
+// so it arms without depending on any inbound client traffic ever having
+// touched lastAuthTraffic (lastAuthTraffic is initialized at that same
+// publish point).
+func (s *Session) startReap() {
+	ticker := time.NewTicker(reapPollInterval)
+	go func() {
+		defer ticker.Stop()
+		s.runReap(ticker.C)
+	}()
+}
+
+// runReap is startReap's own core loop, factored out — the same
+// start*/run* split startKeepalive/runKeepalive and startReneg/runReneg
+// already establish — so tests can drive it from an injected tick channel
+// instead of a real reapPollInterval ticker. On each tick, if no
+// authenticated traffic has arrived for at least the server's reap window
+// (s.srv.reapWindow, server-authoritative and independent of what the
+// client believes — D-22), this session is torn down through the existing
+// Close()/stopOnce path: no new teardown path, and the netstack's read
+// loop then observes io.EOF and detaches, with no new coupling in either
+// direction. Exits on stopCh, the same discipline every other per-session
+// goroutine already establishes. A hand-constructed Session with no srv
+// (some fast-tier tests build one directly) never reaps — s.srv is always
+// set for a real session, published before startReap is ever called.
+func (s *Session) runReap(tickCh <-chan time.Time) {
+	for {
+		select {
+		case <-tickCh:
+			if s.srv == nil {
+				continue
+			}
+			s.mu.Lock()
+			last := s.lastAuthTraffic
+			s.mu.Unlock()
+			if s.now().Sub(last) >= s.srv.reapWindow {
+				_ = s.Close()
+				return
+			}
+		case <-s.stopCh:
+			return
+		}
+	}
 }
 
 // emitPing seals and sends one ping keepalive packet directly through

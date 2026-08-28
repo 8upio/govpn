@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/8upio/govpn/internal/datachan"
+	"github.com/8upio/govpn/internal/wire"
 )
 
 // occExitPayload builds the 17-byte explicit-exit-notify payload (occMagic
@@ -277,4 +278,250 @@ func TestExitNotifyOnLameDuckKeyClosesSession(t *testing.T) {
 	if _, err := readWithTimeout(t, sess, buf, 5*time.Second); err != io.EOF {
 		t.Fatalf("Read after lame-duck OCC_EXIT = %v, want io.EOF", err)
 	}
+}
+
+// newReapTestSession builds a minimal Session (mirroring
+// TestPingNeverReachesSessionRead's own minimal-construction style) with a
+// live, self-symmetric data-channel wrapper and an injected clock/reap
+// window, so Task 2's tests can drive handleDataPacket/pump/runReap
+// directly without a real network round trip.
+func newReapTestSession(t testing.TB, clock *fakeClock, reapWindow time.Duration) *Session {
+	t.Helper()
+	wrapper, err := datachan.NewWrapper(testSymmetricDataKeys(t), 1, 0)
+	if err != nil {
+		t.Fatalf("NewWrapper: %v", err)
+	}
+	sess := &Session{
+		primary:   keySlot{wrapper: wrapper},
+		ipInbound: make(chan []byte, ipInboundQueueSize),
+		stopCh:    make(chan struct{}),
+		clock:     clock,
+		srv:       &Server{reapWindow: reapWindow},
+	}
+	sess.lastAuthTraffic = clock.Now()
+	return sess
+}
+
+// TestSilentSessionReaped is Task 2's core D-22 proof: with an injected
+// clock and tick channel, a session with no authenticated traffic for the
+// reap window is closed by runReap.
+func TestSilentSessionReaped(t *testing.T) {
+	clock := newFakeClock()
+	sess := newReapTestSession(t, clock, time.Minute)
+
+	tick := make(chan time.Time)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		sess.runReap(tick)
+	}()
+
+	clock.Advance(2 * time.Minute)
+	tick <- time.Now()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runReap did not close the session once the reap window elapsed")
+	}
+
+	buf := make([]byte, 10)
+	if _, err := readWithTimeout(t, sess, buf, 2*time.Second); err != io.EOF {
+		t.Fatalf("Read after reap = %v, want io.EOF", err)
+	}
+}
+
+// TestAuthenticatedDataResetsReapTimer is Task 2's proof that a
+// successfully-decrypted data packet (primary slot) resets the reap timer:
+// a session receiving one just under the window is not reaped.
+func TestAuthenticatedDataResetsReapTimer(t *testing.T) {
+	clock := newFakeClock()
+	sess := newReapTestSession(t, clock, time.Minute)
+
+	tick := make(chan time.Time)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		sess.runReap(tick)
+	}()
+	defer func() {
+		close(sess.stopCh)
+		<-done
+	}()
+
+	clock.Advance(50 * time.Second)
+
+	sealed, err := sess.primary.wrapper.Seal(nil, bytes.Repeat([]byte{0x22}, 20))
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	sess.handleDataPacket(sealed)
+	tick <- time.Now()
+
+	select {
+	case <-done:
+		t.Fatal("session was reaped even though a data packet reset the timer")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestLameDuckDecryptResetsReapTimer is Task 2's proof that a data packet
+// decrypting under the LAME-DUCK slot resets the reap timer exactly like
+// one decrypting under the primary.
+func TestLameDuckDecryptResetsReapTimer(t *testing.T) {
+	clock := newFakeClock()
+	sess := newReapTestSession(t, clock, time.Minute)
+
+	// Make the primary slot fail to decrypt anything (distinct keys), and
+	// give the lame-duck slot the wrapper that will actually succeed.
+	failingWrapper, err := datachan.NewWrapper(lameDuckTestKeys(0x10), 1, 0)
+	if err != nil {
+		t.Fatalf("NewWrapper (failing primary): %v", err)
+	}
+	lameWrapper, err := datachan.NewWrapper(lameDuckTestKeys(0x50), 1, 1)
+	if err != nil {
+		t.Fatalf("NewWrapper (lame-duck): %v", err)
+	}
+	sess.mu.Lock()
+	sess.primary = keySlot{keyID: 0, wrapper: failingWrapper}
+	sess.lameDuck = keySlot{keyID: 1, wrapper: lameWrapper, mustDie: clock.Now().Add(time.Hour)}
+	sess.mu.Unlock()
+
+	tick := make(chan time.Time)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		sess.runReap(tick)
+	}()
+	defer func() {
+		close(sess.stopCh)
+		<-done
+	}()
+
+	clock.Advance(50 * time.Second)
+
+	sealed, err := lameWrapper.Seal(nil, bytes.Repeat([]byte{0x33}, 20))
+	if err != nil {
+		t.Fatalf("Seal (lame-duck): %v", err)
+	}
+	sess.handleDataPacket(sealed)
+	tick <- time.Now()
+
+	select {
+	case <-done:
+		t.Fatal("session was reaped even though a lame-duck-key data packet reset the timer")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestForgedPacketDoesNotResetReapTimer is Task 2's T-04-07 proof: a
+// packet that fails to authenticate on both slots does NOT reset the reap
+// timer — an attacker cannot keep a dead session alive with garbage.
+func TestForgedPacketDoesNotResetReapTimer(t *testing.T) {
+	clock := newFakeClock()
+	sess := newReapTestSession(t, clock, time.Minute)
+
+	tick := make(chan time.Time)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		sess.runReap(tick)
+	}()
+
+	clock.Advance(50 * time.Second)
+
+	// Garbage bytes: fails to authenticate on the only live (primary)
+	// slot.
+	sess.handleDataPacket(bytes.Repeat([]byte{0xFF}, 60))
+
+	clock.Advance(20 * time.Second) // now 70s since the last REAL touch
+	tick <- time.Now()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("session was not reaped — the forged packet must not have reset the timer")
+	}
+}
+
+// TestReapTimerStopsOnClose is Task 2's proof that the reaper goroutine
+// exits on Close (via stopCh), like every other per-session goroutine.
+func TestReapTimerStopsOnClose(t *testing.T) {
+	clock := newFakeClock()
+	sess := newReapTestSession(t, clock, time.Minute)
+
+	tick := make(chan time.Time)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		sess.runReap(tick)
+	}()
+
+	close(sess.stopCh)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runReap did not exit after stopCh was closed")
+	}
+}
+
+// TestDeliveredControlPacketResetsReapTimer is Task 2's proof that a
+// delivered control packet alone resets the reap timer — a client
+// mid-renegotiation with no data traffic is not reaped.
+func TestDeliveredControlPacketResetsReapTimer(t *testing.T) {
+	f := newRenegTestFixture(t)
+	f.srv.reapWindow = time.Minute
+	sess := f.newSession(t)
+	sess.inbound = make(chan wire.ControlPacket, inboundQueueSize)
+	sess.lastAuthTraffic = f.clock.Now()
+
+	pumpDone := make(chan struct{})
+	go func() {
+		defer close(pumpDone)
+		sess.pump()
+	}()
+
+	reapTick := make(chan time.Time)
+	reapDone := make(chan struct{})
+	go func() {
+		defer close(reapDone)
+		sess.runReap(reapTick)
+	}()
+
+	f.clock.Advance(50 * time.Second)
+
+	sess.inbound <- wire.ControlPacket{
+		Opcode:    wire.OpControlV1,
+		KeyID:     0,
+		SessionID: f.clientSID,
+		PacketID:  0,
+	}
+
+	wantTouch := f.clock.Now()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		sess.mu.Lock()
+		got := sess.lastAuthTraffic
+		sess.mu.Unlock()
+		if got.Equal(wantTouch) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("lastAuthTraffic was never touched by the delivered control packet")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	reapTick <- time.Now()
+
+	select {
+	case <-reapDone:
+		t.Fatal("session was reaped even though a delivered control packet reset the timer")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(sess.stopCh)
+	<-pumpDone
+	<-reapDone
 }
