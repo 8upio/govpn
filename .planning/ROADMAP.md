@@ -137,7 +137,7 @@ Plans:
   2. A client sending explicit-exit-notify ends its session immediately, and the embedder observes the `Session` closing rather than waiting for a timeout
   3. Silent sessions time out and are reaped, and `Session.Close()` tears down all state — a soak run over many connect/disconnect cycles shows goroutine and memory counts flat
 
-**Plans**: 1/4 plans executed
+**Plans**: 2/4 plans executed
 
 Plans:
 **Wave 1**
@@ -146,7 +146,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 04-02-PLAN.md — Exit-notify (data-channel OCC_EXIT, post-decrypt only), idle-session reaping on an injectable clock, `io.EOF` from Read/Write after every teardown cause, no per-session goroutine leaks (SESS-05)
+- [x] 04-02-PLAN.md — Exit-notify (data-channel OCC_EXIT, post-decrypt only), idle-session reaping on an injectable clock, `io.EOF` from Read/Write after every teardown cause, no per-session goroutine leaks (SESS-05)
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
@@ -166,7 +166,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 | 1. Handshake | 4/4 | Complete    | 2026-08-24 |
 | 2. Tunnel Up | 4/4 | Complete    | 2026-08-25 |
 | 3. In-Process Termination | 6/6 | Complete    | 2026-08-27 |
-| 4. Durable Sessions | 1/4 | In Progress|  |
+| 4. Durable Sessions | 2/4 | In Progress|  |
 
 ## Requirement Coverage
 
