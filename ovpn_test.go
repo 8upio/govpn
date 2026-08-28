@@ -204,11 +204,42 @@ func testHandshakeTLSConfig(t testing.TB) (*tls.Config, *x509.CertPool) {
 // framing helpers (readControlString/writeControlString/
 // pushRequestLiteral, push.go) since this file lives in package ovpn.
 type testPushClient struct {
-	pc      net.PacketConn
-	wrapper *tlscrypt.Wrapper
-	conn    *ctrlconn.Conn
-	tlsConn *tls.Conn
-	stop    chan struct{}
+	pc        net.PacketConn
+	wrapper   *tlscrypt.Wrapper
+	clientSID wire.SessionID
+	conn      *ctrlconn.Conn
+	tlsConn   *tls.Conn
+	stop      chan struct{}
+
+	// mu guards conns: testPushClientDemux routes an inbound packet to the
+	// Conn matching its key-id, so a renegotiating test can register a
+	// second, key-id-1 Conn (via renegotiate below) without racing the
+	// demux goroutine that is already reading (04-01-PLAN.md Task 1
+	// action 8).
+	mu    sync.Mutex
+	conns map[uint8]*ctrlconn.Conn
+
+	// dataOut receives a copy of any inbound datagram testPushClientDemux
+	// cannot tls-crypt-unwrap — i.e. every P_DATA_V2 packet the server
+	// sends this client, since the data channel is never tls-crypt wrapped
+	// (04-01-PLAN.md Task 1's rollover test needs to observe the raw bytes
+	// Session.Write sends, but the demux goroutine is the only reader of
+	// client.pc). Buffered so a slow test consumer never blocks the demux
+	// loop; a full buffer drops the newest datagram, mirroring this
+	// package's own non-blocking-queue drop discipline elsewhere.
+	dataOut chan []byte
+
+	// serverInitiatedReneg receives the newly auto-registered Conn
+	// whenever testPushClientDemux sees a SOFT_RESET_V1 for a key-id it
+	// has no registered Conn for yet — mirroring how a real client
+	// reacts to an unprompted, server-initiated soft reset (it does not
+	// speculatively guess the next key-id and start sending before
+	// observing the server's own reset marker; sending prematurely would
+	// permanently trip the server's tls-crypt replay window on every
+	// retransmission of that same packet-id, 04-01-PLAN.md Task 2). A
+	// test drives its own tls.Client(...).Handshake() over the Conn
+	// received here.
+	serverInitiatedReneg chan *ctrlconn.Conn
 }
 
 // newTestPushClient performs the client's hard reset against serverAddr
@@ -246,8 +277,17 @@ func newTestPushClient(t testing.TB, key []byte, serverAddr net.Addr, caPool *x5
 	// rejected.
 	conn := ctrlconn.New(clientSID, wire.SessionID{}, wrapper, packetConnTransport{pc: pc}, serverAddr, nil)
 
-	stop := make(chan struct{})
-	go testPushClientDemux(pc, wrapper, conn, stop)
+	client := &testPushClient{
+		pc:        pc,
+		wrapper:   wrapper,
+		clientSID: clientSID,
+		conn:      conn,
+		stop:                 make(chan struct{}),
+		conns:                map[uint8]*ctrlconn.Conn{0: conn},
+		dataOut:              make(chan []byte, 8),
+		serverInitiatedReneg: make(chan *ctrlconn.Conn, 4),
+	}
+	go testPushClientDemux(client)
 
 	// SendReset transmits the initial hard reset through conn's OWN
 	// send-side reliability window (packet ID 0) — unlike a hand-crafted
@@ -263,46 +303,94 @@ func newTestPushClient(t testing.TB, key []byte, serverAddr net.Addr, caPool *x5
 		t.Fatalf("send hard reset: %v", err)
 	}
 
-	tlsConn := tls.Client(conn, &tls.Config{
+	client.tlsConn = tls.Client(conn, &tls.Config{
 		RootCAs:    caPool,
 		ServerName: testHandshakeServerCN,
 		MinVersion: tls.VersionTLS12,
 	})
 
-	return &testPushClient{pc: pc, wrapper: wrapper, conn: conn, tlsConn: tlsConn, stop: stop}
+	return client
 }
 
-// Close stops the demux goroutine and tears down the client's control
-// channel and UDP socket.
+// renegotiate opens a second client-side Conn at keyID over the SAME
+// client tls-crypt wrapper and session ID (mirroring the server's own
+// runRenegotiation reusing sess.wrapper — 04-RESEARCH.md Pattern 3),
+// registers it in the demux's per-key-id map so inbound packets at that
+// key-id reach it, and sends the triggering SOFT_RESET_V1 — mirroring a
+// real client's own soft-reset request. The caller drives the resulting
+// *tls.Client handshake and Key Method 2 exchange itself, exactly like
+// newTestPushClient's own conn (04-01-PLAN.md Task 1 action 8).
+func (c *testPushClient) renegotiate(t testing.TB, serverAddr net.Addr, keyID uint8) *ctrlconn.Conn {
+	t.Helper()
+
+	newConn := ctrlconn.NewWithKeyID(c.clientSID, wire.SessionID{}, c.wrapper, packetConnTransport{pc: c.pc}, serverAddr, nil, keyID)
+
+	c.mu.Lock()
+	c.conns[keyID] = newConn
+	c.mu.Unlock()
+
+	if err := newConn.SendReset(wire.OpControlSoftResetV1); err != nil {
+		t.Fatalf("send soft reset: %v", err)
+	}
+	return newConn
+}
+
+// Close stops the demux goroutine and tears down every Conn this client
+// ever registered (the initial key-id-0 Conn plus any renegotiated Conn)
+// and its UDP socket.
 func (c *testPushClient) Close() {
 	close(c.stop)
-	_ = c.conn.Close()
+	c.mu.Lock()
+	conns := make([]*ctrlconn.Conn, 0, len(c.conns))
+	for _, conn := range c.conns {
+		conns = append(conns, conn)
+	}
+	c.mu.Unlock()
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
 	_ = c.pc.Close()
 }
 
 // testPushClientDemux mirrors internal/ctrlconn's own conn_test.go demux
 // helper: unwrap under the client's own tls-crypt Wrapper, parse the
-// plaintext body, and hand the result to conn.Deliver.
-func testPushClientDemux(pc net.PacketConn, wrapper *tlscrypt.Wrapper, conn *ctrlconn.Conn, stop <-chan struct{}) {
+// plaintext body, and route the result by key-id to the matching
+// registered Conn (client.conns) — extended from a single fixed conn so a
+// renegotiating test's second, key-id-1 Conn also receives its own control
+// traffic (04-01-PLAN.md Task 1 action 8). A key-id with no registered Conn
+// is silently dropped, mirroring the server's own pump/routeControlPacket
+// drop discipline.
+func testPushClientDemux(client *testPushClient) {
 	buf := make([]byte, maxDatagramSize)
 	for {
 		select {
-		case <-stop:
+		case <-client.stop:
 			return
 		default:
 		}
-		if err := pc.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		if err := client.pc.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
 			return
 		}
-		n, _, err := pc.ReadFrom(buf)
+		n, _, err := client.pc.ReadFrom(buf)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				continue
 			}
 			return
 		}
-		header, plaintext, err := wrapper.Unwrap(nil, buf[:n])
+		header, plaintext, err := client.wrapper.Unwrap(nil, buf[:n])
 		if err != nil {
+			// Not a tls-crypt-wrapped control packet — the data channel is
+			// never tls-crypt wrapped, so this is exactly what every
+			// P_DATA_V2 packet looks like from here. Forward a copy to
+			// dataOut for any test that needs to observe raw data-channel
+			// bytes (e.g. Session.Write's output) rather than dropping it.
+			raw := make([]byte, n)
+			copy(raw, buf[:n])
+			select {
+			case client.dataOut <- raw:
+			default:
+			}
 			continue
 		}
 		opcode, keyID := wire.ParseHeaderByte(header[0])
@@ -312,7 +400,32 @@ func testPushClientDemux(pc net.PacketConn, wrapper *tlscrypt.Wrapper, conn *ctr
 		if err != nil {
 			continue
 		}
-		conn.Deliver(cp)
+		client.mu.Lock()
+		target := client.conns[keyID]
+		if target == nil && opcode == wire.OpControlSoftResetV1 {
+			// A server-initiated soft reset for a key-id this client has
+			// never seen: react exactly like a real client would — open a
+			// new Conn for it now, over the SAME client wrapper and
+			// session ID, and report it so a test can drive its own
+			// tls.Client(...).Handshake() (04-01-PLAN.md Task 2). Building
+			// this Conn any earlier (e.g. speculatively, before the server
+			// ever sent anything) would have nowhere to route on the
+			// server side yet, and every retransmission of that same
+			// packet-id would then be permanently rejected by the
+			// server's tls-crypt replay window once the first one had
+			// already been seen and dropped.
+			newConn := ctrlconn.NewWithKeyID(client.clientSID, wire.SessionID{}, client.wrapper, packetConnTransport{pc: client.pc}, client.conn.RemoteAddr(), nil, keyID)
+			client.conns[keyID] = newConn
+			target = newConn
+			select {
+			case client.serverInitiatedReneg <- newConn:
+			default:
+			}
+		}
+		client.mu.Unlock()
+		if target != nil {
+			target.Deliver(cp)
+		}
 	}
 }
 
@@ -683,8 +796,8 @@ func TestPerformPushExchangeReleasesAllocationWhenSessionAlreadyClosing(t *testi
 	if sess.assignedIP != nil {
 		t.Errorf("sess.assignedIP = %v, want nil — must not publish state for an already-closing session", sess.assignedIP)
 	}
-	if sess.dataWrapper != nil {
-		t.Error("sess.dataWrapper is set — must not publish state for an already-closing session")
+	if sess.primary.wrapper != nil {
+		t.Error("sess.primary.wrapper is set — must not publish state for an already-closing session")
 	}
 
 	srv.mu.Lock()
@@ -1479,11 +1592,11 @@ func TestSessionReadWriteDatagramSemantics(t *testing.T) {
 	defer clientPC.Close()
 
 	sess := &Session{
-		srv:         &Server{pc: serverPC},
-		RemoteAddr:  clientPC.LocalAddr(),
-		dataWrapper: serverWrapper,
-		ipInbound:   make(chan []byte, ipInboundQueueSize),
-		stopCh:      make(chan struct{}),
+		srv:        &Server{pc: serverPC},
+		RemoteAddr: clientPC.LocalAddr(),
+		primary:    keySlot{wrapper: serverWrapper},
+		ipInbound:  make(chan []byte, ipInboundQueueSize),
+		stopCh:     make(chan struct{}),
 	}
 
 	// --- Write: seals exactly one packet per call, sent to RemoteAddr. ---
@@ -1570,9 +1683,9 @@ func TestPingNeverReachesSessionRead(t *testing.T) {
 		t.Fatalf("NewWrapper: %v", err)
 	}
 	sess := &Session{
-		dataWrapper: wrapper,
-		ipInbound:   make(chan []byte, ipInboundQueueSize),
-		stopCh:      make(chan struct{}),
+		primary:   keySlot{wrapper: wrapper},
+		ipInbound: make(chan []byte, ipInboundQueueSize),
+		stopCh:    make(chan struct{}),
 	}
 
 	pingSealed, err := wrapper.SealPing(nil)
@@ -1630,10 +1743,10 @@ func TestServerEmitsPingOnSchedule(t *testing.T) {
 	defer clientPC.Close()
 
 	sess := &Session{
-		srv:         &Server{pc: serverPC},
-		RemoteAddr:  clientPC.LocalAddr(),
-		dataWrapper: wrapper,
-		stopCh:      make(chan struct{}),
+		srv:        &Server{pc: serverPC},
+		RemoteAddr: clientPC.LocalAddr(),
+		primary:    keySlot{wrapper: wrapper},
+		stopCh:     make(chan struct{}),
 	}
 
 	tick := make(chan time.Time)
@@ -1691,7 +1804,7 @@ func TestPingTimerStopsOnClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewWrapper: %v", err)
 	}
-	sess := &Session{dataWrapper: wrapper, stopCh: make(chan struct{})}
+	sess := &Session{primary: keySlot{wrapper: wrapper}, stopCh: make(chan struct{})}
 
 	tick := make(chan time.Time)
 	done := make(chan struct{})
@@ -1721,7 +1834,7 @@ func TestPingTimerStopsOnClose(t *testing.T) {
 // Session.Write path: a real embedder Write and an independently-timer-
 // triggered ping both reach the client as two separate packets, and the
 // Write call's own return value is unaffected by the concurrently-emitted
-// ping — proving the ping used dataWrapper/srv.pc directly (emitPing),
+// ping — proving the ping used primary.wrapper/srv.pc directly (emitPing),
 // never Session.Write itself.
 func TestPingEmissionDoesNotConsumeSessionWriteQuota(t *testing.T) {
 	wrapper, err := datachan.NewWrapper(testSymmetricDataKeys(t), 1, 0)
@@ -1740,10 +1853,10 @@ func TestPingEmissionDoesNotConsumeSessionWriteQuota(t *testing.T) {
 	defer clientPC.Close()
 
 	sess := &Session{
-		srv:         &Server{pc: serverPC},
-		RemoteAddr:  clientPC.LocalAddr(),
-		dataWrapper: wrapper,
-		stopCh:      make(chan struct{}),
+		srv:        &Server{pc: serverPC},
+		RemoteAddr: clientPC.LocalAddr(),
+		primary:    keySlot{wrapper: wrapper},
+		stopCh:     make(chan struct{}),
 	}
 
 	payload := bytes.Repeat([]byte{0x11}, 60)
@@ -1816,7 +1929,7 @@ func TestPingEmissionDoesNotConsumeSessionWriteQuota(t *testing.T) {
 func TestHandleDatagramAcceptsShortDataChannelPing(t *testing.T) {
 	const peerID = 7
 
-	wrapper, err := datachan.NewWrapper(testSymmetricDataKeys(t), peerID, dataChannelKeyID)
+	wrapper, err := datachan.NewWrapper(testSymmetricDataKeys(t), peerID, 0)
 	if err != nil {
 		t.Fatalf("NewWrapper: %v", err)
 	}
@@ -1839,9 +1952,9 @@ func TestHandleDatagramAcceptsShortDataChannelPing(t *testing.T) {
 	defer serverPC.Close()
 
 	sess := &Session{
-		dataWrapper: wrapper,
-		ipInbound:   make(chan []byte, ipInboundQueueSize),
-		stopCh:      make(chan struct{}),
+		primary:   keySlot{wrapper: wrapper},
+		ipInbound: make(chan []byte, ipInboundQueueSize),
+		stopCh:    make(chan struct{}),
 	}
 	s := &Server{
 		pc:           serverPC,
@@ -1918,7 +2031,7 @@ func TestPerformPushExchangeFieldWritesRaceSafeAgainstClose(t *testing.T) {
 			sess.mu.Unlock()
 
 			sess.mu.Lock()
-			sess.dataWrapper = wrapper
+			sess.primary = keySlot{wrapper: wrapper}
 			sess.mu.Unlock()
 			close(writerDone)
 		}()
@@ -1976,11 +2089,11 @@ func TestCloseRemovesRoutingEntryBeforeReleasingPeerID(t *testing.T) {
 		dataSessions: make(map[uint32]*Session),
 	}
 	sess := &Session{
-		srv:         srv,
-		stopCh:      make(chan struct{}),
-		assignedIP:  ip,
-		peerID:      peerID,
-		dataWrapper: wrapper,
+		srv:        srv,
+		stopCh:     make(chan struct{}),
+		assignedIP: ip,
+		peerID:     peerID,
+		primary:    keySlot{wrapper: wrapper},
 	}
 	srv.mu.Lock()
 	srv.dataSessions[peerID] = sess
