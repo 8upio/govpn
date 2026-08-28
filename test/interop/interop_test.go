@@ -1310,16 +1310,18 @@ const soakGoroutineTolerance = 2
 // absorb Go's allocator behavior (arena growth, GC bookkeeping, one-time
 // lazy initialization the runtime itself performs) without absorbing 19
 // cycles' worth of retained per-session state (T-04-16: retained sessions,
-// wrappers, or lame-duck slots). Observed on a real 20-cycle run against
-// this plan's own committed code: soak_heap_baseline=282816
-// soak_heap_final=321056 (delta=+38240 bytes, ~37 KiB) — 1 MiB is roughly
-// 28x that observed noise, generous headroom for run-to-run allocator
-// variance, while staying far below what 19 cycles' worth of retained
-// *ovpn.Session state (each carrying its own TLS conn, ctrlconn buffers,
-// and data-channel key material) would add if never released (Task 3
-// demonstrates this by deliberately retaining every closed session and
-// observing the assertion fail).
-const soakHeapToleranceBytes = 1024 * 1024 // 1 MiB
+// wrappers, or lame-duck slots). Observed on real 20-cycle runs against
+// this plan's own committed code: two clean runs showed
+// soak_heap_baseline/final deltas of +38240 and +40688 bytes (~37-40 KiB)
+// — ordinary allocator noise. 256 KiB is roughly 6-7x that noise, generous
+// run-to-run headroom, while sitting well below what deliberately
+// retaining all 20 cycles' own closed *ovpn.Session values (each carrying
+// its own TLS conn, ctrlconn buffers, and data-channel key material)
+// actually produced when Task 3 demonstrated this assertion failing:
+// delta=+621224 bytes (~606 KiB) — comfortably over this tolerance,
+// confirming it is tight enough to catch a real per-session heap leak
+// without flagging ordinary run-to-run noise.
+const soakHeapToleranceBytes = 256 * 1024 // 256 KiB
 
 // soakMaxDistinctIPs bounds how many DISTINCT tunnel IPs may appear across
 // all soakCycleCount cycles (04-04-PLAN.md Task 2's pool-reuse assertion,
