@@ -2,6 +2,7 @@ package ovpn
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -18,6 +19,38 @@ import (
 	"github.com/8upio/govpn/internal/tlscrypt"
 	"github.com/8upio/govpn/internal/wire"
 )
+
+// occMagic is OpenVPN's explicit-exit-notify magic prefix (D-21): sent as
+// an ordinary encrypted data-channel payload, indistinguishable from IP
+// traffic at the wire level until decrypted.
+// Source: occ.c:55-58.
+var occMagic = []byte{
+	0x28, 0x7f, 0x34, 0x6b, 0xd4, 0xef, 0x7a, 0x81,
+	0x2d, 0x56, 0xb8, 0xd3, 0xaf, 0xc5, 0x45, 0x9c,
+}
+
+// occExit is the OCC_EXIT opcode byte that follows occMagic in an
+// explicit-exit-notify payload (D-21).
+// Source: occ.h:29-30,67 (OCC_STRING_SIZE=16, OCC_EXIT=6).
+const occExit = 0x06
+
+// isExitNotify reports whether plaintext is a decrypted data-channel
+// explicit-exit-notify payload (D-21): occMagic followed by occExit. This
+// is ONLY ever meaningful on AUTHENTICATED plaintext, after a successful
+// datachan.Wrapper.Open — the data channel is always encrypted first, so a
+// pre-decrypt check against raw or ciphertext bytes could never match, and
+// would move an unauthenticated attacker's bytes into a teardown decision
+// (04-RESEARCH.md Anti-Pattern: "checking for OCC_EXIT before decryption").
+// A non-match is the overwhelmingly common case (every real IP packet) and
+// must stay a cheap, silent, non-error branch — never logged, never
+// counted as an anomaly (Anti-Pattern: "treating a non-match as an
+// error"). bytes.Equal is the correct tool here, not crypto/subtle: this
+// is a public 16-byte protocol constant, not a secret, and the reference's
+// own buf_string_match_head is not constant-time either (RESEARCH's
+// "Don't Hand-Roll", row 1).
+func isExitNotify(plaintext []byte) bool {
+	return len(plaintext) >= 17 && bytes.Equal(plaintext[:16], occMagic) && plaintext[16] == occExit
+}
 
 // keySlot holds one TLS key-id's live data-channel state — the reference's
 // own two-slot key_state[KS_PRIMARY]/key_state[KS_LAME_DUCK] design
@@ -67,9 +100,16 @@ type keySlot struct {
 // buffer too small for the next packet on Read returns an error rather
 // than truncating — backed by the AES-256-GCM data channel
 // (internal/datachan). A 16-byte ping keepalive is absorbed entirely
-// inside the decrypt path and never reaches Read's caller (D-11). Close
-// tears down this session's control channel and releases its tunnel IP
-// and peer-id back to the pool.
+// inside the decrypt path and never reaches Read's caller (D-11).
+//
+// A Session ends in exactly one of three ways, all of which flow through
+// the same Close()/stopOnce contract and leave both Read and Write
+// returning io.EOF: the embedder calling Close directly, the client
+// sending an explicit-exit-notify on the authenticated data channel
+// (D-21), or the server's own idle-session reaper closing a session that
+// has gone silent for the reap window (D-22). In every case, Close tears
+// down this session's control channel and releases its tunnel IP and
+// peer-id back to the pool.
 type Session struct {
 	// SessionID is this session's server-assigned 8-byte control-channel
 	// session ID.
@@ -182,9 +222,10 @@ type Session struct {
 	pushRequested atomic.Bool
 
 	// mu guards assignedIP, peerID, primary, lameDuck, pendingReneg,
-	// pendingRenegKeyID, and lastRenegAccepted below (WR-03, extended by
-	// 04-01-PLAN.md Task 1 from the single dataWrapper field it originally
-	// guarded to this phase's two-slot key state): ovpn.go's
+	// pendingRenegKeyID, lastRenegAccepted, and lastAuthTraffic below
+	// (WR-03, extended by 04-01-PLAN.md Task 1 from the single dataWrapper
+	// field it originally guarded to this phase's two-slot key state, and
+	// by 04-02-PLAN.md Task 2 to lastAuthTraffic — no new mutex): ovpn.go's
 	// performPushExchange and runRenegotiation (running on this session's
 	// own goroutines) write them, while Close — which
 	// enforceHandshakeWindow's timeout goroutine can invoke concurrently at
@@ -256,6 +297,19 @@ type Session struct {
 	// rapidly. The zero value means "never renegotiated": the first one is
 	// always allowed through this check. Guarded by mu.
 	lastRenegAccepted time.Time
+
+	// lastAuthTraffic is when this session last received AUTHENTICATED
+	// traffic — a delivered control packet (ovpn.go's pump) or a
+	// successfully-decrypted data packet, primary or lame-duck slot
+	// (handleDataPacket) — mirroring the reference's own two reset sites
+	// (Pattern 6: forward.c:1093-1103 control path, forward.c:1184 data
+	// path). Session.runReap compares s.now() against this to decide
+	// whether to reap (D-22). A packet that fails to authenticate never
+	// touches this (T-04-07): an attacker cannot keep a dead session alive
+	// with garbage. Initialized at the same publish point
+	// startKeepalive/startReneg are (ovpn.go's performPushExchange).
+	// Guarded by mu.
+	lastAuthTraffic time.Time
 
 	// ipInbound is fed decrypted IP packets by handleDataDatagram's decrypt
 	// path (ovpn.go) and drained by Read. Sized ipInboundQueueSize (D-14,
@@ -424,8 +478,18 @@ func (s *Session) Read(p []byte) (int, error) {
 // Write encrypts p as one P_DATA_V2 packet (D-05: one full IP packet per
 // call) and sends it to the client's UDP address over the same
 // net.PacketConn the control channel uses. It returns len(p) on success,
-// matching io.Writer's contract for a full write.
+// matching io.Writer's contract for a full write. After this session has
+// been torn down — by any of the three causes Session's own doc comment
+// names (embedder Close, client exit-notify, idle reap) — Write returns
+// io.EOF (D-22), distinct from the "data channel not yet established"
+// error below, which is the genuinely-pre-tunnel-up case: a session that
+// is merely still negotiating is not the same as one that has already
+// ended.
 func (s *Session) Write(p []byte) (int, error) {
+	if s.closing() {
+		return 0, io.EOF
+	}
+
 	s.mu.Lock()
 	wrapper := s.primary.wrapper
 	s.mu.Unlock()
@@ -471,7 +535,9 @@ func (s *Session) handleDataPacket(packet []byte) {
 		// still live: try primary first (the common case, cheapest),
 		// lameDuck only on failure and only before its mustDie deadline
 		// (Pitfall 5) — both failing is the existing silent drop (T-02-17):
-		// no allocation, no logging, no per-attacker state.
+		// no allocation, no logging, no per-attacker state, and — per
+		// T-04-07 — no touch of lastAuthTraffic: an attacker cannot keep a
+		// dead session alive with garbage that never authenticates.
 		if lameDuck.wrapper == nil || !s.now().Before(lameDuck.mustDie) {
 			return
 		}
@@ -480,6 +546,24 @@ func (s *Session) handleDataPacket(packet []byte) {
 			return
 		}
 	}
+
+	// D-22/Pattern 6 (forward.c:1184): any successfully-decrypted data
+	// packet — primary or lame-duck — resets the idle-reap timer, exactly
+	// like a delivered control packet does (ovpn.go's pump).
+	s.touchAuthTraffic()
+
+	// D-21/Pattern 5 (forward.c:1196-1207): checked ONLY here, after a
+	// successful Open, before ever reaching the ipInbound delivery select
+	// below — never on raw or ciphertext bytes (isExitNotify's own doc
+	// comment). A match tears the session down immediately through the
+	// existing Close()/stopOnce path, adding no new teardown path; the
+	// payload itself is never delivered to ipInbound and never treated as
+	// an error.
+	if isExitNotify(plaintext) {
+		_ = s.Close()
+		return
+	}
+
 	select {
 	case s.ipInbound <- plaintext:
 	case <-s.stopCh:
@@ -652,6 +736,66 @@ func (s *Session) checkReneg() {
 	// WriteTo error below.
 	_ = newConn.SendReset(wire.OpControlSoftResetV1)
 	go s.srv.runRenegotiation(s, newConn, keyID)
+}
+
+// touchAuthTraffic stamps lastAuthTraffic with s.now() (D-22, Pattern 6:
+// forward.c:1093-1103 control path, forward.c:1184 data path). Called only
+// from a delivered control-packet path (ovpn.go's pump) or after a
+// successful data-channel decrypt (handleDataPacket) — never for traffic
+// that failed to authenticate (T-04-07). Guarded by mu, the same lock
+// lastAuthTraffic itself is guarded by.
+func (s *Session) touchAuthTraffic() {
+	s.mu.Lock()
+	s.lastAuthTraffic = s.now()
+	s.mu.Unlock()
+}
+
+// startReap starts this session's idle-session reaper goroutine (D-22): a
+// real time.Ticker at reapPollInterval feeds runReap below. Called once,
+// from ovpn.go's performPushExchange, at the same point
+// startKeepalive/startReneg are — alongside the data wrapper going live —
+// so it arms without depending on any inbound client traffic ever having
+// touched lastAuthTraffic (lastAuthTraffic is initialized at that same
+// publish point).
+func (s *Session) startReap() {
+	ticker := time.NewTicker(reapPollInterval)
+	go func() {
+		defer ticker.Stop()
+		s.runReap(ticker.C)
+	}()
+}
+
+// runReap is startReap's own core loop, factored out — the same
+// start*/run* split startKeepalive/runKeepalive and startReneg/runReneg
+// already establish — so tests can drive it from an injected tick channel
+// instead of a real reapPollInterval ticker. On each tick, if no
+// authenticated traffic has arrived for at least the server's reap window
+// (s.srv.reapWindow, server-authoritative and independent of what the
+// client believes — D-22), this session is torn down through the existing
+// Close()/stopOnce path: no new teardown path, and the netstack's read
+// loop then observes io.EOF and detaches, with no new coupling in either
+// direction. Exits on stopCh, the same discipline every other per-session
+// goroutine already establishes. A hand-constructed Session with no srv
+// (some fast-tier tests build one directly) never reaps — s.srv is always
+// set for a real session, published before startReap is ever called.
+func (s *Session) runReap(tickCh <-chan time.Time) {
+	for {
+		select {
+		case <-tickCh:
+			if s.srv == nil {
+				continue
+			}
+			s.mu.Lock()
+			last := s.lastAuthTraffic
+			s.mu.Unlock()
+			if s.now().Sub(last) >= s.srv.reapWindow {
+				_ = s.Close()
+				return
+			}
+		case <-s.stopCh:
+			return
+		}
+	}
 }
 
 // emitPing seals and sends one ping keepalive packet directly through

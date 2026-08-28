@@ -169,6 +169,28 @@ const (
 	// drift apart. Not configurable in v1 (RESEARCH.md Deferred Ideas).
 	pingIntervalSeconds = 10
 	pingInterval        = pingIntervalSeconds * time.Second
+
+	// defaultReapWindow is how long a session may go without any
+	// authenticated traffic (control or data, primary or lame-duck) before
+	// the idle-session reaper (Session.startReap/runReap) closes it
+	// (D-22): this is the ping-restart window 04-CONTEXT.md locks — 60
+	// seconds — server-authoritative and deliberately independent of what
+	// the client believes. Expressed as 6*pingInterval rather than a bare
+	// 60*time.Second so the relationship to the pushed keepalive schedule
+	// (buildPushReply's own `ping N`) is structural, not just documented:
+	// a live client emitting on that pushed schedule resets this window
+	// many times over before it can ever expire. Not configurable via
+	// Config in v1 (deliberately deferred, like RenegSec's own
+	// non-pushed-to-client posture, D-19) — Server.reapWindow below exists
+	// only so tests can override it directly.
+	// Source: 04-CONTEXT.md D-22; forward.c:1093-1103/1184 (Pattern 6).
+	defaultReapWindow = 6 * pingInterval
+
+	// reapPollInterval is how often each session's idle-reap timer
+	// (Session.startReap/runReap) checks whether it's due — a
+	// poll-granularity constant, not a reference constant, mirroring
+	// renegPollInterval's own precedent above.
+	reapPollInterval = 1 * time.Second
 )
 
 // nextKeyID computes the next TLS key-id in the renegotiation sequence:
@@ -220,6 +242,14 @@ type Server struct {
 	// teardown path without waiting a real minute.
 	handshakeWindow time.Duration
 
+	// reapWindow bounds how long a session may go without any
+	// authenticated traffic before Session.runReap closes it (D-22). It
+	// defaults to defaultReapWindow and exists as a field only so tests can
+	// exercise idle-session reaping without waiting a real 60 seconds —
+	// the same test-injectable-field precedent handshakeWindow above
+	// already establishes.
+	reapWindow time.Duration
+
 	// pool is this server's tunnel-IP and peer-id allocator, built from
 	// Config.Network in Serve. nil if Config.Network was never set — a
 	// session that reaches the PUSH_REQUEST/PUSH_REPLY exchange with a nil
@@ -260,6 +290,7 @@ func NewServer(cfg Config) *Server {
 	return &Server{
 		cfg:             cfg,
 		handshakeWindow: reliable.HandshakeWindow,
+		reapWindow:      defaultReapWindow,
 		sessions:        make(map[sessionKey]*Session),
 		dataSessions:    make(map[uint32]*Session),
 	}
@@ -575,6 +606,12 @@ func (sess *Session) pump() {
 		case cp := <-sess.inbound:
 			if target := sess.routeControlPacket(cp.KeyID); target != nil {
 				target.Deliver(cp)
+				// D-22/Pattern 6 (forward.c:1093-1103): reset the idle-reap
+				// timer only for a packet actually delivered to a slot's
+				// Conn — never for one routeControlPacket found no match
+				// for (mirrors the reference resetting only AFTER
+				// tls_pre_decrypt succeeded).
+				sess.touchAuthTraffic()
 			}
 		case <-sess.stopCh:
 			return
@@ -758,6 +795,11 @@ func (s *Server) performPushExchange(sess *Session, w io.Writer) error {
 				established: sess.now(),
 			}
 			sess.ipInbound = ipInbound
+			// D-22: initialized here, at the same publish point the data
+			// wrapper goes live, so the reaper (started right below) can
+			// never observe a zero-value lastAuthTraffic and reap a
+			// session that just this moment came up.
+			sess.lastAuthTraffic = sess.now()
 			s.mu.Lock()
 			s.dataSessions[peerID] = sess
 			s.mu.Unlock()
@@ -778,6 +820,12 @@ func (s *Server) performPushExchange(sess *Session, w io.Writer) error {
 			// startKeepalive is, so it can never start for a session the
 			// closing check just decided is dead.
 			sess.startReneg()
+
+			// D-22: the idle-session reaper starts here too, alongside the
+			// data wrapper and lastAuthTraffic's own initialization above,
+			// so it can never start for a session the closing check just
+			// decided is dead.
+			sess.startReap()
 		}
 
 		reply := buildPushReply(sess.assignedIP, s.cfg.Network, sess.peerID, cipher)

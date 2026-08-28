@@ -396,9 +396,20 @@ func TestRenegTimerRearmsAfterRollover(t *testing.T) {
 			},
 		},
 		handshakeWindow: reliable.HandshakeWindow,
-		sessions:        make(map[sessionKey]*Session),
-		dataSessions:    make(map[uint32]*Session),
-		clock:           clock,
+		// This test jumps the injected clock forward 2 hours (below) to
+		// make the reneg-sec poller observe an already-elapsed deadline —
+		// it doesn't exercise 04-02's idle-reap mechanism at all, so
+		// reapWindow must be set well past that jump (a hand-built Server
+		// bypasses NewServer's own defaultReapWindow default, mirroring
+		// handshakeWindow's identical explicit-set-required precedent
+		// above): without this, runReap would observe the same 2-hour
+		// clock jump against a zero-value reapWindow and reap the session
+		// before this test's own server-initiated renegotiation ever
+		// completes.
+		reapWindow:   24 * time.Hour,
+		sessions:     make(map[sessionKey]*Session),
+		dataSessions: make(map[uint32]*Session),
+		clock:        clock,
 	}
 	go func() { _ = srv.Serve(serverPC) }()
 	defer srv.Close()
