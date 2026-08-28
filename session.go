@@ -2,6 +2,7 @@ package ovpn
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -18,6 +19,38 @@ import (
 	"github.com/8upio/govpn/internal/tlscrypt"
 	"github.com/8upio/govpn/internal/wire"
 )
+
+// occMagic is OpenVPN's explicit-exit-notify magic prefix (D-21): sent as
+// an ordinary encrypted data-channel payload, indistinguishable from IP
+// traffic at the wire level until decrypted.
+// Source: occ.c:55-58.
+var occMagic = []byte{
+	0x28, 0x7f, 0x34, 0x6b, 0xd4, 0xef, 0x7a, 0x81,
+	0x2d, 0x56, 0xb8, 0xd3, 0xaf, 0xc5, 0x45, 0x9c,
+}
+
+// occExit is the OCC_EXIT opcode byte that follows occMagic in an
+// explicit-exit-notify payload (D-21).
+// Source: occ.h:29-30,67 (OCC_STRING_SIZE=16, OCC_EXIT=6).
+const occExit = 0x06
+
+// isExitNotify reports whether plaintext is a decrypted data-channel
+// explicit-exit-notify payload (D-21): occMagic followed by occExit. This
+// is ONLY ever meaningful on AUTHENTICATED plaintext, after a successful
+// datachan.Wrapper.Open — the data channel is always encrypted first, so a
+// pre-decrypt check against raw or ciphertext bytes could never match, and
+// would move an unauthenticated attacker's bytes into a teardown decision
+// (04-RESEARCH.md Anti-Pattern: "checking for OCC_EXIT before decryption").
+// A non-match is the overwhelmingly common case (every real IP packet) and
+// must stay a cheap, silent, non-error branch — never logged, never
+// counted as an anomaly (Anti-Pattern: "treating a non-match as an
+// error"). bytes.Equal is the correct tool here, not crypto/subtle: this
+// is a public 16-byte protocol constant, not a secret, and the reference's
+// own buf_string_match_head is not constant-time either (RESEARCH's
+// "Don't Hand-Roll", row 1).
+func isExitNotify(plaintext []byte) bool {
+	return len(plaintext) >= 17 && bytes.Equal(plaintext[:16], occMagic) && plaintext[16] == occExit
+}
 
 // keySlot holds one TLS key-id's live data-channel state — the reference's
 // own two-slot key_state[KS_PRIMARY]/key_state[KS_LAME_DUCK] design
@@ -480,6 +513,19 @@ func (s *Session) handleDataPacket(packet []byte) {
 			return
 		}
 	}
+
+	// D-21/Pattern 5 (forward.c:1196-1207): checked ONLY here, after a
+	// successful Open, before ever reaching the ipInbound delivery select
+	// below — never on raw or ciphertext bytes (isExitNotify's own doc
+	// comment). A match tears the session down immediately through the
+	// existing Close()/stopOnce path, adding no new teardown path; the
+	// payload itself is never delivered to ipInbound and never treated as
+	// an error.
+	if isExitNotify(plaintext) {
+		_ = s.Close()
+		return
+	}
+
 	select {
 	case s.ipInbound <- plaintext:
 	case <-s.stopCh:

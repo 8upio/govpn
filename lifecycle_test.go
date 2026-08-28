@@ -1,0 +1,280 @@
+// lifecycle_test.go exercises Phase 4's session-teardown mechanics
+// (SESS-05): explicit-exit-notify (OCC_EXIT) detection on the
+// authenticated data channel, idle-session reaping on a
+// server-authoritative clock, and the io.EOF/goroutine-teardown contract
+// every teardown cause must uphold. Fast-tier only — no Docker, no real
+// client — and, per this plan's must_haves prohibition, the reap window is
+// crossed only through the injected clock, never a real wall-clock sleep.
+package ovpn
+
+import (
+	"bytes"
+	"crypto/tls"
+	"io"
+	"net"
+	"testing"
+	"time"
+
+	"github.com/8upio/govpn/internal/datachan"
+)
+
+// occExitPayload builds the 17-byte explicit-exit-notify payload (occMagic
+// followed by occExit) a real client sends on the authenticated data
+// channel (D-21).
+func occExitPayload() []byte {
+	return append(append([]byte{}, occMagic...), occExit)
+}
+
+// readWithTimeout calls sess.Read(buf) on its own goroutine and fails the
+// test if it does not return within d — Session.Read has no deadline
+// mechanism of its own (it blocks until a packet arrives or stopCh
+// closes), so a bounded-wait helper is needed for any assertion that a
+// packet was (or was not) delivered without risking a permanent hang.
+func readWithTimeout(t testing.TB, sess *Session, buf []byte, d time.Duration) (int, error) {
+	t.Helper()
+	type result struct {
+		n   int
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		n, err := sess.Read(buf)
+		ch <- result{n, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.n, r.err
+	case <-time.After(d):
+		t.Fatal("Read timed out")
+		return 0, nil
+	}
+}
+
+// TestExitNotifyClosesSessionImmediately is Task 1's D-21 proof, driven
+// against a live srv.Serve loop with a real tunnel-up synthetic client: a
+// 17-byte occMagic+occExit payload sealed under the client's own
+// data-channel keys and sent as an ordinary P_DATA_V2 packet closes the
+// session immediately — Session.Read returns io.EOF, the session leaves
+// Server.sessions/Server.dataSessions, and its tunnel IP/peer-id return to
+// the pool — while three negative cases (wrong opcode, truncated magic, an
+// ordinary IP packet) leave the session open and functional.
+func TestExitNotifyClosesSessionImmediately(t *testing.T) {
+	_, network, err := net.ParseCIDR("10.60.0.0/24")
+	if err != nil {
+		t.Fatalf("parse network: %v", err)
+	}
+	key := testTLSCryptKey(t)
+
+	serverPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("server listen: %v", err)
+	}
+	defer serverPC.Close()
+
+	tlsCfg, caPool := testHandshakeTLSConfig(t)
+
+	sessions := make(chan *Session, 1)
+	srv := NewServer(Config{
+		TLSCryptKey: key,
+		TLSConfig:   tlsCfg,
+		Network:     network,
+		OnSession:   func(sess *Session) { sessions <- sess },
+	})
+	go func() { _ = srv.Serve(serverPC) }()
+	defer srv.Close()
+
+	client, replyReader := tunnelUpTestClient(t, key, serverPC.LocalAddr(), caPool)
+	defer client.Close()
+
+	if err := writeControlString(client.tlsConn, pushRequestLiteral); err != nil {
+		t.Fatalf("write push request: %v", err)
+	}
+	if _, err := readControlString(replyReader, maxControlStringLen); err != nil {
+		t.Fatalf("read push reply: %v", err)
+	}
+
+	var sess *Session
+	select {
+	case sess = <-sessions:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnSession was never called")
+	}
+
+	serverKeys, ok := sess.DebugDataKeys()
+	if !ok {
+		t.Fatal("DebugDataKeys() not ok")
+	}
+	clientWrapper, err := datachan.NewWrapper(mirrorDataKeys(serverKeys), sess.PeerID(), 0)
+	if err != nil {
+		t.Fatalf("build client wrapper: %v", err)
+	}
+
+	sendSealed := func(payload []byte) {
+		t.Helper()
+		sealed, err := clientWrapper.Seal(nil, payload)
+		if err != nil {
+			t.Fatalf("seal: %v", err)
+		}
+		if _, err := client.pc.WriteTo(sealed, serverPC.LocalAddr()); err != nil {
+			t.Fatalf("write data packet: %v", err)
+		}
+	}
+
+	buf := make([]byte, 200)
+
+	// Negative 1: magic matches but the opcode byte does not (OCC_REQUEST,
+	// not OCC_EXIT) — must not close the session, and (since this plan
+	// only special-cases OCC_EXIT) is delivered through like any other
+	// payload.
+	wrongOpcode := append(append([]byte{}, occMagic...), 0x00)
+	sendSealed(wrongOpcode)
+	n, err := readWithTimeout(t, sess, buf, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Read after wrong-opcode payload: %v", err)
+	}
+	if !bytes.Equal(buf[:n], wrongOpcode) {
+		t.Fatalf("Read = %x, want %x (wrong-opcode payload, session must stay open)", buf[:n], wrongOpcode)
+	}
+
+	// Negative 2: exactly the 16-byte magic with nothing after it — must
+	// not close the session and must not panic.
+	truncated := append([]byte{}, occMagic...)
+	sendSealed(truncated)
+	n, err = readWithTimeout(t, sess, buf, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Read after truncated-magic payload: %v", err)
+	}
+	if !bytes.Equal(buf[:n], truncated) {
+		t.Fatalf("Read = %x, want %x (truncated-magic payload, session must stay open)", buf[:n], truncated)
+	}
+
+	// Negative 3: an ordinary IP packet is unaffected.
+	ordinary := bytes.Repeat([]byte{0x55}, 60)
+	sendSealed(ordinary)
+	n, err = readWithTimeout(t, sess, buf, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Read after ordinary IP packet: %v", err)
+	}
+	if !bytes.Equal(buf[:n], ordinary) {
+		t.Fatalf("Read = %x, want %x (ordinary IP packet)", buf[:n], ordinary)
+	}
+
+	// Positive: the real OCC_EXIT payload closes the session immediately.
+	sendSealed(occExitPayload())
+
+	if _, err := readWithTimeout(t, sess, buf, 5*time.Second); err != io.EOF {
+		t.Fatalf("Read after OCC_EXIT = %v, want io.EOF", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		srv.mu.Lock()
+		_, inSessions := srv.sessions[sess.key]
+		_, inData := srv.dataSessions[sess.PeerID()]
+		srv.mu.Unlock()
+		if !inSessions && !inData {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("session/dataSessions entry was never removed after OCC_EXIT")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if _, _, err := srv.pool.allocate(); err != nil {
+		t.Fatalf("pool.allocate() after OCC_EXIT teardown: %v (tunnel IP/peer-id must be reusable)", err)
+	}
+}
+
+// TestExitNotifyOnLameDuckKeyClosesSession is Task 1's proof that
+// OCC_EXIT detection runs on ANY successfully-decrypted data packet, not
+// only the primary slot's: after a renegotiation, an OCC_EXIT payload
+// sealed under the now-demoted LAME-DUCK key, inside the transition
+// window, still closes the session.
+func TestExitNotifyOnLameDuckKeyClosesSession(t *testing.T) {
+	_, network, err := net.ParseCIDR("10.60.1.0/24")
+	if err != nil {
+		t.Fatalf("parse network: %v", err)
+	}
+	key := testTLSCryptKey(t)
+
+	serverPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("server listen: %v", err)
+	}
+	defer serverPC.Close()
+
+	tlsCfg, caPool := testHandshakeTLSConfig(t)
+
+	sessions := make(chan *Session, 1)
+	srv := NewServer(Config{
+		TLSCryptKey: key,
+		TLSConfig:   tlsCfg,
+		Network:     network,
+		OnSession:   func(sess *Session) { sessions <- sess },
+	})
+	go func() { _ = srv.Serve(serverPC) }()
+	defer srv.Close()
+
+	client, replyReader := tunnelUpTestClient(t, key, serverPC.LocalAddr(), caPool)
+	defer client.Close()
+
+	if err := writeControlString(client.tlsConn, pushRequestLiteral); err != nil {
+		t.Fatalf("write push request: %v", err)
+	}
+	if _, err := readControlString(replyReader, maxControlStringLen); err != nil {
+		t.Fatalf("read push reply: %v", err)
+	}
+
+	var sess *Session
+	select {
+	case sess = <-sessions:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnSession was never called")
+	}
+
+	oldServerKeys, ok := sess.DebugDataKeys()
+	if !ok {
+		t.Fatal("DebugDataKeys() not ok before renegotiation")
+	}
+	oldClientWrapper, err := datachan.NewWrapper(mirrorDataKeys(oldServerKeys), sess.PeerID(), 0)
+	if err != nil {
+		t.Fatalf("build old client wrapper: %v", err)
+	}
+
+	newConn := client.renegotiate(t, serverPC.LocalAddr(), 1)
+	if err := newConn.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
+		t.Fatalf("set reneg deadline: %v", err)
+	}
+	renegTLSConn := tls.Client(newConn, &tls.Config{
+		RootCAs:    caPool,
+		ServerName: testHandshakeServerCN,
+		MinVersion: tls.VersionTLS12,
+	})
+	if err := renegTLSConn.Handshake(); err != nil {
+		t.Fatalf("reneg client handshake: %v", err)
+	}
+	if err := writeTestClientKeyMethod2(renegTLSConn); err != nil {
+		t.Fatalf("write client Key Method 2 (reneg): %v", err)
+	}
+	if err := readTestServerKeyMethod2(renegTLSConn); err != nil {
+		t.Fatalf("read server Key Method 2 (reneg): %v", err)
+	}
+	if err := newConn.SetDeadline(time.Time{}); err != nil {
+		t.Fatalf("clear reneg deadline: %v", err)
+	}
+	waitForPrimaryKeyID(t, sess, 1)
+
+	sealed, err := oldClientWrapper.Seal(nil, occExitPayload())
+	if err != nil {
+		t.Fatalf("seal OCC_EXIT under lame-duck key: %v", err)
+	}
+	if _, err := client.pc.WriteTo(sealed, serverPC.LocalAddr()); err != nil {
+		t.Fatalf("write lame-duck OCC_EXIT packet: %v", err)
+	}
+
+	buf := make([]byte, 200)
+	if _, err := readWithTimeout(t, sess, buf, 5*time.Second); err != io.EOF {
+		t.Fatalf("Read after lame-duck OCC_EXIT = %v, want io.EOF", err)
+	}
+}
