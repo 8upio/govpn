@@ -142,6 +142,18 @@ const (
 	// = 3600).
 	defaultRenegSec = 3600 * time.Second
 
+	// renegMinInterval is the minimum time between two ACCEPTED
+	// renegotiations on the same session (T-04-01): a small fraction of
+	// the reference's own reneg-sec default (defaultRenegSec/60 = 60s),
+	// chosen so it never interferes with a legitimate reneg-sec-driven
+	// rollover but still bounds how often a peer can force a full new TLS
+	// handshake. tls-crypt's own replay window (Phase 1) is the primary
+	// defense against a byte-identical REPLAYED SOFT_RESET_V1 packet — it
+	// never reaches this check twice with the same bytes. This interval is
+	// defense in depth against a legitimate but abusive peer sending
+	// distinct, validly-signed SOFT_RESET_V1 requests in rapid succession.
+	renegMinInterval = defaultRenegSec / 60
+
 	// renegPollInterval is how often each session's reneg-sec timer
 	// (Session.startReneg/runReneg) checks whether it's due — a
 	// poll-granularity constant, not a reference constant, mirroring
@@ -904,12 +916,26 @@ func (s *Server) startRenegotiation(sess *Session, pc net.PacketConn, addr net.A
 		// SOFT_RESET_V1 is a no-op.
 		return nil, 0, false
 	}
+	if !sess.lastRenegAccepted.IsZero() && sess.now().Sub(sess.lastRenegAccepted) < renegMinInterval {
+		// T-04-01: reneg-flood rate limit. This is defense in depth on top
+		// of tls-crypt's own replay window (Phase 1), which already
+		// rejects a byte-identical REPLAYED SOFT_RESET_V1 before it ever
+		// reaches this code; this check instead bounds how often a
+		// legitimate-looking but abusive peer can force a full new TLS
+		// handshake with distinct, validly-signed requests.
+		return nil, 0, false
+	}
 
 	next := nextKeyID(sess.primary.keyID)
 	if hasWantKeyID && wantKeyID != next {
-		// Hard error, never trusted from the peer (ssl.c:3983-3990): drop
-		// and leave every field of the session untouched — no partial
-		// state, no counter advance, no new allocation.
+		// Hard error, never trusted from the peer (T-04-02,
+		// ssl.c:3983-3990: "local/remote key IDs out of sync ... goto
+		// error"): the server computes the expected next key-id itself and
+		// refuses anything else — drop and leave every field of the
+		// session untouched, no partial state, no counter advance, no new
+		// allocation, matching the forged-control-packet discipline
+		// handleDatagram already applies elsewhere. No per-packet log —
+		// that would be an attacker-controlled log-volume amplifier.
 		return nil, 0, false
 	}
 

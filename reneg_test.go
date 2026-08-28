@@ -12,6 +12,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -514,5 +515,334 @@ func TestRenegTimerStopsOnClose(t *testing.T) {
 		t.Fatal("reneg timer goroutine accepted a tick after it should have already exited")
 	case <-time.After(100 * time.Millisecond):
 		// Expected: nobody is receiving on tick anymore.
+	}
+}
+
+// renegTestFixture is the shared plumbing every Task 3 white-box test
+// below needs: a live server-side control-channel Conn (primaryConn), a
+// throwaway *Server with no dependency on a full srv.Serve loop, and the
+// raw session IDs/wrapper a hand-built wire.ControlPacket needs to look
+// authentic to beginRenegotiation. Mirrors TestServerInitiatedRenegOnRenegSec's
+// own direct-construction style.
+type renegTestFixture struct {
+	serverPC, clientPC net.PacketConn
+	serverWrapper      *tlscrypt.Wrapper
+	clientSID, serverSID wire.SessionID
+	primaryConn        *ctrlconn.Conn
+	srv                *Server
+	clock              *fakeClock
+}
+
+func newRenegTestFixture(t testing.TB) *renegTestFixture {
+	t.Helper()
+	key := testTLSCryptKey(t)
+
+	serverPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("server listen: %v", err)
+	}
+	t.Cleanup(func() { _ = serverPC.Close() })
+	clientPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("client listen: %v", err)
+	}
+	t.Cleanup(func() { _ = clientPC.Close() })
+
+	serverWrapper, err := tlscrypt.NewWrapper(key, true)
+	if err != nil {
+		t.Fatalf("server wrapper: %v", err)
+	}
+
+	var clientSID, serverSID wire.SessionID
+	if _, err := rand.Read(clientSID[:]); err != nil {
+		t.Fatalf("generate client session id: %v", err)
+	}
+	if _, err := rand.Read(serverSID[:]); err != nil {
+		t.Fatalf("generate server session id: %v", err)
+	}
+
+	primaryConn := ctrlconn.New(serverSID, clientSID, serverWrapper, packetConnTransport{pc: serverPC}, clientPC.LocalAddr(), nil)
+	t.Cleanup(func() { _ = primaryConn.Close() })
+
+	clock := newFakeClock()
+	srv := &Server{
+		pc: serverPC,
+		// A large renegSec keeps checkReneg's own server-initiated-timer
+		// trigger (Task 2) from firing spuriously in these Task 3 tests,
+		// which target the receive-side rejection/expiry mechanisms only.
+		renegSec:     time.Hour,
+		sessions:     make(map[sessionKey]*Session),
+		dataSessions: make(map[uint32]*Session),
+	}
+
+	return &renegTestFixture{
+		serverPC:      serverPC,
+		clientPC:      clientPC,
+		serverWrapper: serverWrapper,
+		clientSID:     clientSID,
+		serverSID:     serverSID,
+		primaryConn:   primaryConn,
+		srv:           srv,
+		clock:         clock,
+	}
+}
+
+// newSession builds a Session at established key-id 0 over the fixture's
+// primaryConn, ready for beginRenegotiation/startRenegotiation tests.
+func (f *renegTestFixture) newSession(t testing.TB) *Session {
+	t.Helper()
+	return &Session{
+		SessionID:       f.serverSID,
+		clientSessionID: f.clientSID,
+		wrapper:         f.serverWrapper,
+		conn:            f.primaryConn,
+		RemoteAddr:      f.clientPC.LocalAddr(),
+		srv:             f.srv,
+		clock:           f.clock,
+		stopCh:          make(chan struct{}),
+		primary:         keySlot{keyID: 0, conn: f.primaryConn, established: f.clock.Now()},
+	}
+}
+
+// softReset builds a hand-crafted P_CONTROL_SOFT_RESET_V1 wire.ControlPacket
+// at keyID, matching what handleDatagram would have parsed from an inbound
+// datagram, for directly exercising beginRenegotiation.
+func (f *renegTestFixture) softReset(keyID uint8) wire.ControlPacket {
+	return wire.ControlPacket{
+		Opcode:    wire.OpControlSoftResetV1,
+		KeyID:     keyID,
+		SessionID: f.clientSID,
+	}
+}
+
+// TestForgedKeyIDRenegRejected is 04-01-PLAN.md Task 3's T-04-02 proof: a
+// SOFT_RESET_V1 at a key-id other than the locally-computed next one
+// (here, 5 instead of 1) is refused — no new Conn is constructed, no
+// pending slot is published, and the session's primary key-id is
+// unchanged.
+func TestForgedKeyIDRenegRejected(t *testing.T) {
+	f := newRenegTestFixture(t)
+	sess := f.newSession(t)
+
+	f.srv.beginRenegotiation(sess, f.softReset(5), f.clientPC.LocalAddr(), f.serverPC)
+
+	sess.mu.Lock()
+	gotKeyID := sess.primary.keyID
+	gotPending := sess.pendingReneg
+	sess.mu.Unlock()
+
+	if gotKeyID != 0 {
+		t.Errorf("primary.keyID = %d, want 0 (unchanged)", gotKeyID)
+	}
+	if gotPending != nil {
+		t.Error("pendingReneg is set — a forged key-id must not construct any new Conn")
+	}
+}
+
+// TestRenegRejectedBeforePrimaryEstablished is 04-01-PLAN.md Task 3's
+// proof that a SOFT_RESET_V1 arriving while the primary slot is not yet
+// established (ssl.c:3882-3900's S_GENERATED_KEYS gate) is refused.
+func TestRenegRejectedBeforePrimaryEstablished(t *testing.T) {
+	f := newRenegTestFixture(t)
+	sess := f.newSession(t)
+	sess.mu.Lock()
+	sess.primary = keySlot{conn: f.primaryConn} // established left zero
+	sess.mu.Unlock()
+
+	f.srv.beginRenegotiation(sess, f.softReset(1), f.clientPC.LocalAddr(), f.serverPC)
+
+	sess.mu.Lock()
+	gotPending := sess.pendingReneg
+	sess.mu.Unlock()
+	if gotPending != nil {
+		t.Error("renegotiation was accepted before the primary slot was established")
+	}
+}
+
+// TestRenegFloodRateLimited is 04-01-PLAN.md Task 3's T-04-01 proof: once
+// one renegotiation has been accepted, a burst of further SOFT_RESET_V1
+// requests at the (now correct) next key-id, all arriving within
+// renegMinInterval of the first, are every one refused — at most one
+// renegotiation total.
+func TestRenegFloodRateLimited(t *testing.T) {
+	f := newRenegTestFixture(t)
+	sess := f.newSession(t)
+
+	// First SOFT_RESET_V1, at the correct next key-id (1): accepted.
+	f.srv.beginRenegotiation(sess, f.softReset(1), f.clientPC.LocalAddr(), f.serverPC)
+	sess.mu.Lock()
+	firstConn := sess.pendingReneg
+	sess.mu.Unlock()
+	if firstConn == nil {
+		t.Fatal("first SOFT_RESET_V1 was not accepted")
+	}
+	t.Cleanup(func() { _ = firstConn.Close() })
+
+	// Simulate that renegotiation having already completed — exactly the
+	// state runRenegotiation's own atomic swap leaves — WITHOUT advancing
+	// the clock, so lastRenegAccepted (set by the accepted request above)
+	// is still within renegMinInterval of now.
+	sess.mu.Lock()
+	sess.pendingReneg = nil
+	sess.primary = keySlot{keyID: 1, conn: firstConn, established: sess.now()}
+	sess.mu.Unlock()
+
+	// A burst of further SOFT_RESET_V1 requests at the new correct next
+	// key-id (2), all within renegMinInterval of the first: every one is
+	// refused.
+	for i := 0; i < 3; i++ {
+		f.srv.beginRenegotiation(sess, f.softReset(2), f.clientPC.LocalAddr(), f.serverPC)
+	}
+
+	sess.mu.Lock()
+	gotKeyID := sess.primary.keyID
+	gotPending := sess.pendingReneg
+	sess.mu.Unlock()
+	if gotKeyID != 1 {
+		t.Errorf("primary.keyID = %d, want 1 (unchanged — the rate-limited burst must not have advanced it)", gotKeyID)
+	}
+	if gotPending != nil {
+		t.Error("pendingReneg is set — the rate-limited burst must not have published anything")
+	}
+}
+
+// lameDuckTestKeys returns a deterministic, self-symmetric
+// keyderiv.DataKeys distinct from testSymmetricDataKeys's own pattern, so
+// a single test can build two independent Wrappers (old/new) that never
+// accidentally share key material.
+func lameDuckTestKeys(seed byte) keyderiv.DataKeys {
+	var keys keyderiv.DataKeys
+	for i := range keys.EncryptCipher {
+		keys.EncryptCipher[i] = seed + byte(i)
+	}
+	for i := range keys.EncryptImplicitIV {
+		keys.EncryptImplicitIV[i] = seed + 0x10 + byte(i)
+	}
+	keys.DecryptCipher = keys.EncryptCipher
+	keys.DecryptImplicitIV = keys.EncryptImplicitIV
+	return keys
+}
+
+// TestLameDuckKeyRefusedAfterTransitionWindow is 04-01-PLAN.md Task 3's
+// T-04-03 proof (decrypt side): with an injected clock, a data packet
+// sealed under the lame-duck key still decrypts before its mustDie
+// deadline, and no longer decrypts once the clock advances past it.
+func TestLameDuckKeyRefusedAfterTransitionWindow(t *testing.T) {
+	newWrapper, err := datachan.NewWrapper(lameDuckTestKeys(0x30), 1, 1)
+	if err != nil {
+		t.Fatalf("NewWrapper (new): %v", err)
+	}
+	oldWrapper, err := datachan.NewWrapper(lameDuckTestKeys(0x70), 1, 0)
+	if err != nil {
+		t.Fatalf("NewWrapper (old): %v", err)
+	}
+
+	clock := newFakeClock()
+	sess := &Session{
+		clock:     clock,
+		primary:   keySlot{keyID: 1, wrapper: newWrapper},
+		lameDuck:  keySlot{keyID: 0, wrapper: oldWrapper, mustDie: clock.Now().Add(time.Minute)},
+		ipInbound: make(chan []byte, ipInboundQueueSize),
+		stopCh:    make(chan struct{}),
+	}
+
+	payload := bytes.Repeat([]byte{0x11}, 40)
+
+	// Before mustDie: the old key still decrypts (D-18).
+	sealed, err := oldWrapper.Seal(nil, payload)
+	if err != nil {
+		t.Fatalf("seal (before expiry): %v", err)
+	}
+	sess.handleDataPacket(sealed)
+
+	buf := make([]byte, 200)
+	n, err := sess.Read(buf)
+	if err != nil {
+		t.Fatalf("Read (before expiry): %v", err)
+	}
+	if !bytes.Equal(buf[:n], payload) {
+		t.Fatalf("Read = %x, want %x", buf[:n], payload)
+	}
+
+	// Advance the clock past mustDie.
+	clock.Advance(2 * time.Minute)
+
+	sealed2, err := oldWrapper.Seal(nil, payload)
+	if err != nil {
+		t.Fatalf("seal (after expiry): %v", err)
+	}
+	sess.handleDataPacket(sealed2)
+
+	select {
+	case leaked := <-sess.ipInbound:
+		t.Fatalf("old-key packet was delivered after mustDie: %x", leaked)
+	default:
+	}
+}
+
+// TestLameDuckConnClosedOnExpiry is 04-01-PLAN.md Task 3's T-04-03 proof
+// (resource side): the lame-duck slot's expiry sweep (runReneg's own
+// ticker) closes its Conn once mustDie passes, freeing its retransmit
+// goroutine — asserted via a bounded runtime.NumGoroutine poll, never a
+// fixed sleep.
+func TestLameDuckConnClosedOnExpiry(t *testing.T) {
+	f := newRenegTestFixture(t)
+	sess := f.newSession(t)
+	sess.primary = keySlot{keyID: 1, conn: f.primaryConn, established: f.clock.Now()}
+
+	tick := make(chan time.Time)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		sess.runReneg(tick)
+	}()
+	defer func() {
+		close(sess.stopCh)
+		<-done
+	}()
+
+	// Baseline is taken AFTER the fixture's own primaryConn and this
+	// test's runReneg goroutine both already exist (neither is expected
+	// to exit during this test — only lameDuckConn's own retransmit
+	// goroutine, created next, should).
+	runtime.Gosched()
+	baseline := runtime.NumGoroutine()
+
+	lameWrapper, err := datachan.NewWrapper(lameDuckTestKeys(0x90), 1, 0)
+	if err != nil {
+		t.Fatalf("NewWrapper: %v", err)
+	}
+	lameDuckConn := ctrlconn.NewWithKeyID(f.serverSID, f.clientSID, f.serverWrapper, packetConnTransport{pc: f.serverPC}, f.clientPC.LocalAddr(), nil, 0)
+
+	sess.mu.Lock()
+	sess.lameDuck = keySlot{keyID: 0, conn: lameDuckConn, wrapper: lameWrapper, mustDie: f.clock.Now().Add(time.Minute)}
+	sess.mu.Unlock()
+
+	f.clock.Advance(2 * time.Minute)
+	tick <- time.Now()
+
+	// Poll for the goroutine count to return to baseline — lameDuckConn's
+	// own retransmitLoop should exit once Close() propagates through its
+	// closeCh. Bounded poll, not a fixed sleep (04-01-PLAN.md Task 3).
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if runtime.NumGoroutine() <= baseline {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("lame-duck Conn's retransmit goroutine did not exit after the expiry sweep (goroutines = %d, baseline = %d)", runtime.NumGoroutine(), baseline)
+		}
+		time.Sleep(5 * time.Millisecond) // polling only — waiting for a goroutine to exit, not a protocol deadline
+	}
+
+	sess.mu.Lock()
+	gotConn := sess.lameDuck.conn
+	gotWrapper := sess.lameDuck.wrapper
+	sess.mu.Unlock()
+	if gotConn != nil {
+		t.Error("lameDuck.conn was not cleared after the expiry sweep")
+	}
+	if gotWrapper != nil {
+		t.Error("lameDuck.wrapper was not cleared after the expiry sweep")
 	}
 }

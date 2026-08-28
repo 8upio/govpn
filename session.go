@@ -583,10 +583,36 @@ func (s *Session) runReneg(tickCh <-chan time.Time) {
 	for {
 		select {
 		case <-tickCh:
+			s.sweepLameDuck()
 			s.checkReneg()
 		case <-s.stopCh:
 			return
 		}
+	}
+}
+
+// sweepLameDuck closes and clears the lame-duck slot once its mustDie
+// deadline has passed (T-04-03, mirrors lame_duck_must_die,
+// ssl.c:1297-1322): closing its Conn frees its retransmit goroutine.
+// Runs on the SAME ticker startReneg already owns — not a third
+// goroutine. This is a bound on the slot's Conn/goroutine LIFETIME,
+// deliberately separate from handleDataPacket's own mustDie check, which
+// bounds the old key's decrypt VALIDITY on a per-packet basis — dropping
+// either check is exactly how a leaked retransmit goroutine or an "old
+// key works forever" regression gets in (Pitfall 5). mustDie is never
+// extended by this sweep or anything else: a late-arriving or rejected
+// renegotiation never buys the old key more time.
+func (s *Session) sweepLameDuck() {
+	s.mu.Lock()
+	conn := s.lameDuck.conn
+	expired := s.lameDuck.wrapper != nil && !s.now().Before(s.lameDuck.mustDie)
+	if expired {
+		s.lameDuck = keySlot{}
+	}
+	s.mu.Unlock()
+
+	if expired && conn != nil {
+		_ = conn.Close()
 	}
 }
 

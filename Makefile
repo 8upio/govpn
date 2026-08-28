@@ -14,11 +14,11 @@ test: gates
 	go test -race ./...
 
 # Runs the standing prohibition gates (gates_test.go) — every
-# must_haves.prohibitions entry declared across Phase 2's and Phase 3's
-# plans, turned into assertions that fail a normal `go test` run rather
-# than sitting in a document nobody greps.
+# must_haves.prohibitions entry declared across Phase 2's, Phase 3's, and
+# Phase 4's plans, turned into assertions that fail a normal `go test` run
+# rather than sitting in a document nobody greps.
 gates:
-	go test -race -run 'TestPhase2|TestPhase3' -v ./
+	go test -race -run 'TestPhase2|TestPhase3|TestPhase4' -v ./
 
 # Full interop tier: generates a fresh test PKI in Go (large profile, so
 # the certificate-fragmentation assertions have something to fragment —

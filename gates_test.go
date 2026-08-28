@@ -490,6 +490,221 @@ func TestPhase3ServerContainerRequestsNoPrivileges(t *testing.T) {
 	}
 }
 
+// Phase 4's own standing prohibitions (04-01-PLAN.md Task 3), scoped to
+// ovpn.go specifically — the single file this phase's own action text and
+// acceptance-criteria greps name as the enforcement point for these three
+// checks (`grep -n 'tlscrypt.NewWrapper' ovpn.go`, `grep -n 'dataChannelKeyID'
+// ovpn.go session.go`) — rather than walkGoFiles's repo-wide sweep, which
+// would also flag this package's own test harness files
+// (ovpn_test.go/reneg_test.go) for legitimately constructing synthetic
+// Conns/Wrappers with test-chosen key-ids that have no locally-computed
+// nextKeyID provenance to trace.
+
+// parseGoFile parses exactly one repo-relative .go file, mirroring this
+// file's own single-file-read precedent (TestPhase2GoldenCorpusIsTestOnly,
+// TestPhase3ServerContainerRequestsNoPrivileges) rather than walkGoFiles's
+// whole-repository sweep.
+func parseGoFile(t *testing.T, path string) (*ast.File, *token.FileSet) {
+	t.Helper()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, path, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	return file, fset
+}
+
+// TestPhase4RenegotiationNeverRepeatsPushExchange asserts runRenegotiation's
+// body contains no call to performPushExchange or pool.allocate, and no
+// assignment to the session's assigned IP or peer-id fields — the
+// renegotiation driver must stop after Key Method 2 and never repeat the
+// one-shot PUSH_REQUEST/PUSH_REPLY exchange or reallocate the tunnel
+// IP/peer-id (04-RESEARCH.md Pattern 4, Anti-Pattern 2).
+func TestPhase4RenegotiationNeverRepeatsPushExchange(t *testing.T) {
+	file, fset := parseGoFile(t, "ovpn.go")
+	found := false
+	for _, decl := range file.Decls {
+		fd, ok := decl.(*ast.FuncDecl)
+		if !ok || fd.Name.Name != "runRenegotiation" || fd.Body == nil {
+			continue
+		}
+		found = true
+		ast.Inspect(fd.Body, func(n ast.Node) bool {
+			switch node := n.(type) {
+			case *ast.CallExpr:
+				sel, ok := node.Fun.(*ast.SelectorExpr)
+				if !ok {
+					return true
+				}
+				switch sel.Sel.Name {
+				case "performPushExchange":
+					pos := fset.Position(node.Pos())
+					t.Errorf(
+						"%s:%d: runRenegotiation calls performPushExchange — renegotiation must never repeat the PUSH_REQUEST/PUSH_REPLY exchange (04-RESEARCH.md Pattern 4, Anti-Pattern 2)",
+						pos.Filename, pos.Line,
+					)
+				case "allocate":
+					pos := fset.Position(node.Pos())
+					t.Errorf(
+						"%s:%d: runRenegotiation calls .allocate() — renegotiation must never allocate a new tunnel IP/peer-id from the pool (Anti-Pattern 2)",
+						pos.Filename, pos.Line,
+					)
+				}
+			case *ast.AssignStmt:
+				for _, lhs := range node.Lhs {
+					sel, ok := lhs.(*ast.SelectorExpr)
+					if !ok {
+						continue
+					}
+					if sel.Sel.Name == "assignedIP" || sel.Sel.Name == "peerID" {
+						pos := fset.Position(node.Pos())
+						t.Errorf(
+							"%s:%d: runRenegotiation assigns to .%s — renegotiation must never write the session's assigned IP or peer-id; those are fixed for the session's whole lifetime (Anti-Pattern 2)",
+							pos.Filename, pos.Line, sel.Sel.Name,
+						)
+					}
+				}
+			}
+			return true
+		})
+	}
+	if !found {
+		t.Fatal("ovpn.go declares no runRenegotiation function to check")
+	}
+}
+
+// TestPhase4RenegotiationReusesSessionTLSCryptWrapper asserts ovpn.go
+// constructs a tls-crypt Wrapper (tlscrypt.NewWrapper) in exactly two
+// functions — Serve's fail-fast validation and handleDatagram's
+// per-session allocation — and nowhere else, so a renegotiation can never
+// accidentally allocate a fresh Wrapper instead of reusing sess.wrapper
+// (Anti-Pattern 1: a fresh Wrapper breaks the tls-crypt packet-id
+// continuum the real client expects within one session; T-04-05).
+func TestPhase4RenegotiationReusesSessionTLSCryptWrapper(t *testing.T) {
+	file, fset := parseGoFile(t, "ovpn.go")
+	allowed := map[string]bool{"Serve": true, "handleDatagram": true}
+	for _, decl := range file.Decls {
+		fd, ok := decl.(*ast.FuncDecl)
+		if !ok || fd.Body == nil {
+			continue
+		}
+		ast.Inspect(fd.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			pkgIdent, ok := sel.X.(*ast.Ident)
+			if !ok || pkgIdent.Name != "tlscrypt" || sel.Sel.Name != "NewWrapper" {
+				return true
+			}
+			if !allowed[fd.Name.Name] {
+				pos := fset.Position(call.Pos())
+				t.Errorf(
+					"%s:%d: %s calls tlscrypt.NewWrapper — a fresh tls-crypt Wrapper is only ever allocated in Serve's fail-fast validation and handleDatagram's per-session allocation; renegotiation must reuse the session's existing sess.wrapper (Anti-Pattern 1, T-04-05)",
+					pos.Filename, pos.Line, fd.Name.Name,
+				)
+			}
+			return true
+		})
+	}
+}
+
+// TestPhase4KeyIDNeverTrustedFromPeer asserts every construction of a
+// renegotiation Conn (ctrlconn.NewWithKeyID) in ovpn.go passes a key-id
+// this same function locally computed via a call to nextKeyID — never a
+// peer-supplied packet field (T-04-02, ssl.c:3983-3990: the server
+// computes the expected next key-id itself and treats any other value as
+// a hard error, not something to trust from the wire).
+func TestPhase4KeyIDNeverTrustedFromPeer(t *testing.T) {
+	file, fset := parseGoFile(t, "ovpn.go")
+	for _, decl := range file.Decls {
+		fd, ok := decl.(*ast.FuncDecl)
+		if !ok || fd.Body == nil {
+			continue
+		}
+
+		// Identifiers this function assigned directly from a call to
+		// nextKeyID — the only source of a locally-computed key-id.
+		localNextKeyID := map[string]bool{}
+		ast.Inspect(fd.Body, func(n ast.Node) bool {
+			assign, ok := n.(*ast.AssignStmt)
+			if !ok || len(assign.Lhs) != len(assign.Rhs) {
+				return true
+			}
+			for i, rhs := range assign.Rhs {
+				call, ok := rhs.(*ast.CallExpr)
+				if !ok {
+					continue
+				}
+				callee, ok := call.Fun.(*ast.Ident)
+				if !ok || callee.Name != "nextKeyID" {
+					continue
+				}
+				if lhsIdent, ok := assign.Lhs[i].(*ast.Ident); ok {
+					localNextKeyID[lhsIdent.Name] = true
+				}
+			}
+			return true
+		})
+
+		ast.Inspect(fd.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			pkgIdent, ok := sel.X.(*ast.Ident)
+			if !ok || pkgIdent.Name != "ctrlconn" || sel.Sel.Name != "NewWithKeyID" {
+				return true
+			}
+			if len(call.Args) == 0 {
+				return true
+			}
+			last := call.Args[len(call.Args)-1]
+			ident, ok := last.(*ast.Ident)
+			if !ok || !localNextKeyID[ident.Name] {
+				pos := fset.Position(call.Pos())
+				t.Errorf(
+					"%s:%d: %s calls ctrlconn.NewWithKeyID with a key-id that is not this function's own locally-computed nextKeyID result — every renegotiation Conn's key-id must come from the server's own local computation, never trusted from a parsed packet field (T-04-02, ssl.c:3983-3990)",
+					pos.Filename, pos.Line, fd.Name.Name,
+				)
+			}
+			return true
+		})
+	}
+}
+
+// TestPhase4NoNewModuleDependencies mirrors
+// TestPhase2NoThirdPartyDependencies's own go.mod check, re-asserted under
+// this phase's own gate name per 04-01-PLAN.md Task 3's action text: this
+// phase adds no package-manager installs (T-04-SC).
+func TestPhase4NoNewModuleDependencies(t *testing.T) {
+	data, err := os.ReadFile("go.mod")
+	if err != nil {
+		t.Fatalf("read go.mod: %v", err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "module ") || strings.HasPrefix(trimmed, "go ") {
+			continue
+		}
+		t.Fatalf(
+			"go.mod contains %q — this phase adds no new module dependencies (T-04-SC); the core module and its tests stay stdlib-only",
+			trimmed,
+		)
+	}
+}
+
 func TestPhase3StdlibOnlyImports(t *testing.T) {
 	walkGoFiles(t, func(path string, file *ast.File, fset *token.FileSet) {
 		for _, imp := range file.Imports {
