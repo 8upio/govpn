@@ -298,6 +298,18 @@ type Session struct {
 	// always allowed through this check. Guarded by mu.
 	lastRenegAccepted time.Time
 
+	// renegotiations counts how many soft-reset key rollovers this session
+	// has completed — a diagnostic accessor in the PeerID()/PushRequestSeen()
+	// family (04-03-PLAN.md Task 1): not part of the contract a production
+	// embedder needs, but a test harness can assert a real rollover actually
+	// happened rather than trusting a PASS line alone. Incremented exactly
+	// once per completed rollover, inside ovpn.go's runRenegotiation, under
+	// the same sess.mu critical section that publishes the new primary slot
+	// (04-01-PLAN.md's atomic-swap point) — so a partially-failed
+	// renegotiation (abandoned before that swap) never increments it.
+	// Guarded by mu.
+	renegotiations uint32
+
 	// lastAuthTraffic is when this session last received AUTHENTICATED
 	// traffic — a delivered control packet (ovpn.go's pump) or a
 	// successfully-decrypted data packet, primary or lame-duck slot
@@ -408,6 +420,17 @@ func (s *Session) PeerID() uint32 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.peerID
+}
+
+// RenegotiationCount reports how many soft-reset key rollovers this session
+// has completed (04-03-PLAN.md Task 1) — a diagnostic accessor in the same
+// spirit as PeerID/PushRequestSeen above: an external package (the interop
+// harness's PASS line) can report the value a test harness asserts against,
+// but a production embedder has no reason to call it.
+func (s *Session) RenegotiationCount() uint32 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.renegotiations
 }
 
 // DebugKeyMethod2Material returns this session's raw Key Method 2 seed

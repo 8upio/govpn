@@ -1079,6 +1079,11 @@ func (s *Server) runRenegotiation(sess *Session, newConn *ctrlconn.Conn, keyID u
 	// dataKeys backs DebugDataKeys, a debug-only accessor that should
 	// reflect the newest key (04-01-PLAN.md Task 1 action 7).
 	sess.dataKeys = dataKeys
+	// RenegotiationCount (04-03-PLAN.md Task 1): incremented exactly once
+	// per completed rollover, inside this same atomic-swap critical section
+	// — a renegotiation abandoned before reaching here (failed handshake,
+	// failed Key Method 2, session closing) never increments it.
+	sess.renegotiations++
 	if sess.pendingReneg == newConn {
 		sess.pendingReneg = nil
 	}

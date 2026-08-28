@@ -44,6 +44,29 @@ type scenario struct {
 	lossy          bool
 	largeCert      bool
 	contextTimeout time.Duration
+
+	// composeOverlay (04-03-PLAN.md Task 1) names an extra docker-compose
+	// overlay file (e.g. "docker-compose.lossy.yml", "docker-compose.reneg.yml")
+	// to layer on top of docker-compose.yml, replacing the old
+	// lossy-boolean-only overlay selection so a scenario can pick an overlay
+	// without inheriting loss injection. Empty means no overlay — the
+	// clean-small/clean-large scenarios' existing behavior. lossy above is
+	// kept as its own field regardless: it drives the probe-strictness
+	// convention (assertPingRoundTrip and friends), which is orthogonal to
+	// which overlay file happens to be in play.
+	composeOverlay string
+
+	// clientDirectives (04-03-PLAN.md Task 1) are extra client.conf lines
+	// passed through to cmd/gentestpki via repeated -client-directive flags.
+	// nil for every pre-existing scenario, so their generated client.conf
+	// stays byte-identical to before this field existed.
+	clientDirectives []string
+
+	// minRenegotiations (04-03-PLAN.md Task 1/2), when greater than 0,
+	// asserts the server's PASS line reports at least this many completed
+	// soft-reset rollovers (assertRenegotiation below). 0 (every
+	// pre-existing scenario) skips the assertion entirely.
+	minRenegotiations int
 }
 
 // scenarios covers, at minimum, the clean-small/clean-large/lossy-large
@@ -58,10 +81,26 @@ type scenario struct {
 // bounds on a context.WithTimeout, not sleeps, so raising them costs
 // nothing on a passing run and only prevents a slow CI machine's timeout
 // from looking like a protocol failure.
+// The "reneg" scenario (04-03-PLAN.md, D-23) proves renegotiation and
+// exit-notify against a real client: reneg-sec 15 on both the client
+// (via clientDirectives, cmd/gentestpki -client-directive) and the server
+// (docker-compose.reneg.yml's -reneg-sec 15s), with -hold giving the
+// shortened timer room to actually fire before the server's own
+// probe-driven survival window would otherwise let it exit.
 var scenarios = []scenario{
 	{name: "clean-small", profile: "small", lossy: false, largeCert: false, contextTimeout: 3 * time.Minute},
 	{name: "clean-large", profile: "large", lossy: false, largeCert: true, contextTimeout: 4 * time.Minute},
-	{name: "lossy-large", profile: "large", lossy: true, largeCert: true, contextTimeout: 10 * time.Minute},
+	{name: "lossy-large", profile: "large", lossy: true, largeCert: true, contextTimeout: 10 * time.Minute, composeOverlay: "docker-compose.lossy.yml"},
+	{
+		name:              "reneg",
+		profile:           "small",
+		lossy:             false,
+		largeCert:         false,
+		contextTimeout:    3 * time.Minute,
+		composeOverlay:    "docker-compose.reneg.yml",
+		clientDirectives:  []string{"reneg-sec 15"},
+		minRenegotiations: 1,
+	},
 }
 
 // scenarioResult is one scenario's completed run: docker compose's combined
@@ -142,7 +181,11 @@ func TestMain(m *testing.M) {
 // project down unconditionally — including on a failing run, so the next
 // scenario starts from a clean container/network state.
 func runScenario(root, interopDir string, sc scenario) scenarioResult {
-	genCmd := exec.Command("go", "run", "./cmd/gentestpki", "-out", filepath.Join("test", "interop", "pki"), "-profile", sc.profile)
+	genArgs := []string{"run", "./cmd/gentestpki", "-out", filepath.Join("test", "interop", "pki"), "-profile", sc.profile}
+	for _, d := range sc.clientDirectives {
+		genArgs = append(genArgs, "-client-directive", d)
+	}
+	genCmd := exec.Command("go", genArgs...)
 	genCmd.Dir = root
 	if out, genErr := genCmd.CombinedOutput(); genErr != nil {
 		return scenarioResult{composeOut: string(out), composeErr: fmt.Errorf("gentestpki -profile %s: %w", sc.profile, genErr)}
@@ -153,9 +196,14 @@ func runScenario(root, interopDir string, sc scenario) scenarioResult {
 		return scenarioResult{composeErr: fmt.Errorf("preserve tls-crypt key for scenario %s: %w", sc.name, cpErr)}
 	}
 
+	// composeOverlay (04-03-PLAN.md Task 1) generalizes the old
+	// sc.lossy-only overlay selection: a scenario names whichever overlay
+	// file it needs (or none), independent of whether it also carries the
+	// lossy strictness convention (lossy-large sets both; reneg sets only
+	// composeOverlay).
 	composeFiles := []string{"-f", "docker-compose.yml"}
-	if sc.lossy {
-		composeFiles = append(composeFiles, "-f", "docker-compose.lossy.yml")
+	if sc.composeOverlay != "" {
+		composeFiles = append(composeFiles, "-f", sc.composeOverlay)
 	}
 
 	upArgs := append(append([]string{"compose"}, composeFiles...), "up", "--build", "--abort-on-container-exit", "--exit-code-from", "server")
@@ -333,6 +381,15 @@ func TestInteropScenarios(t *testing.T) {
 			assertUnreachableOutsideTunnel(t, res)
 
 			assertServerStaysUnprivileged(t, res)
+
+			// 04-03-PLAN.md Task 1 (SESS-04 against a real client): the
+			// "reneg" scenario's server PASS line must report at least
+			// sc.minRenegotiations completed soft-reset rollovers. Every
+			// other scenario leaves minRenegotiations at its zero value and
+			// skips this assertion entirely.
+			if sc.minRenegotiations > 0 {
+				assertRenegotiation(t, res, sc.minRenegotiations)
+			}
 
 			if sc.largeCert {
 				assertCertificateFlightFragmented(t, res)
@@ -789,6 +846,40 @@ func assertServerStaysUnprivileged(t *testing.T, res scenarioResult) {
 			res.privilegeCheck,
 		)
 	}
+}
+
+// renegotiationsRe extracts the renegotiations= field test/interop/server's
+// PASS line carries (04-03-PLAN.md Task 1, sess.RenegotiationCount()),
+// modeled directly on the pre-existing udpRxTxRe/pingRxTxRe parsers above —
+// a new PASS-line field needs a new regexp+assertion pair here, not a
+// change to any existing one.
+var renegotiationsRe = regexp.MustCompile(`renegotiations=(\d+)`)
+
+// assertRenegotiation is 04-03-PLAN.md Task 1/2's rollover proof: the
+// server's PASS line must report at least wantMin completed soft-reset
+// rollovers (sess.RenegotiationCount(), incremented once per completed
+// rollover inside ovpn.go's runRenegotiation) — proving a real client
+// actually renegotiated against the library, not merely that the harness's
+// shortened -reneg-sec flag was set.
+func assertRenegotiation(t *testing.T, res scenarioResult, wantMin int) {
+	t.Helper()
+
+	if res.composeErr != nil {
+		return
+	}
+
+	m := renegotiationsRe.FindStringSubmatch(res.composeOut)
+	if m == nil {
+		t.Fatal("server output does not contain a parsable renegotiations= field — see log above")
+	}
+	got, err := strconv.Atoi(m[1])
+	if err != nil {
+		t.Fatalf("parse renegotiations=%q: %v", m[1], err)
+	}
+	if got < wantMin {
+		t.Fatalf("server output reports renegotiations=%d, want at least %d — see log above", got, wantMin)
+	}
+	t.Logf("server observed renegotiations=%d (want at least %d)", got, wantMin)
 }
 
 // assertCertificateFlightFragmented is 01-04-PLAN.md Task 1's fragmentation

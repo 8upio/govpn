@@ -113,15 +113,17 @@ func main() {
 	seed := flag.Int64("seed", 1, "seed for the server-to-client loss/reorder decorator's PRNG, so a failing lossy run is reproducible")
 	httpPort := flag.Uint("http-port", 8080, "TCP port the tunnelweb example site listens on, over the netstack (03-06-PLAN.md Task 1)")
 	udpPort := flag.Uint("udp-port", 9999, "UDP port the echo service listens on, over the netstack (03-06-PLAN.md Task 2)")
+	renegSec := flag.Duration("reneg-sec", 0, "this server's own renegotiation deadline (ovpn.Config.RenegSec); 0 means the library's own 3600s default (04-03-PLAN.md Task 1)")
+	hold := flag.Duration("hold", 0, "extra survival time the server waits AFTER waitForProbes' normal probe-driven trigger fires, before printing PASS and exiting; 0 means no extension (the pre-existing scenarios' unchanged behavior) — gives a shortened -reneg-sec's timer room to actually fire before the server tears the run down (04-03-PLAN.md Task 1)")
 	flag.Parse()
 
-	if err := run(*pkiDir, *listenAddr, *deadline, *dropRate, *reorderRate, *reorderDelay, *seed, uint16(*httpPort), uint16(*udpPort)); err != nil {
+	if err := run(*pkiDir, *listenAddr, *deadline, *dropRate, *reorderRate, *reorderDelay, *seed, uint16(*httpPort), uint16(*udpPort), *renegSec, *hold); err != nil {
 		fmt.Fprintln(os.Stderr, "interop-server:", err)
 		os.Exit(1)
 	}
 }
 
-func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorderRatePct float64, reorderDelay time.Duration, seed int64, httpPort, udpPort uint16) error {
+func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorderRatePct float64, reorderDelay time.Duration, seed int64, httpPort, udpPort uint16, renegSec, hold time.Duration) error {
 	tlsCfg, tlsCryptKey, err := loadConfig(pkiDir)
 	if err != nil {
 		return fmt.Errorf("load PKI material: %w", err)
@@ -213,6 +215,11 @@ func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorder
 		TLSCryptKey: tlsCryptKey,
 		Network:     tunnelNetwork,
 		Cipher:      "AES-256-GCM",
+		// RenegSec (04-03-PLAN.md Task 1): 0 (every pre-existing scenario's
+		// default flag value) means the library's own 3600s default — this
+		// only shortens the server's own reneg-sec timer for the "reneg"
+		// scenario's -reneg-sec flag.
+		RenegSec: renegSec,
 		OnSession: func(sess *ovpn.Session) {
 			// D-02: the embedder attaches; nothing in ovpn.Config knows
 			// the netstack exists. AssignedIP() is guaranteed non-nil
@@ -275,6 +282,23 @@ func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorder
 			return err
 		}
 
+		// -hold (04-03-PLAN.md Task 1): an extra survival extension AFTER
+		// waitForProbes' own normal trigger fires, default 0 so every
+		// pre-existing scenario is unaffected. The "reneg" scenario sets
+		// this so its shortened -reneg-sec timer has room to actually
+		// elapse — and, from Task 2 onward, room for multiple rollovers
+		// across several probe rounds — before this process exits and
+		// docker compose's --abort-on-container-exit tears the whole run
+		// down.
+		if hold > 0 {
+			log.Printf("holding an additional %s past the probe-driven trigger (-hold)", hold)
+			select {
+			case err := <-serveErr:
+				return fmt.Errorf("Serve exited unexpectedly during the -hold survival extension: %v", err)
+			case <-time.After(hold):
+			}
+		}
+
 		// km2=ok and assigned_ip=/peer_id= are unconditional here:
 		// Config.OnSession only fires after runHandshake's Key Method 2
 		// exchange AND its PUSH_REQUEST/PUSH_REPLY exchange have both
@@ -293,9 +317,9 @@ func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorder
 		// assertPingRoundTrip keep working unchanged.
 		netStats := stack.Stats()
 		log.Printf(
-			"PASS: session established and stable %s past handshake completion; peer_cn=%s tls_version=%s tls_version_raw=0x%04x cipher_suite=%s km2=ok push_request=%s assigned_ip=%s peer_id=%d ping_rx=%d ping_tx=%d udp_rx=%d udp_tx=%d http_requests=%d",
+			"PASS: session established and stable %s past handshake completion; peer_cn=%s tls_version=%s tls_version_raw=0x%04x cipher_suite=%s km2=ok push_request=%s assigned_ip=%s peer_id=%d ping_rx=%d ping_tx=%d udp_rx=%d udp_tx=%d http_requests=%d renegotiations=%d",
 			postHandshakeSurvival, sess.PeerCN, tls.VersionName(state.Version), state.Version, tls.CipherSuiteName(state.CipherSuite), pushStatus, sess.AssignedIP(), sess.PeerID(),
-			netStats.ICMPEchoRequests, netStats.ICMPEchoReplies, udpRx.Load(), udpTx.Load(), httpRequests.Load(),
+			netStats.ICMPEchoRequests, netStats.ICMPEchoReplies, udpRx.Load(), udpTx.Load(), httpRequests.Load(), sess.RenegotiationCount(),
 		)
 
 		_ = srv.Close()
