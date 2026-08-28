@@ -222,19 +222,24 @@ type Session struct {
 	pushRequested atomic.Bool
 
 	// mu guards assignedIP, peerID, primary, lameDuck, pendingReneg,
-	// pendingRenegKeyID, lastRenegAccepted, and lastAuthTraffic below
-	// (WR-03, extended by 04-01-PLAN.md Task 1 from the single dataWrapper
-	// field it originally guarded to this phase's two-slot key state, and
-	// by 04-02-PLAN.md Task 2 to lastAuthTraffic — no new mutex): ovpn.go's
-	// performPushExchange and runRenegotiation (running on this session's
-	// own goroutines) write them, while Close — which
-	// enforceHandshakeWindow's timeout goroutine can invoke concurrently at
-	// any point — reads them. Without this lock those are an
-	// unsynchronized concurrent read/write of the same memory from two
-	// goroutines, undefined under the Go memory model. Every other field
-	// in this struct has its own, already-established discipline (stopCh/
+	// pendingRenegKeyID, lastRenegAccepted, lastAuthTraffic, and dataKeys
+	// below (WR-03, extended by 04-01-PLAN.md Task 1 from the single
+	// dataWrapper field it originally guarded to this phase's two-slot key
+	// state, by 04-02-PLAN.md Task 2 to lastAuthTraffic, and by 04-REVIEW.md
+	// WR-01 to dataKeys — no new mutex): ovpn.go's performPushExchange and
+	// runRenegotiation (running on this session's own goroutines) write
+	// them, while Close — which enforceHandshakeWindow's timeout goroutine
+	// can invoke concurrently at any point — reads them, and the public
+	// DebugDataKeys accessor can be called from an arbitrary embedder/test
+	// goroutine at any time. Without this lock those are an unsynchronized
+	// concurrent read/write of the same memory from two goroutines,
+	// undefined under the Go memory model. Every other field in this
+	// struct has its own, already-established discipline (stopCh/
 	// stopOnce, srv.mu for dataSessions/sessions) and does not need this
-	// mutex.
+	// mutex — this notably excludes clientKM/serverKM (WR-01): those are
+	// written exactly once, unlocked, during the single-writer initial
+	// handshake before OnSession ever publishes the *Session to the
+	// embedder, and never rewritten by runRenegotiation.
 	mu sync.Mutex
 
 	// assignedIP is this session's tunnel address, allocated from
@@ -460,11 +465,21 @@ func (s *Session) DebugKeyMethod2Material() (src keyderiv.KeySource2, clientSID,
 // (02-04-PLAN.md Task 2). ok is false until Key Method 2 has completed
 // (dataKeys != nil). Debug/test-only, mirroring DebugKeyMethod2Material
 // above.
+//
+// WR-01 (04-REVIEW.md): dataKeys is written under sess.mu by
+// runRenegotiation's rollover swap (and, as of this fix, by
+// performKeyMethod2Exchange's initial write too), so this read must take
+// the same lock — an embedder or test harness can call this concurrently
+// with a live renegotiation, with no other synchronization point in
+// between.
 func (s *Session) DebugDataKeys() (keys keyderiv.DataKeys, ok bool) {
-	if s.dataKeys == nil {
+	s.mu.Lock()
+	dataKeys := s.dataKeys
+	s.mu.Unlock()
+	if dataKeys == nil {
 		return keyderiv.DataKeys{}, false
 	}
-	return s.dataKeys.ServerSlots(), true
+	return dataKeys.ServerSlots(), true
 }
 
 // Read delivers exactly one raw, decrypted IP packet per call (D-05):

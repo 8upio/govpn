@@ -977,3 +977,53 @@ func TestStalledRenegotiationRecoversAfterWindow(t *testing.T) {
 		t.Fatal("startRenegotiation refused after the stalled renegotiation was abandoned — pendingReneg did not re-arm (CR-01 regression)")
 	}
 }
+
+// TestDebugDataKeysConcurrentWithWrite is 04-REVIEW.md WR-01's regression
+// test: DebugDataKeys is a public, documented-as-safe-to-call-from-a-
+// harness accessor, but before this fix it read s.dataKeys with no lock at
+// all while runRenegotiation/performKeyMethod2Exchange write it under
+// sess.mu — an unsynchronized concurrent read/write of the same memory
+// from two goroutines, exactly the pattern `go test -race` is designed to
+// catch. This drives the same write/read pattern those two call sites use
+// (mu-guarded write, DebugDataKeys read) concurrently and in a tight loop,
+// with no other synchronization point between them (deliberately NOT
+// polling under mu first, which is what let every other test in this
+// phase's suite pass under -race even before this fix — see WR-01's own
+// finding text).
+func TestDebugDataKeysConcurrentWithWrite(t *testing.T) {
+	sess := &Session{stopCh: make(chan struct{})}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		i := 0
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			dk := &keyderiv.Key2{}
+			sess.mu.Lock()
+			sess.dataKeys = dk
+			sess.mu.Unlock()
+			i++
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		deadline := time.Now().Add(100 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			_, _ = sess.DebugDataKeys()
+		}
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+}

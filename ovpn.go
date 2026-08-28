@@ -947,7 +947,13 @@ func (s *Server) performKeyMethod2Exchange(sess *Session, tlsConn *tls.Conn) err
 		return err
 	}
 	sess.tlsReader = tlsReader
+	// WR-01 (04-REVIEW.md): dataKeys is a sess.mu-guarded field (see mu's
+	// own doc comment) — this is its initial, single-writer publish, but
+	// DebugDataKeys can be called concurrently from an arbitrary goroutine
+	// at any time, so this write takes the same lock its reader does.
+	sess.mu.Lock()
 	sess.dataKeys = dataKeys
+	sess.mu.Unlock()
 	sess.clientKM = clientKM
 	sess.serverKM = serverKM
 	return nil
