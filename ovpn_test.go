@@ -228,6 +228,18 @@ type testPushClient struct {
 	// loop; a full buffer drops the newest datagram, mirroring this
 	// package's own non-blocking-queue drop discipline elsewhere.
 	dataOut chan []byte
+
+	// serverInitiatedReneg receives the newly auto-registered Conn
+	// whenever testPushClientDemux sees a SOFT_RESET_V1 for a key-id it
+	// has no registered Conn for yet — mirroring how a real client
+	// reacts to an unprompted, server-initiated soft reset (it does not
+	// speculatively guess the next key-id and start sending before
+	// observing the server's own reset marker; sending prematurely would
+	// permanently trip the server's tls-crypt replay window on every
+	// retransmission of that same packet-id, 04-01-PLAN.md Task 2). A
+	// test drives its own tls.Client(...).Handshake() over the Conn
+	// received here.
+	serverInitiatedReneg chan *ctrlconn.Conn
 }
 
 // newTestPushClient performs the client's hard reset against serverAddr
@@ -270,9 +282,10 @@ func newTestPushClient(t testing.TB, key []byte, serverAddr net.Addr, caPool *x5
 		wrapper:   wrapper,
 		clientSID: clientSID,
 		conn:      conn,
-		stop:      make(chan struct{}),
-		conns:     map[uint8]*ctrlconn.Conn{0: conn},
-		dataOut:   make(chan []byte, 8),
+		stop:                 make(chan struct{}),
+		conns:                map[uint8]*ctrlconn.Conn{0: conn},
+		dataOut:              make(chan []byte, 8),
+		serverInitiatedReneg: make(chan *ctrlconn.Conn, 4),
 	}
 	go testPushClientDemux(client)
 
@@ -389,6 +402,26 @@ func testPushClientDemux(client *testPushClient) {
 		}
 		client.mu.Lock()
 		target := client.conns[keyID]
+		if target == nil && opcode == wire.OpControlSoftResetV1 {
+			// A server-initiated soft reset for a key-id this client has
+			// never seen: react exactly like a real client would — open a
+			// new Conn for it now, over the SAME client wrapper and
+			// session ID, and report it so a test can drive its own
+			// tls.Client(...).Handshake() (04-01-PLAN.md Task 2). Building
+			// this Conn any earlier (e.g. speculatively, before the server
+			// ever sent anything) would have nowhere to route on the
+			// server side yet, and every retransmission of that same
+			// packet-id would then be permanently rejected by the
+			// server's tls-crypt replay window once the first one had
+			// already been seen and dropped.
+			newConn := ctrlconn.NewWithKeyID(client.clientSID, wire.SessionID{}, client.wrapper, packetConnTransport{pc: client.pc}, client.conn.RemoteAddr(), nil, keyID)
+			client.conns[keyID] = newConn
+			target = newConn
+			select {
+			case client.serverInitiatedReneg <- newConn:
+			default:
+			}
+		}
 		client.mu.Unlock()
 		if target != nil {
 			target.Deliver(cp)

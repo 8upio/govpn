@@ -561,6 +561,73 @@ func (s *Session) runKeepalive(tickCh <-chan time.Time) {
 	}
 }
 
+// startReneg starts this session's server-initiated reneg-sec timer
+// goroutine (D-17, D-19): a real time.Ticker at renegPollInterval feeds
+// runReneg below. Called once, from ovpn.go's performPushExchange, at the
+// same point startKeepalive is (alongside the data wrapper going live) —
+// so it arms without depending on any inbound client traffic (Pitfall 2).
+func (s *Session) startReneg() {
+	ticker := time.NewTicker(renegPollInterval)
+	go func() {
+		defer ticker.Stop()
+		s.runReneg(ticker.C)
+	}()
+}
+
+// runReneg is startReneg's own core loop, factored out — the same
+// start*/run* split startKeepalive/runKeepalive already establish — so
+// tests can drive it from an injected tick channel instead of a real
+// renegPollInterval ticker. It selects on stopCh and exits on Close, with
+// no second teardown signal, exactly like runKeepalive.
+func (s *Session) runReneg(tickCh <-chan time.Time) {
+	for {
+		select {
+		case <-tickCh:
+			s.checkReneg()
+		case <-s.stopCh:
+			return
+		}
+	}
+}
+
+// checkReneg compares the elapsed time since the primary slot's
+// established timestamp against the server's resolved reneg-sec interval
+// (ssl.c:3098-3114's own trigger condition), and, on expiry, takes the
+// SEND side of the same startRenegotiation path beginRenegotiation (the
+// receive side, ovpn.go) already uses — so the two sides' key-id counters
+// can never drift apart by growing separately-maintained copies. If a
+// renegotiation is already in flight (startRenegotiation's own in-flight
+// check), this tick is a no-op: the in-flight one wins (D-17 "first to
+// fire wins").
+func (s *Session) checkReneg() {
+	if s.srv == nil {
+		return
+	}
+	s.mu.Lock()
+	established := s.primary.established
+	s.mu.Unlock()
+	if established.IsZero() {
+		return
+	}
+	if s.now().Sub(established) < s.srv.renegSec {
+		return
+	}
+	if s.srv.pc == nil {
+		return
+	}
+
+	newConn, keyID, ok := s.srv.startRenegotiation(s, s.srv.pc, s.RemoteAddr, 0, false)
+	if !ok {
+		return
+	}
+	// Best-effort: if the transport write fails transiently, the entry is
+	// already queued in newConn's own send-side reliability window and its
+	// retransmit loop will retry it, exactly like emitPing's own ignored
+	// WriteTo error below.
+	_ = newConn.SendReset(wire.OpControlSoftResetV1)
+	go s.srv.runRenegotiation(s, newConn, keyID)
+}
+
 // emitPing seals and sends one ping keepalive packet directly through
 // dataWrapper and srv.pc — deliberately NOT through Session.Write, so a
 // server-emitted ping never appears to the embedder as bytes written

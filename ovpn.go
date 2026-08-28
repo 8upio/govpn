@@ -77,6 +77,18 @@ type Config struct {
 	// vanishes. OnSessionPanic itself is called from inside the recover
 	// path and must not panic.
 	OnSessionPanic func(sess *Session, recovered any, stack []byte)
+
+	// RenegSec is this server's own renegotiation deadline (D-19): once a
+	// session's active key has been established for at least this long,
+	// the server starts its own soft-reset renegotiation with no inbound
+	// client packet required — the server's own timer, independent of
+	// whatever the client's own reneg-sec might be (D-17: both sides run
+	// independent timers; whichever fires first wins, matching the
+	// reference's own tls_process, ssl.c:3098-3114). 0 means the
+	// reference's own reneg-sec default of 3600 seconds (options.c:878).
+	// Deliberately never pushed to the client as a `reneg-sec` option — see
+	// D-19.
+	RenegSec time.Duration
 }
 
 // ParseStaticKeyV1 parses an OpenVPN "Static key V1" PEM-style envelope
@@ -123,6 +135,19 @@ const (
 	// Source: options.c:881 (--tran-window default, o->transition_window
 	// = 3600).
 	transitionWindow = 3600 * time.Second
+
+	// defaultRenegSec is Config.RenegSec's default when left at its zero
+	// value (D-19).
+	// Source: options.c:878 (--reneg-sec default, o->renegotiate_seconds
+	// = 3600).
+	defaultRenegSec = 3600 * time.Second
+
+	// renegPollInterval is how often each session's reneg-sec timer
+	// (Session.startReneg/runReneg) checks whether it's due — a
+	// poll-granularity constant, not a reference constant, mirroring
+	// ctrlconn's own retransmitInterval precedent (a fixed poll standing
+	// in for the reference's own exact-wakeup event loop).
+	renegPollInterval = 1 * time.Second
 
 	// pingIntervalSeconds is the fixed v1 keepalive schedule (D-11):
 	// push.go's buildPushReply pushes `ping N` using this exact value, and
@@ -190,6 +215,11 @@ type Server struct {
 	// performPushExchange).
 	pool *ipPool
 
+	// renegSec is Config.RenegSec resolved once in Serve (0 ->
+	// defaultRenegSec), so every session's reneg-sec timer reads the same
+	// already-defaulted value rather than re-resolving it per session.
+	renegSec time.Duration
+
 	// clock is a test-only override for every new Session's own clock
 	// field (Session.now, the reneg-sec timer, lame-duck mustDie, and the
 	// reneg-flood rate limit). nil in production, meaning
@@ -242,6 +272,10 @@ func (s *Server) Serve(pc net.PacketConn) error {
 	}
 	if s.cfg.TLSConfig == nil {
 		return errors.New("ovpn: Config.TLSConfig must be set")
+	}
+	s.renegSec = s.cfg.RenegSec
+	if s.renegSec == 0 {
+		s.renegSec = defaultRenegSec
 	}
 	// Config.Network is intentionally not required here: a Server built
 	// without it can still complete Phase 1's TLS handshake (existing
@@ -724,6 +758,14 @@ func (s *Server) performPushExchange(sess *Session, w io.Writer) error {
 			// the atomic publish above has committed, so it can never
 			// start for a session the closing check just decided is dead.
 			sess.startKeepalive()
+
+			// D-17/Pitfall 2: the server's own reneg-sec timer starts here
+			// too, independent of any inbound client traffic, so a session
+			// renegotiates on schedule even if the client never sends its
+			// own SOFT_RESET_V1 first. Started at the same point
+			// startKeepalive is, so it can never start for a session the
+			// closing check just decided is dead.
+			sess.startReneg()
 		}
 
 		reply := buildPushReply(sess.assignedIP, s.cfg.Network, sess.peerID, cipher)
