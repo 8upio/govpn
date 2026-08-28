@@ -1071,6 +1071,21 @@ func (s *Server) beginRenegotiation(sess *Session, cp wire.ControlPacket, addr n
 // OLD primary key stays live and usable, exactly as if the renegotiation
 // had never been attempted (T-04-04).
 func (s *Server) runRenegotiation(sess *Session, newConn *ctrlconn.Conn, keyID uint8) {
+	// CR-01: bound this renegotiation's lifetime the same way
+	// enforceHandshakeWindow bounds the initial handshake. Without this,
+	// a stalled reneg (client goes silent mid-handshake) leaks this
+	// goroutine and newConn's own retransmit goroutine forever, and never
+	// clears sess.pendingReneg — permanently disabling all further
+	// renegotiation for the session, since startRenegotiation's own
+	// in-flight check (ovpn.go:1008-1013) then refuses every subsequent
+	// attempt. done is closed on every return path below (success,
+	// abandon, and the sess.closing() early-outs) so the watchdog
+	// goroutine itself never leaks once this renegotiation finishes
+	// normally.
+	done := make(chan struct{})
+	defer close(done)
+	go s.enforceRenegotiationWindow(sess, newConn, done)
+
 	abandon := func() {
 		sess.mu.Lock()
 		if sess.pendingReneg == newConn {
@@ -1149,6 +1164,29 @@ func (s *Server) enforceHandshakeWindow(sess *Session) {
 		return
 	case <-time.After(s.handshakeWindow):
 		_ = sess.Close()
+	}
+}
+
+// enforceRenegotiationWindow tears the in-flight renegotiation newConn down
+// (mirroring abandon()'s own cleanup inside runRenegotiation) if it hasn't
+// completed within the same handshake-window budget the initial handshake
+// gets (CR-01). This is the renegotiation-scoped counterpart to
+// enforceHandshakeWindow above: unlike a stalled initial handshake, a
+// stalled renegotiation must NOT tear the session itself down (the old
+// primary key is still live and usable, T-04-04) — it only needs to
+// release the stuck newConn/goroutine and clear sess.pendingReneg so a
+// future renegotiation attempt can re-arm.
+func (s *Server) enforceRenegotiationWindow(sess *Session, newConn *ctrlconn.Conn, done <-chan struct{}) {
+	select {
+	case <-done:
+		return
+	case <-time.After(s.handshakeWindow):
+		sess.mu.Lock()
+		if sess.pendingReneg == newConn {
+			sess.pendingReneg = nil
+		}
+		sess.mu.Unlock()
+		_ = newConn.Close() // unblocks the stalled Handshake()/deriveKeyMethod2 call
 	}
 }
 

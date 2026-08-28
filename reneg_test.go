@@ -864,3 +864,116 @@ func TestLameDuckConnClosedOnExpiry(t *testing.T) {
 		t.Error("lameDuck.wrapper was not cleared after the expiry sweep")
 	}
 }
+
+// TestStalledRenegotiationRecoversAfterWindow is 04-REVIEW.md CR-01's
+// regression test: a renegotiation whose peer never completes the TLS
+// handshake must not (a) leak runRenegotiation's own goroutine and
+// newConn's retransmit goroutine forever, nor (b) permanently disable all
+// future renegotiation for the session. Before CR-01's fix,
+// runRenegotiation had no watchdog of its own (unlike the initial
+// handshake's enforceHandshakeWindow) — tlsConn.Handshake() blocked
+// forever on a peer that never responds, sess.pendingReneg never cleared,
+// and every subsequent startRenegotiation call was refused by its own
+// in-flight check for the remaining lifetime of the session.
+//
+// This mirrors lifecycle_test.go's own "handshake-window timeout" case
+// (a direct, synchronous call against a tiny srv.handshakeWindow rather
+// than a real production-sized wait) since enforceRenegotiationWindow, like
+// enforceHandshakeWindow, is built on time.After rather than the injected
+// fake Clock — internal/reliable.Clock only abstracts Now(), not timers —
+// so a short real duration is this codebase's existing, established
+// pattern for deterministically exercising this class of watchdog.
+func TestStalledRenegotiationRecoversAfterWindow(t *testing.T) {
+	key := testTLSCryptKey(t)
+
+	serverPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("server listen: %v", err)
+	}
+	defer serverPC.Close()
+	clientPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("client listen: %v", err)
+	}
+	defer clientPC.Close()
+
+	serverWrapper, err := tlscrypt.NewWrapper(key, true)
+	if err != nil {
+		t.Fatalf("server wrapper: %v", err)
+	}
+
+	var clientSID, serverSID wire.SessionID
+	if _, err := rand.Read(clientSID[:]); err != nil {
+		t.Fatalf("generate client session id: %v", err)
+	}
+	if _, err := rand.Read(serverSID[:]); err != nil {
+		t.Fatalf("generate server session id: %v", err)
+	}
+
+	primaryConn := ctrlconn.New(serverSID, clientSID, serverWrapper, packetConnTransport{pc: serverPC}, clientPC.LocalAddr(), nil)
+	defer primaryConn.Close()
+
+	tlsCfg, _ := testHandshakeTLSConfig(t)
+
+	srv := &Server{
+		pc: serverPC,
+		cfg: Config{
+			TLSConfig: tlsCfg,
+		},
+		sessions:        make(map[sessionKey]*Session),
+		dataSessions:    make(map[uint32]*Session),
+		handshakeWindow: 30 * time.Millisecond,
+	}
+
+	sess := &Session{
+		SessionID:       serverSID,
+		clientSessionID: clientSID,
+		wrapper:         serverWrapper,
+		conn:            primaryConn,
+		RemoteAddr:      clientPC.LocalAddr(),
+		srv:             srv,
+		stopCh:          make(chan struct{}),
+		primary:         keySlot{keyID: 0, conn: primaryConn, established: time.Now()},
+	}
+
+	newConn, keyID, ok := srv.startRenegotiation(sess, serverPC, clientPC.LocalAddr(), 0, false)
+	if !ok {
+		t.Fatalf("startRenegotiation: not ok")
+	}
+
+	// No peer ever drives this reneg's TLS handshake to completion —
+	// simulating the stalled/abandoned-peer scenario CR-01 describes.
+	// Before the fix, this goroutine never returns.
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		srv.runRenegotiation(sess, newConn, keyID)
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		sess.mu.Lock()
+		pending := sess.pendingReneg
+		sess.mu.Unlock()
+		if pending == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("sess.pendingReneg never cleared after the stalled renegotiation's handshake window elapsed (CR-01 regression)")
+		}
+		time.Sleep(2 * time.Millisecond) // polling only — not a protocol deadline wait
+	}
+
+	select {
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runRenegotiation goroutine never returned after its watchdog abandoned the stalled handshake (leaked goroutine, CR-01 regression)")
+	}
+
+	// The actual regression CR-01 identified: without the fix, EVERY
+	// subsequent renegotiation attempt is refused forever once one stalls.
+	// Confirm a fresh attempt re-arms now that pendingReneg has cleared.
+	if _, _, ok := srv.startRenegotiation(sess, serverPC, clientPC.LocalAddr(), 0, false); !ok {
+		t.Fatal("startRenegotiation refused after the stalled renegotiation was abandoned — pendingReneg did not re-arm (CR-01 regression)")
+	}
+}
