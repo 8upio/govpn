@@ -150,6 +150,22 @@ func repoRoot() (string, error) {
 	return filepath.Abs(filepath.Join(wd, "..", ".."))
 }
 
+// runFlagOnlyTargets reports whether the test binary's own -run flag value
+// is EXACTLY name (04-04-PLAN.md Task 1) — used by TestMain to skip the
+// pre-existing scenarios table's setup when the caller asked for only
+// TestSoak, so that test function's own timeout governs a soak run without
+// also paying for the unrelated scenario table's Docker runs. A simple
+// exact-string check rather than a full -run regexp evaluation: every
+// caller this plan cares about (its own verify commands, the Makefile's
+// `soak` target) passes exactly `-run 'TestSoak'`.
+func runFlagOnlyTargets(name string) bool {
+	f := flag.Lookup("test.run")
+	if f == nil {
+		return false
+	}
+	return f.Value.String() == name
+}
+
 func TestMain(m *testing.M) {
 	// TestMain must parse flags itself before reading -update-golden below
 	// (testing.Main normally parses flags inside m.Run(), too late for
@@ -168,8 +184,20 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	for _, sc := range scenarios {
-		scenarioResults[sc.name] = runScenario(root, interopDir, sc)
+	// TestSoak (04-04-PLAN.md Task 1) drives its own scenario directly,
+	// deliberately outside the scenarios table below — "the soak scenario
+	// is driven by its own test function, not folded into that table"
+	// (04-04-PLAN.md's own key_links). runFlagOnlyTargets guards the
+	// pre-existing scenario table's setup so `go test -run 'TestSoak'`
+	// (this plan's own verify command, and the Makefile's `soak` target)
+	// does not ALSO pay for clean-small/clean-large/lossy-large/reneg's own
+	// several minutes of Docker runs it will never assert against — the
+	// soak gets its own timeout, exactly like every other design constraint
+	// this plan states for it (D-24, T-04-19).
+	if !runFlagOnlyTargets("TestSoak") {
+		for _, sc := range scenarios {
+			scenarioResults[sc.name] = runScenario(root, interopDir, sc)
+		}
 	}
 
 	if *updateGolden {
@@ -1221,4 +1249,270 @@ func logRetransmissionEvidence(t *testing.T, res scenarioResult) {
 		return
 	}
 	t.Logf("retransmission evidence: %d duplicate reliability packet ID occurrences observed in %s — the handshake completed through genuine retransmission, not by chance", duplicates, res.capturePath)
+}
+
+// soakCycleCount must match docker-compose.soak.yml's own hardcoded
+// -soak-cycles/CYCLE_COUNT values exactly (04-04-PLAN.md Task 2, D-24) —
+// kept as one named constant here, rather than duplicated across every
+// assertion below, so both places that must agree change together.
+const soakCycleCount = 20
+
+// soakContextTimeout bounds TestSoak's own `docker compose up` context —
+// generous against soakCycleCount cycles' own observed per-cycle cost (a
+// fresh client handshake, a short ping, one HTTP probe, and a graceful
+// exit-notify stop, each roughly 10-15s) rather than tuned to one observed
+// run's timing.
+const soakContextTimeout = 15 * time.Minute
+
+// soakCyclesObservedRe extracts the soak_cycles_observed= field
+// test/interop/server's PASS line carries in soak mode
+// (test/interop/server/main.go's runSoak, 04-04-PLAN.md Task 1).
+var soakCyclesObservedRe = regexp.MustCompile(`soak_cycles_observed=(\d+)`)
+
+// soakGoroutinesRe/soakHeapRe extract the baseline/final goroutine and
+// post-GC HeapAlloc fields test/interop/server's PASS line carries in soak
+// mode (test/interop/server/main.go's takeSoakSample, 04-04-PLAN.md
+// Task 2).
+var (
+	soakGoroutinesBaselineRe = regexp.MustCompile(`soak_goroutines_baseline=(\d+)`)
+	soakGoroutinesFinalRe    = regexp.MustCompile(`soak_goroutines_final=(\d+)`)
+	soakHeapBaselineRe       = regexp.MustCompile(`soak_heap_baseline=(\d+)`)
+	soakHeapFinalRe          = regexp.MustCompile(`soak_heap_final=(\d+)`)
+)
+
+// soakIPsRe extracts the soak_ips= field (comma-separated, one entry per
+// cycle in CLOSE order) test/interop/server's PASS line carries in soak
+// mode (test/interop/server/main.go's soakTracker.ipHistory, 04-04-PLAN.md
+// Task 2's pool-reuse assertion).
+var soakIPsRe = regexp.MustCompile(`soak_ips=([0-9.,]+)`)
+
+// soakGoroutineTolerance bounds how much runtime.NumGoroutine may grow
+// between the baseline (sampled after cycle 1's session closes) and the
+// final sample (sampled after cycle 20's session closes) — 04-04-PLAN.md
+// Task 2's own tolerance choice. A per-session goroutine leak
+// (04-02-SUMMARY.md's own enumerated pump, keepalive, reneg/expiry ticker,
+// reaper, and any lame-duck Conn retransmit loop) shows up as roughly ONE
+// extra goroutine PER CYCLE that never exits, so a real leak across 19
+// remaining cycles would push the final count up by nearly 19 — this
+// tolerance must stay far below that to actually catch one. Observed on a
+// real 20-cycle run against this plan's own committed code:
+// soak_goroutines_baseline=5 soak_goroutines_final=4 (delta=-1, well
+// within noise — the final count can legitimately be LOWER than the
+// baseline too, e.g. a transient goroutine alive only at the moment the
+// baseline sample was taken) — the margin of 2 absorbs that kind of
+// ordinary scheduler/runtime noise without absorbing anything close to a
+// real per-cycle leak (Task 3 demonstrates this by deliberately disabling
+// one goroutine's own exit path and observing the assertion fail).
+const soakGoroutineTolerance = 2
+
+// soakHeapToleranceBytes bounds how much runtime.ReadMemStats' HeapAlloc
+// may grow between the baseline and final samples — loose enough to
+// absorb Go's allocator behavior (arena growth, GC bookkeeping, one-time
+// lazy initialization the runtime itself performs) without absorbing 19
+// cycles' worth of retained per-session state (T-04-16: retained sessions,
+// wrappers, or lame-duck slots). Observed on real 20-cycle runs against
+// this plan's own committed code: two clean runs showed
+// soak_heap_baseline/final deltas of +38240 and +40688 bytes (~37-40 KiB)
+// — ordinary allocator noise. 256 KiB is roughly 6-7x that noise, generous
+// run-to-run headroom, while sitting well below what deliberately
+// retaining all 20 cycles' own closed *ovpn.Session values (each carrying
+// its own TLS conn, ctrlconn buffers, and data-channel key material)
+// actually produced when Task 3 demonstrated this assertion failing:
+// delta=+621224 bytes (~606 KiB) — comfortably over this tolerance,
+// confirming it is tight enough to catch a real per-session heap leak
+// without flagging ordinary run-to-run noise.
+const soakHeapToleranceBytes = 256 * 1024 // 256 KiB
+
+// soakMaxDistinctIPs bounds how many DISTINCT tunnel IPs may appear across
+// all soakCycleCount cycles (04-04-PLAN.md Task 2's pool-reuse assertion,
+// T-04-17): this harness serves exactly one client at a time, so every
+// cycle's Close (WR-04, session.go:491-511) must release its IP back to
+// the pool before the next cycle's OnSession allocates again — a
+// regression that stopped releasing IPs would climb toward
+// soakCycleCount distinct addresses instead of reusing the same handful.
+const soakMaxDistinctIPs = 2
+
+// TestSoak is 04-04-PLAN.md's own verification, and ROADMAP Phase 4
+// success criterion 3's proof: a single long-lived server process serves
+// soakCycleCount real connect/use/clean-disconnect cycles from one real,
+// unmodified OpenVPN 2.6 client, every cycle reaching tunnel-up and ending
+// through explicit-exit-notify. It is deliberately its own test function,
+// not folded into the scenarios table TestInteropScenarios drives
+// (04-04-PLAN.md's key_links) — `make test` and `make interop` never
+// invoke it; only `make soak` (04-04-PLAN.md Task 2) does, via its own
+// long timeout.
+func TestSoak(t *testing.T) {
+	root, err := repoRoot()
+	if err != nil {
+		t.Fatalf("resolve repo root: %v", err)
+	}
+	interopDir := filepath.Join(root, "test", "interop")
+
+	if err := os.MkdirAll(filepath.Join(interopDir, "captures"), 0o755); err != nil {
+		t.Fatalf("create captures dir: %v", err)
+	}
+
+	// explicit-exit-notify (via cmd/gentestpki -client-directive, the same
+	// mechanism 04-03-PLAN.md Task 3 established) is what lets each cycle's
+	// clean disconnect close the server's Session promptly through the
+	// existing OCC_EXIT teardown path (04-02-PLAN.md) rather than the 60s
+	// idle-reap timer — without it, 20 cycles in Task 2 would each cost a
+	// full reap window instead of a couple of seconds.
+	sc := scenario{
+		name:             "soak",
+		profile:          "small",
+		composeOverlay:   "docker-compose.soak.yml",
+		contextTimeout:   soakContextTimeout,
+		clientDirectives: []string{"explicit-exit-notify 1"},
+	}
+
+	res := runScenario(root, interopDir, sc)
+	t.Log(res.composeOut)
+
+	if res.composeErr != nil {
+		t.Fatalf("docker compose up did not exit cleanly — see log above: %v", res.composeErr)
+	}
+
+	assertServerStaysUnprivileged(t, res)
+	assertSoakCyclesObserved(t, res, soakCycleCount)
+	assertSoakProbesOK(t, res, soakCycleCount)
+	assertSoakGoroutinesFlat(t, res)
+	assertSoakHeapFlat(t, res)
+	assertSoakIPsReused(t, res)
+}
+
+// assertSoakCyclesObserved is 04-04-PLAN.md Task 1's core proof: the
+// server's own soak_cycles_observed= PASS-line field must equal EXACTLY
+// want (never merely "at least") — a server that never observed the
+// cycles, or that stopped early on a partial deadline, must fail this
+// assertion rather than passing vacuously (T-04-18, this plan's own threat
+// register).
+func assertSoakCyclesObserved(t *testing.T, res scenarioResult, want int) {
+	t.Helper()
+
+	m := soakCyclesObservedRe.FindStringSubmatch(res.composeOut)
+	if m == nil {
+		t.Fatal("server output does not contain a parsable soak_cycles_observed= field — see log above")
+	}
+	got, err := strconv.Atoi(m[1])
+	if err != nil {
+		t.Fatalf("parse soak_cycles_observed=%q: %v", m[1], err)
+	}
+	if got != want {
+		t.Fatalf("server output reports soak_cycles_observed=%d, want exactly %d — see log above", got, want)
+	}
+	t.Logf("server observed %d soak cycles", got)
+}
+
+// assertSoakProbesOK requires every cycle's own http_landing_cN probe
+// (entrypoint.sh's run_soak_cycles) to report result=ok, proving each
+// cycle actually reached a working tunnel and not merely that the server
+// counted an open/close pair.
+func assertSoakProbesOK(t *testing.T, res scenarioResult, cycles int) {
+	t.Helper()
+
+	for i := 1; i <= cycles; i++ {
+		assertProbe(t, res, fmt.Sprintf("http_landing_c%d", i), true)
+	}
+}
+
+// parseSoakUint extracts and parses the first capture group re matches
+// against res.composeOut, failing the test with a descriptive message if
+// the field is missing or unparsable — shared by the four soak-flatness
+// field extractions below.
+func parseSoakUint(t *testing.T, res scenarioResult, re *regexp.Regexp, field string) uint64 {
+	t.Helper()
+	m := re.FindStringSubmatch(res.composeOut)
+	if m == nil {
+		t.Fatalf("server output does not contain a parsable %s= field — see log above", field)
+	}
+	v, err := strconv.ParseUint(m[1], 10, 64)
+	if err != nil {
+		t.Fatalf("parse %s=%q: %v", field, m[1], err)
+	}
+	return v
+}
+
+// assertSoakGoroutinesFlat is 04-04-PLAN.md Task 2's goroutine flatness
+// proof (T-04-15 in this plan's own threat register): the final
+// runtime.NumGoroutine sample (after cycle 20's session closes) must be
+// within soakGoroutineTolerance of the baseline (after cycle 1's session
+// closes) — proving no per-session goroutine accumulates across 20 real
+// connect/disconnect cycles.
+func assertSoakGoroutinesFlat(t *testing.T, res scenarioResult) {
+	t.Helper()
+
+	baseline := parseSoakUint(t, res, soakGoroutinesBaselineRe, "soak_goroutines_baseline")
+	final := parseSoakUint(t, res, soakGoroutinesFinalRe, "soak_goroutines_final")
+
+	var delta int64
+	if final >= baseline {
+		delta = int64(final - baseline)
+	} else {
+		delta = -int64(baseline - final)
+	}
+	if delta > soakGoroutineTolerance || delta < -soakGoroutineTolerance {
+		t.Fatalf(
+			"goroutine count grew from baseline=%d to final=%d (delta=%d), want within +/-%d — a per-session goroutine is likely leaking across cycles (T-04-15) — see log above",
+			baseline, final, delta, soakGoroutineTolerance,
+		)
+	}
+	t.Logf("goroutine count: baseline=%d final=%d (delta=%d, within +/-%d)", baseline, final, delta, soakGoroutineTolerance)
+}
+
+// assertSoakHeapFlat is 04-04-PLAN.md Task 2's post-GC HeapAlloc flatness
+// proof (T-04-16 in this plan's own threat register): the final HeapAlloc
+// sample must be within soakHeapToleranceBytes of the baseline — proving
+// no per-session heap state (sessions, wrappers, lame-duck slots) is
+// retained across 20 real connect/disconnect cycles.
+func assertSoakHeapFlat(t *testing.T, res scenarioResult) {
+	t.Helper()
+
+	baseline := parseSoakUint(t, res, soakHeapBaselineRe, "soak_heap_baseline")
+	final := parseSoakUint(t, res, soakHeapFinalRe, "soak_heap_final")
+
+	var delta int64
+	if final >= baseline {
+		delta = int64(final - baseline)
+	} else {
+		delta = -int64(baseline - final)
+	}
+	if delta > soakHeapToleranceBytes || delta < -soakHeapToleranceBytes {
+		t.Fatalf(
+			"post-GC HeapAlloc grew from baseline=%d to final=%d bytes (delta=%d), want within +/-%d bytes — per-session heap state is likely being retained across cycles (T-04-16) — see log above",
+			baseline, final, delta, soakHeapToleranceBytes,
+		)
+	}
+	t.Logf("post-GC HeapAlloc: baseline=%d final=%d bytes (delta=%d, within +/-%d)", baseline, final, delta, soakHeapToleranceBytes)
+}
+
+// assertSoakIPsReused is 04-04-PLAN.md Task 2's pool-reuse proof
+// (T-04-17): the soak_ips= field's comma-separated list (one assigned
+// tunnel IP per cycle, in close order) must contain at most
+// soakMaxDistinctIPs distinct addresses across all soakCycleCount cycles —
+// evidence that Close released each cycle's allocation back to the pool
+// (WR-04's ordering) rather than exhausting the range.
+func assertSoakIPsReused(t *testing.T, res scenarioResult) {
+	t.Helper()
+
+	m := soakIPsRe.FindStringSubmatch(res.composeOut)
+	if m == nil {
+		t.Fatal("server output does not contain a parsable soak_ips= field — see log above")
+	}
+	ips := strings.Split(m[1], ",")
+	if len(ips) != soakCycleCount {
+		t.Fatalf("soak_ips= lists %d addresses, want exactly %d (one per cycle) — see log above", len(ips), soakCycleCount)
+	}
+
+	distinct := make(map[string]bool, len(ips))
+	for _, ip := range ips {
+		distinct[ip] = true
+	}
+	if len(distinct) > soakMaxDistinctIPs {
+		t.Fatalf(
+			"soak_ips= contains %d distinct addresses across %d cycles (%v), want at most %d — the tunnel-IP pool may not be releasing addresses on Close (T-04-17) — see log above",
+			len(distinct), soakCycleCount, ips, soakMaxDistinctIPs,
+		)
+	}
+	t.Logf("tunnel IPs across %d cycles: %d distinct address(es) (%v), within the %d-address reuse bound", soakCycleCount, len(distinct), ips, soakMaxDistinctIPs)
 }

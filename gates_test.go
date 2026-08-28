@@ -950,6 +950,175 @@ func TestPhase4InteropClientConfigCarriesLifecycleDirectives(t *testing.T) {
 	}
 }
 
+// TestPhase4SoakSamplesBaselineAfterFirstCycle is 04-04-PLAN.md Task 3's own
+// standing gate (T-04-18 in this plan's own threat register): the soak
+// harness's baseline sample (test/interop/server/main.go's runSoak) must be
+// taken from a goroutine that receives from tracker.firstClosed — the
+// completed-first-cycle event — BEFORE ever calling takeSoakSample. A later
+// edit that moved the baseline to a cold-start sample (process start,
+// before any session has even opened) would make every soak result
+// trivially flat, certifying the property it does not check.
+func TestPhase4SoakSamplesBaselineAfterFirstCycle(t *testing.T) {
+	path := filepath.Join("test", "interop", "server", "main.go")
+	file, fset := parseGoFile(t, path)
+
+	var runSoak *ast.FuncDecl
+	for _, decl := range file.Decls {
+		fd, ok := decl.(*ast.FuncDecl)
+		if ok && fd.Name.Name == "runSoak" {
+			runSoak = fd
+		}
+	}
+	if runSoak == nil {
+		t.Fatalf("%s declares no runSoak function to check", path)
+	}
+
+	checkedAny := false
+	ast.Inspect(runSoak.Body, func(n ast.Node) bool {
+		fl, ok := n.(*ast.FuncLit)
+		if !ok || fl.Body == nil {
+			return true
+		}
+
+		firstClosedRecvIdx, takeSampleIdx := -1, -1
+		for i, stmt := range fl.Body.List {
+			ast.Inspect(stmt, func(inner ast.Node) bool {
+				if ue, ok := inner.(*ast.UnaryExpr); ok && ue.Op == token.ARROW {
+					if sel, ok := ue.X.(*ast.SelectorExpr); ok && sel.Sel.Name == "firstClosed" && firstClosedRecvIdx == -1 {
+						firstClosedRecvIdx = i
+					}
+				}
+				if call, ok := inner.(*ast.CallExpr); ok {
+					if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "takeSoakSample" && takeSampleIdx == -1 {
+						takeSampleIdx = i
+					}
+				}
+				return true
+			})
+		}
+
+		if takeSampleIdx == -1 {
+			return true // this closure doesn't sample; not the one we're checking
+		}
+		checkedAny = true
+		if firstClosedRecvIdx == -1 || firstClosedRecvIdx >= takeSampleIdx {
+			pos := fset.Position(fl.Pos())
+			t.Errorf(
+				"%s:%d: this closure calls takeSoakSample without first receiving from tracker.firstClosed earlier in the same statement list — the baseline must be sampled after cycle 1 closes, never at process start (T-04-18)",
+				pos.Filename, pos.Line,
+			)
+		}
+		return true
+	})
+	if !checkedAny {
+		t.Fatalf("%s's runSoak declares no closure calling takeSoakSample to check the baseline-after-first-cycle ordering against", path)
+	}
+}
+
+// makefileTargetRecipe extracts the tab-indented recipe lines immediately
+// following a "target:" header line in a Makefile's raw text — used by
+// TestPhase4SoakIsNotInDefaultTargets below to inspect exactly one
+// target's own commands without false-matching an unrelated target that
+// merely mentions the same word in a comment elsewhere in the file.
+func makefileTargetRecipe(t *testing.T, text, target string) string {
+	t.Helper()
+	prefix := target + ":"
+	inTarget := false
+	var recipe []string
+	for _, line := range strings.Split(text, "\n") {
+		if inTarget {
+			if strings.HasPrefix(line, "\t") {
+				recipe = append(recipe, line)
+				continue
+			}
+			break
+		}
+		if strings.HasPrefix(line, prefix) {
+			inTarget = true
+		}
+	}
+	if len(recipe) == 0 {
+		t.Fatalf("Makefile declares no recipe lines under target %q", target)
+	}
+	return strings.Join(recipe, "\n")
+}
+
+// TestPhase4SoakIsNotInDefaultTargets is 04-04-PLAN.md Task 3's own
+// standing gate (T-04-19): the Makefile's `test` and `interop` target
+// recipes must never invoke the soak test or the `soak` target itself, and
+// .DEFAULT_GOAL must keep pointing at `test` — a soak run costs minutes,
+// far more than either of those two targets is meant to cost a developer
+// on every invocation.
+func TestPhase4SoakIsNotInDefaultTargets(t *testing.T) {
+	data, err := os.ReadFile("Makefile")
+	if err != nil {
+		t.Fatalf("read Makefile: %v", err)
+	}
+	text := string(data)
+
+	if !strings.Contains(text, ".DEFAULT_GOAL := test") {
+		t.Error("Makefile's .DEFAULT_GOAL no longer points at test — the cheap check must stay reflexive (T-04-19)")
+	}
+
+	for _, target := range []string{"test", "interop"} {
+		recipe := makefileTargetRecipe(t, text, target)
+		if strings.Contains(recipe, "TestSoak") || strings.Contains(recipe, "soak") {
+			t.Errorf(
+				"Makefile's %q target recipe mentions the soak test/target (%q) — the soak must never run as part of `make test` or `make interop` (T-04-19)",
+				target, recipe,
+			)
+		}
+	}
+}
+
+// TestPhase4SoakAssertsObservedCycleCount is 04-04-PLAN.md Task 3's own
+// standing gate (T-04-18): test/interop/interop_test.go's
+// assertSoakCyclesObserved must compare the observed soak_cycles_observed=
+// field against its configured "want" argument with a strict inequality
+// (!=, never a "got < want" that a server reporting MORE cycles than
+// configured could satisfy trivially) and fail the test via Fatalf on
+// mismatch — a server that never observed the cycles must not be able to
+// pass this assertion.
+func TestPhase4SoakAssertsObservedCycleCount(t *testing.T) {
+	path := filepath.Join("test", "interop", "interop_test.go")
+	file, fset := parseGoFile(t, path)
+
+	var fd *ast.FuncDecl
+	for _, decl := range file.Decls {
+		f, ok := decl.(*ast.FuncDecl)
+		if ok && f.Name.Name == "assertSoakCyclesObserved" {
+			fd = f
+		}
+	}
+	if fd == nil {
+		t.Fatalf("%s declares no assertSoakCyclesObserved function to check", path)
+	}
+
+	hasExactComparison, hasFatal := false, false
+	ast.Inspect(fd.Body, func(n ast.Node) bool {
+		if be, ok := n.(*ast.BinaryExpr); ok && be.Op == token.NEQ {
+			if ident, ok := be.X.(*ast.Ident); ok && ident.Name == "want" {
+				hasExactComparison = true
+			}
+			if ident, ok := be.Y.(*ast.Ident); ok && ident.Name == "want" {
+				hasExactComparison = true
+			}
+		}
+		if sel, ok := n.(*ast.SelectorExpr); ok && sel.Sel.Name == "Fatalf" {
+			hasFatal = true
+		}
+		return true
+	})
+
+	pos := fset.Position(fd.Pos())
+	if !hasExactComparison {
+		t.Errorf("%s:%d: assertSoakCyclesObserved no longer compares the observed count against \"want\" with != — a server reporting a different cycle count than configured must fail this assertion (T-04-18)", pos.Filename, pos.Line)
+	}
+	if !hasFatal {
+		t.Errorf("%s:%d: assertSoakCyclesObserved no longer calls Fatalf on mismatch — a soft failure would let the soak pass vacuously", pos.Filename, pos.Line)
+	}
+}
+
 func TestPhase3StdlibOnlyImports(t *testing.T) {
 	walkGoFiles(t, func(path string, file *ast.File, fset *token.FileSet) {
 		for _, imp := range file.Imports {
