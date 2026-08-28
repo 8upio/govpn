@@ -1201,11 +1201,20 @@ func (s *Server) enforceRenegotiationWindow(sess *Session, newConn *ctrlconn.Con
 		return
 	case <-time.After(s.handshakeWindow):
 		sess.mu.Lock()
-		if sess.pendingReneg == newConn {
+		stillPending := sess.pendingReneg == newConn
+		if stillPending {
 			sess.pendingReneg = nil
 		}
 		sess.mu.Unlock()
-		_ = newConn.Close() // unblocks the stalled Handshake()/deriveKeyMethod2 call
+		// Only close newConn if this call is the one that actually cleared
+		// pendingReneg (CR-02): if the check above is false, the
+		// renegotiation already completed and swapped newConn in as
+		// sess.primary.conn between the select's timer firing and done
+		// being closed — closing it here would tear down the live,
+		// just-negotiated control channel for a reneg that succeeded.
+		if stillPending {
+			_ = newConn.Close() // unblocks the stalled Handshake()/deriveKeyMethod2 call
+		}
 	}
 }
 

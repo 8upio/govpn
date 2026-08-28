@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/tls"
+	"io"
 	"net"
 	"runtime"
 	"sync"
@@ -1103,5 +1104,96 @@ func TestPumpDoesNotDeliverAfterClose(t *testing.T) {
 		if delivered {
 			t.Fatalf("trial %d: pump() delivered a packet to a Conn after stopCh was already closed (WR-02 regression)", i)
 		}
+	}
+}
+
+// TestEnforceRenegotiationWindowDoesNotCloseSwappedConn is 04-REVIEW.md
+// CR-02's regression test: enforceRenegotiationWindow's timeout branch must
+// only close newConn if THIS call actually is the one that cleared
+// sess.pendingReneg (i.e. the renegotiation was still in flight when the
+// watchdog fired) — never unconditionally. Before the fix, the timer
+// branch unconditionally called newConn.Close() regardless of whether the
+// pendingReneg check matched, so a timer that fires in the narrow window
+// between runRenegotiation's atomic-swap unlock and its deferred
+// close(done) would tear down the just-promoted, live primary Conn for a
+// renegotiation that had already succeeded.
+//
+// This drives that exact post-swap, pre-done window directly and
+// deterministically: sess is constructed already in the state
+// runRenegotiation's own swap leaves it in (pendingReneg == nil,
+// primary.conn == newConn), and done is deliberately never closed —
+// reproducing "the timer is the select's only ready case even though the
+// reneg already succeeded" without any goroutine race or real sleep. A
+// handshakeWindow of 1ms makes enforceRenegotiationWindow's time.After
+// fire almost immediately when called synchronously.
+func TestEnforceRenegotiationWindowDoesNotCloseSwappedConn(t *testing.T) {
+	key := testTLSCryptKey(t)
+
+	serverPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("server listen: %v", err)
+	}
+	defer serverPC.Close()
+	clientPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("client listen: %v", err)
+	}
+	defer clientPC.Close()
+
+	serverWrapper, err := tlscrypt.NewWrapper(key, true)
+	if err != nil {
+		t.Fatalf("server wrapper: %v", err)
+	}
+
+	var clientSID, serverSID wire.SessionID
+	if _, err := rand.Read(clientSID[:]); err != nil {
+		t.Fatalf("generate client session id: %v", err)
+	}
+	if _, err := rand.Read(serverSID[:]); err != nil {
+		t.Fatalf("generate server session id: %v", err)
+	}
+
+	newConn := ctrlconn.New(serverSID, clientSID, serverWrapper, packetConnTransport{pc: serverPC}, clientPC.LocalAddr(), nil)
+	defer newConn.Close()
+
+	srv := &Server{handshakeWindow: time.Millisecond}
+
+	sess := &Session{
+		stopCh:  make(chan struct{}),
+		primary: keySlot{keyID: 1, conn: newConn, established: time.Now()},
+		// pendingReneg is nil — simulating runRenegotiation's own atomic
+		// swap having ALREADY cleared it and published newConn as primary,
+		// exactly the state between ovpn.go's post-swap sess.mu.Unlock()
+		// and its deferred close(done) actually running.
+		pendingReneg: nil,
+	}
+
+	// done is deliberately never closed, so the select inside
+	// enforceRenegotiationWindow has only the timer as a ready case —
+	// reproducing the race window even though the renegotiation already
+	// succeeded.
+	done := make(chan struct{})
+	srv.enforceRenegotiationWindow(sess, newConn, done)
+
+	sess.mu.Lock()
+	gotPending := sess.pendingReneg
+	sess.mu.Unlock()
+	if gotPending != nil {
+		t.Errorf("pendingReneg = %v, want nil (unchanged — it was already clear, so the watchdog must not touch it)", gotPending)
+	}
+
+	// newConn must NOT have been closed: give it a short read deadline and
+	// confirm Read reports a timeout, not io.EOF. ctrlconn.Conn.Read only
+	// returns io.EOF once c.closed is true and its read buffer is empty
+	// (internal/ctrlconn/conn.go) — a live Conn with no data delivered and
+	// an elapsed read deadline instead returns a timeout error.
+	if err := newConn.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	buf := make([]byte, 16)
+	if _, err := newConn.Read(buf); err == nil {
+		t.Fatal("Read unexpectedly succeeded with no data ever delivered")
+	} else if err == io.EOF {
+		t.Fatal("enforceRenegotiationWindow closed newConn even though the renegotiation had already succeeded (CR-02 regression): Read returned io.EOF instead of timing out")
 	}
 }
