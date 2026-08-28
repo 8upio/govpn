@@ -137,7 +137,7 @@ Plans:
   2. A client sending explicit-exit-notify ends its session immediately, and the embedder observes the `Session` closing rather than waiting for a timeout
   3. Silent sessions time out and are reaped, and `Session.Close()` tears down all state — a soak run over many connect/disconnect cycles shows goroutine and memory counts flat
 
-**Plans**: 3/4 plans executed
+**Plans**: 4/4 plans executed
 
 Plans:
 **Wave 1**
@@ -154,7 +154,7 @@ Plans:
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
-- [ ] 04-04-PLAN.md — Soak: 20 real connect/disconnect cycles against one server process, goroutine count and post-GC HeapAlloc flat against a post-first-cycle baseline, on its own `make soak` target (SESS-05)
+- [x] 04-04-PLAN.md — Soak: 20 real connect/disconnect cycles against one server process, goroutine count and post-GC HeapAlloc flat against a post-first-cycle baseline, on its own `make soak` target (SESS-05)
 
 ## Progress
 
@@ -166,7 +166,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 | 1. Handshake | 4/4 | Complete    | 2026-08-24 |
 | 2. Tunnel Up | 4/4 | Complete    | 2026-08-25 |
 | 3. In-Process Termination | 6/6 | Complete    | 2026-08-27 |
-| 4. Durable Sessions | 3/4 | In Progress|  |
+| 4. Durable Sessions | 4/4 | In Progress|  |
 
 ## Requirement Coverage
 
