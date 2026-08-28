@@ -87,6 +87,7 @@ const (
 	probeSettleDelay  = 5 * time.Second
 )
 
+
 // newHardenedHTTPServer builds the *http.Server this harness serves the
 // tunnelweb site through, with WR-02's timeouts set — see
 // examples/tunnelweb/main.go's own copy of this function for the full
@@ -209,7 +210,16 @@ func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorder
 	var udpRx, udpTx atomic.Int64
 	go runUDPEcho(udpConn, &udpRx, &udpTx)
 
-	sessions := make(chan *ovpn.Session, 1)
+	// establishedSession bundles the session-open timestamp and its
+	// sessionCloseObserver alongside the *ovpn.Session itself (04-03-PLAN.md
+	// Task 3), so the single value sent over sessions carries everything
+	// run()'s post-handshake logic needs to compute exit_notify_close_after=.
+	type establishedSession struct {
+		sess     *ovpn.Session
+		obs      *sessionCloseObserver
+		openedAt time.Time
+	}
+	sessions := make(chan establishedSession, 1)
 	srv := ovpn.NewServer(ovpn.Config{
 		TLSConfig:   tlsCfg,
 		TLSCryptKey: tlsCryptKey,
@@ -225,11 +235,19 @@ func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorder
 			// the netstack exists. AssignedIP() is guaranteed non-nil
 			// here (D-08: OnSession only fires after the PUSH_REQUEST/
 			// PUSH_REPLY exchange has already completed).
-			if err := stack.Attach(sess, sess.AssignedIP()); err != nil {
+			//
+			// closeObs wraps sess purely to time WHEN netstack's own
+			// single read-loop goroutine (Attach's documented one-reader
+			// contract) observes sess.Read returning a non-nil error —
+			// the client's explicit-exit-notify closing the session via
+			// Session.Close (04-03-PLAN.md Task 3). It changes no
+			// behavior: every call is forwarded to sess unchanged.
+			closeObs := newSessionCloseObserver(sess)
+			if err := stack.Attach(closeObs, sess.AssignedIP()); err != nil {
 				log.Printf("warning: netstack attach failed for %s: %v", sess.AssignedIP(), err)
 			}
 			select {
-			case sessions <- sess:
+			case sessions <- establishedSession{sess: sess, obs: closeObs, openedAt: time.Now()}:
 			default:
 				// Only the first session matters for this harness run.
 			}
@@ -240,7 +258,8 @@ func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorder
 	go func() { serveErr <- srv.Serve(obs) }()
 
 	select {
-	case sess := <-sessions:
+	case es := <-sessions:
+		sess := es.sess
 		state := sess.ConnectionState()
 		log.Printf(
 			"handshake established peer_cn=%s tls_version=%s cipher_suite=%s",
@@ -282,21 +301,50 @@ func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorder
 			return err
 		}
 
-		// -hold (04-03-PLAN.md Task 1): an extra survival extension AFTER
-		// waitForProbes' own normal trigger fires, default 0 so every
-		// pre-existing scenario is unaffected. The "reneg" scenario sets
-		// this so its shortened -reneg-sec timer has room to actually
-		// elapse — and, from Task 2 onward, room for multiple rollovers
-		// across several probe rounds — before this process exits and
-		// docker compose's --abort-on-container-exit tears the whole run
-		// down.
+		// -hold (04-03-PLAN.md Task 1) / session-close observation
+		// (04-03-PLAN.md Task 3): a SINGLE reactive survival-extension loop
+		// past waitForProbes' own normal trigger, ending on WHICHEVER of
+		// two conditions comes first — -hold's own deadline elapsing
+		// (default 0, so every pre-existing scenario is unaffected and
+		// this loop exits immediately, same as before -hold existed), or
+		// es.obs.observedClose() reporting the session already closed.
+		//
+		// This is a bug fix discovered running this plan's own "reneg"
+		// scenario for real (Rule 1): an EARLIER version slept the FULL
+		// -hold duration UNCONDITIONALLY, then only afterward checked for
+		// a close. Because docker compose's --abort-on-container-exit
+		// tears the WHOLE run down the instant ANY container exits — and
+		// the real client's own explicit-exit-notify makes IT exit within
+		// a couple of seconds of the graceful stop, long before a 60-second
+		// -hold sleep would ever complete — the client's own early exit
+		// killed the server mid-sleep every time, before it ever reached
+		// the close-check at all. Checking observedClose() on every poll
+		// tick, not just once after the full sleep, lets the server react
+		// and exit (printing PASS) within one poll interval of the close —
+		// comfortably before the client's own explicit-exit-notify timer
+		// (which keeps repeating OCC_EXIT for its own configured N seconds
+		// before self-terminating) — so the SERVER's own exit is what
+		// triggers the abort, exactly as --exit-code-from server intends,
+		// rather than racing the client's.
 		if hold > 0 {
-			log.Printf("holding an additional %s past the probe-driven trigger (-hold)", hold)
-			select {
-			case err := <-serveErr:
-				return fmt.Errorf("Serve exited unexpectedly during the -hold survival extension: %v", err)
-			case <-time.After(hold):
+			log.Printf("holding an additional %s past the probe-driven trigger (-hold), or until the session close is observed, whichever comes first", hold)
+			holdDeadline := time.After(hold)
+			holdTicker := time.NewTicker(probePollInterval)
+		holdLoop:
+			for {
+				if _, closed := es.obs.observedClose(); closed {
+					break holdLoop
+				}
+				select {
+				case err := <-serveErr:
+					holdTicker.Stop()
+					return fmt.Errorf("Serve exited unexpectedly during the -hold survival extension: %v", err)
+				case <-holdDeadline:
+					break holdLoop
+				case <-holdTicker.C:
+				}
 			}
+			holdTicker.Stop()
 		}
 
 		// km2=ok and assigned_ip=/peer_id= are unconditional here:
@@ -316,10 +364,33 @@ func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorder
 		// harness-local counters — interop_test.go's pingRxTxRe/
 		// assertPingRoundTrip keep working unchanged.
 		netStats := stack.Stats()
+
+		// exitNotifyField (04-03-PLAN.md Task 3) is appended to the PASS
+		// line only when the close was actually observed — every
+		// pre-existing scenario (and the "reneg" scenario's own probe
+		// rounds, before its final graceful stop) never triggers this, so
+		// the field is simply absent there, exactly as before this task.
+		// The distinct close_observed_epoch=/opened_at_epoch= log line
+		// (an absolute Unix-second timestamp, comparable across
+		// containers sharing the host clock) is what
+		// interop_test.go's assertExitNotifyClosesPromptly diffs against
+		// entrypoint.sh's own exit_notify_stop_issued epoch= field — the
+		// PASS line's own exit_notify_close_after= is a simpler,
+		// self-contained (session-open-to-close) duration for a human
+		// reading this log, not itself the cross-process proof.
+		var exitNotifyField string
+		if closedAt, closed := es.obs.observedClose(); closed {
+			log.Printf(
+				"session close observed (Read returned io.EOF) opened_at_epoch=%d close_observed_epoch=%d",
+				es.openedAt.Unix(), closedAt.Unix(),
+			)
+			exitNotifyField = fmt.Sprintf(" exit_notify_close_after=%s", closedAt.Sub(es.openedAt).Round(time.Millisecond))
+		}
+
 		log.Printf(
-			"PASS: session established and stable %s past handshake completion; peer_cn=%s tls_version=%s tls_version_raw=0x%04x cipher_suite=%s km2=ok push_request=%s assigned_ip=%s peer_id=%d ping_rx=%d ping_tx=%d udp_rx=%d udp_tx=%d http_requests=%d renegotiations=%d",
+			"PASS: session established and stable %s past handshake completion; peer_cn=%s tls_version=%s tls_version_raw=0x%04x cipher_suite=%s km2=ok push_request=%s assigned_ip=%s peer_id=%d ping_rx=%d ping_tx=%d udp_rx=%d udp_tx=%d http_requests=%d renegotiations=%d%s",
 			postHandshakeSurvival, sess.PeerCN, tls.VersionName(state.Version), state.Version, tls.CipherSuiteName(state.CipherSuite), pushStatus, sess.AssignedIP(), sess.PeerID(),
-			netStats.ICMPEchoRequests, netStats.ICMPEchoReplies, udpRx.Load(), udpTx.Load(), httpRequests.Load(), sess.RenegotiationCount(),
+			netStats.ICMPEchoRequests, netStats.ICMPEchoReplies, udpRx.Load(), udpTx.Load(), httpRequests.Load(), sess.RenegotiationCount(), exitNotifyField,
 		)
 
 		_ = srv.Close()
@@ -507,6 +578,59 @@ func (o *observingConn) lastObservedSummary() string {
 		return "nothing"
 	}
 	return o.lastObserved
+}
+
+// sessionCloseObserver wraps an *ovpn.Session purely to record WHEN
+// netstack's own single read-loop goroutine (Stack.Attach's documented
+// one-reader-per-attachment contract) observes Read returning a non-nil
+// error — the sole detach trigger (netstack's own D-02), and the moment a
+// real client's explicit-exit-notify (or any other teardown cause) actually
+// closed this session (04-03-PLAN.md Task 3). It changes no behavior: every
+// Read/Write/Close call is forwarded to the underlying Session unchanged,
+// and — because Attach starts EXACTLY one reader goroutine for whatever
+// netstack.Session it is given — wrapping sess here does not add a second
+// concurrent reader of the real *ovpn.Session, preserving Session.Read's own
+// documented single-reader-goroutine contract.
+type sessionCloseObserver struct {
+	sess *ovpn.Session
+
+	mu       sync.Mutex
+	closedAt time.Time
+	closed   bool
+}
+
+func newSessionCloseObserver(sess *ovpn.Session) *sessionCloseObserver {
+	return &sessionCloseObserver{sess: sess}
+}
+
+func (o *sessionCloseObserver) Read(p []byte) (int, error) {
+	n, err := o.sess.Read(p)
+	if err != nil {
+		o.mu.Lock()
+		if !o.closed {
+			o.closed = true
+			o.closedAt = time.Now()
+		}
+		o.mu.Unlock()
+	}
+	return n, err
+}
+
+func (o *sessionCloseObserver) Write(p []byte) (int, error) {
+	return o.sess.Write(p)
+}
+
+func (o *sessionCloseObserver) Close() error {
+	return o.sess.Close()
+}
+
+// observedClose reports whether this session's Read loop has observed a
+// close yet, and if so, when — safe to call repeatedly and concurrently
+// with Read (guarded by its own mutex), unlike draining a one-shot channel.
+func (o *sessionCloseObserver) observedClose() (time.Time, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.closedAt, o.closed
 }
 
 // lossyPacketConn is the server-to-client half of 01-04-PLAN.md Task 1's

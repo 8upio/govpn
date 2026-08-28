@@ -47,6 +47,21 @@ UDP_PORT="${UDP_PORT:-9999}"
 ROUND_COUNT="${ROUND_COUNT:-1}"
 ROUND_INTERVAL="${ROUND_INTERVAL:-0}"
 
+# EXIT_NOTIFY_STOP (04-03-PLAN.md Task 3) gates the graceful-stop step
+# below: default 0 (every pre-existing scenario) leaves this script's exit
+# path completely unchanged — the client stays blocked in `wait "$OVPN_PID"`
+# until the SERVER container's own exit triggers compose's
+# --abort-on-container-exit teardown, exactly as before this task. Only the
+# "reneg" scenario's docker-compose.reneg.yml overlay sets this to 1, since
+# only that scenario's client.conf carries explicit-exit-notify at all. A
+# non-gated (unconditional) early self-stop was tried first and discovered,
+# by actually running this harness, to break every OTHER scenario: the
+# client exiting before the server had finished its own probe-driven
+# survival window made --abort-on-container-exit tear the server down
+# mid-flight, well before it ever printed PASS (Rule 1 bug, caught and
+# fixed within this same task before being committed).
+EXIT_NOTIFY_STOP="${EXIT_NOTIFY_STOP:-0}"
+
 CAPTURE_DIR="${CAPTURE_DIR:-/captures}"
 CAPTURE_FILE="${CAPTURE_DIR}/interop.pcap"
 CONFIG="${OVPN_CONFIG:-/pki/client.conf}"
@@ -278,6 +293,31 @@ if curl -s --max-time 3 "http://govpn-interop-server:$HTTP_PORT/" >/dev/null 2>&
 else
 	echo "entrypoint: PROBE outside_tunnel result=ok"
 	echo "entrypoint: outside-tunnel probe succeeded: direct connection to the server container was refused or timed out"
+fi
+
+# Graceful stop (Task 3, gated by EXIT_NOTIFY_STOP above): SIGTERM the real
+# OpenVPN client so it actually transmits its own explicit-exit-notify (the
+# classic OCC_EXIT payload, sent once per second on the DATA channel for
+# `explicit-exit-notify <n>` seconds, sig.c:352-392) rather than being
+# killed outright by compose teardown, which would never emit it at all.
+# Only the "reneg" scenario's client.conf carries the explicit-exit-notify
+# directive (cmd/gentestpki -client-directive) and sets EXIT_NOTIFY_STOP=1
+# to match; this step runs strictly after every probe round and subpage
+# probe above has already finished, so there is no timing conflict with
+# that same scenario's renegotiation proof.
+#
+# epoch=$(date +%s) gives test/interop/interop_test.go's
+# assertExitNotifyClosesPromptly an absolute, cross-container-comparable
+# timestamp (docker compose containers share the host clock) to diff
+# against the server's own close_observed_epoch= field.
+if [ "$EXIT_NOTIFY_STOP" = "1" ]; then
+	STOP_ISSUED_AT=$(date +%s)
+	echo "entrypoint: PROBE exit_notify_stop_issued result=ok epoch=$STOP_ISSUED_AT"
+	kill -TERM "$OVPN_PID" 2>/dev/null || true
+	# Give the client's own explicit-exit-notify a moment to actually reach
+	# the server before this script's own wait/cleanup path takes over
+	# below.
+	sleep 3
 fi
 
 set +e

@@ -33,11 +33,18 @@
 # (plus the remaining http_status/http_echo/http_headers/outside_tunnel
 # probes after it) before its probe-driven trigger's settle delay would
 # otherwise let it exit.
+# EXIT_NOTIFY_STOP=1 (04-03-PLAN.md Task 3) is this scenario's own opt-in
+# into entrypoint.sh's graceful-stop step — gated, not unconditional,
+# because an early unconditional client self-stop was discovered (running
+# this harness for real) to race the server's own probe-driven survival
+# window on every OTHER scenario, killing it via
+# --abort-on-container-exit before it ever printed PASS (Rule 1 bug fix).
 services:
   client:
     environment:
       - ROUND_COUNT=5
       - ROUND_INTERVAL=8
+      - EXIT_NOTIFY_STOP=1
 
   server:
     command: ["-pki", "/pki", "-listen", "0.0.0.0:1194", "-deadline", "60s", "-reneg-sec", "15s", "-hold", "60s"]

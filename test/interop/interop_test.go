@@ -107,7 +107,13 @@ var scenarios = []scenario{
 		largeCert:         false,
 		contextTimeout:    4 * time.Minute,
 		composeOverlay:    "docker-compose.reneg.yml",
-		clientDirectives:  []string{"reneg-sec 15"},
+		// explicit-exit-notify 2 (04-03-PLAN.md Task 3) is carried by this
+		// SAME scenario rather than a second one sharing the overlay: the
+		// graceful-stop step (entrypoint.sh) runs strictly after every
+		// probe round and subpage probe above has already finished, so
+		// there is no timing conflict with the multi-round renegotiation
+		// proof above — one shared run exercises both success criteria.
+		clientDirectives:  []string{"reneg-sec 15", "explicit-exit-notify 2"},
 		minRenegotiations: 2,
 		probeRounds:       5,
 	},
@@ -412,6 +418,18 @@ func TestInteropScenarios(t *testing.T) {
 			// skips this assertion entirely.
 			if sc.minRenegotiations > 0 {
 				assertRenegotiation(t, res, sc.minRenegotiations)
+			}
+
+			// 04-03-PLAN.md Task 3 (SESS-05 against a real client): the
+			// same "reneg" scenario's client carries explicit-exit-notify,
+			// so its graceful stop (entrypoint.sh, after every probe round
+			// and subpage probe above) must close the server's Session
+			// well under the 60s idle-reap window. minRenegotiations > 0 is
+			// reused as this scenario's own marker rather than adding a
+			// third boolean field — this plan's only scenario carrying
+			// either directive carries both.
+			if sc.minRenegotiations > 0 {
+				assertExitNotifyClosesPromptly(t, res)
 			}
 
 			if sc.largeCert {
@@ -906,6 +924,71 @@ func assertNoReconnect(t *testing.T, res scenarioResult) {
 		t.Fatalf("client output contains %d occurrences of \"Initialization Sequence Completed\", want exactly 1 — more than one means the tunnel was torn down and rebuilt (a reconnect), not rekeyed in place (T-04-11) — see log above", n)
 	}
 	t.Log("client log shows renegotiation evidence and exactly one completed initialization sequence — every rollover rekeyed in place, none reconnected")
+}
+
+// exitNotifyStopIssuedRe/sessionCloseObservedRe (04-03-PLAN.md Task 3)
+// extract the two absolute Unix-second epoch timestamps
+// assertExitNotifyClosesPromptly diffs: the client's own
+// "PROBE exit_notify_stop_issued result=ok epoch=<N>" line (entrypoint.sh,
+// when the graceful SIGTERM was issued) and the server's own
+// "close_observed_epoch=<N>" field on its distinct close-observation log
+// line (test/interop/server/main.go, when Read returning io.EOF was
+// observed). Both containers share the host clock under docker compose, so
+// the two epochs are directly comparable.
+var (
+	exitNotifyStopIssuedRe = regexp.MustCompile(`PROBE exit_notify_stop_issued result=ok epoch=(\d+)`)
+	sessionCloseObservedRe = regexp.MustCompile(`close_observed_epoch=(\d+)`)
+)
+
+const exitNotifyThresholdSecs int64 = 15
+
+// assertExitNotifyClosesPromptly is 04-03-PLAN.md Task 3's proof (T-04-12
+// in this plan's own threat register): a real client's explicit-exit-notify
+// closes the server's Session within seconds of the graceful stop being
+// issued — comfortably below the 60s idle-reap window, so the close cannot
+// be explained by the reap timer having simply expired on its own schedule.
+// exitNotifyThresholdSecs (15s) is chosen well under 60s with generous
+// margin for the client's own OCC_EXIT round trip (repeated once per
+// second, sig.c:374-392) while still being far enough from 60 that a
+// regression which silently fell back to the idle-reap path would fail
+// this assertion rather than accidentally sneaking in under a threshold set
+// too close to 60.
+func assertExitNotifyClosesPromptly(t *testing.T, res scenarioResult) {
+	t.Helper()
+
+	if res.composeErr != nil {
+		return
+	}
+
+	stopMatch := exitNotifyStopIssuedRe.FindStringSubmatch(res.composeOut)
+	if stopMatch == nil {
+		t.Fatal("client output does not contain a parsable PROBE exit_notify_stop_issued epoch= field — see log above")
+	}
+	stopEpoch, err := strconv.ParseInt(stopMatch[1], 10, 64)
+	if err != nil {
+		t.Fatalf("parse exit_notify_stop_issued epoch=%q: %v", stopMatch[1], err)
+	}
+
+	closeMatch := sessionCloseObservedRe.FindStringSubmatch(res.composeOut)
+	if closeMatch == nil {
+		t.Fatal("server output does not contain a parsable close_observed_epoch= field — the server never observed the session close (Session.Read returning io.EOF) — see log above")
+	}
+	closeEpoch, err := strconv.ParseInt(closeMatch[1], 10, 64)
+	if err != nil {
+		t.Fatalf("parse close_observed_epoch=%q: %v", closeMatch[1], err)
+	}
+
+	elapsed := closeEpoch - stopEpoch
+	if elapsed < 0 {
+		t.Fatalf("server observed the session close (epoch=%d) BEFORE the client's graceful stop was issued (epoch=%d) — see log above", closeEpoch, stopEpoch)
+	}
+	if elapsed > exitNotifyThresholdSecs {
+		t.Fatalf(
+			"elapsed time from the client's graceful stop to the server observing the session close = %ds, want at most %ds — comfortably under the 60s idle-reap window; a duration this close to 60s would not distinguish exit-notify from the idle-reap timer having simply expired on its own schedule — see log above",
+			elapsed, exitNotifyThresholdSecs,
+		)
+	}
+	t.Logf("exit-notify closed the session %ds after the client's graceful stop (well under the 60s idle-reap window and the %ds threshold)", elapsed, exitNotifyThresholdSecs)
 }
 
 // assertUnreachableOutsideTunnel is 03-06-PLAN.md Task 3's negative proof

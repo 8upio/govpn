@@ -851,6 +851,105 @@ func TestPhase4NoSessionClosedCallback(t *testing.T) {
 	}
 }
 
+// TestPhase4InteropClientConfigCarriesLifecycleDirectives is 04-03-PLAN.md
+// Task 3's own standing gate: the interop scenario table's renegotiation/
+// exit-notify entry ("reneg", test/interop/interop_test.go's own
+// clientDirectives field) must carry BOTH the shortened-reneg-sec directive
+// and the explicit-exit-notify directive in its client directive list — a
+// static, AST-based check over that file's source (parsing does not care
+// about its own "interop" build tag) so a later edit that quietly drops
+// either directive from the scenario table fails `make gates` immediately
+// rather than leaving the "reneg" scenario passing vacuously (T-04-11/
+// T-04-12: a scenario satisfied by nothing is itself a risk this plan's
+// threat register flags).
+func TestPhase4InteropClientConfigCarriesLifecycleDirectives(t *testing.T) {
+	file, fset := parseGoFile(t, filepath.Join("test", "interop", "interop_test.go"))
+
+	var directives []string
+	found := false
+	for _, decl := range file.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.VAR {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			vs, ok := spec.(*ast.ValueSpec)
+			if !ok || len(vs.Names) != 1 || vs.Names[0].Name != "scenarios" {
+				continue
+			}
+			for _, val := range vs.Values {
+				cl, ok := val.(*ast.CompositeLit)
+				if !ok {
+					continue
+				}
+				for _, elt := range cl.Elts {
+					scLit, ok := elt.(*ast.CompositeLit)
+					if !ok {
+						continue
+					}
+
+					isReneg := false
+					var cdLit *ast.CompositeLit
+					for _, f := range scLit.Elts {
+						kv, ok := f.(*ast.KeyValueExpr)
+						if !ok {
+							continue
+						}
+						key, ok := kv.Key.(*ast.Ident)
+						if !ok {
+							continue
+						}
+						switch key.Name {
+						case "name":
+							if bl, ok := kv.Value.(*ast.BasicLit); ok && bl.Value == `"reneg"` {
+								isReneg = true
+							}
+						case "clientDirectives":
+							if lit, ok := kv.Value.(*ast.CompositeLit); ok {
+								cdLit = lit
+							}
+						}
+					}
+					if !isReneg {
+						continue
+					}
+					found = true
+					if cdLit != nil {
+						for _, d := range cdLit.Elts {
+							bl, ok := d.(*ast.BasicLit)
+							if !ok {
+								continue
+							}
+							directives = append(directives, strings.Trim(bl.Value, `"`))
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if !found {
+		t.Fatal("test/interop/interop_test.go's scenarios table declares no \"reneg\" scenario entry to check")
+	}
+
+	hasReneg, hasExitNotify := false, false
+	for _, d := range directives {
+		if strings.HasPrefix(d, "reneg-sec ") {
+			hasReneg = true
+		}
+		if strings.HasPrefix(d, "explicit-exit-notify ") {
+			hasExitNotify = true
+		}
+	}
+	pos := fset.Position(file.Pos())
+	if !hasReneg {
+		t.Errorf("%s: the \"reneg\" scenario's clientDirectives no longer carries a \"reneg-sec \" directive — D-23's renegotiation proof would be untestable against a real client", pos.Filename)
+	}
+	if !hasExitNotify {
+		t.Errorf("%s: the \"reneg\" scenario's clientDirectives no longer carries an \"explicit-exit-notify \" directive — this plan's exit-notify proof would be untestable against a real client", pos.Filename)
+	}
+}
+
 func TestPhase3StdlibOnlyImports(t *testing.T) {
 	walkGoFiles(t, func(path string, file *ast.File, fset *token.FileSet) {
 		for _, imp := range file.Imports {
