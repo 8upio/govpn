@@ -137,12 +137,12 @@ Plans:
   2. A client sending explicit-exit-notify ends its session immediately, and the embedder observes the `Session` closing rather than waiting for a timeout
   3. Silent sessions time out and are reaped, and `Session.Close()` tears down all state — a soak run over many connect/disconnect cycles shows goroutine and memory counts flat
 
-**Plans**: 4 plans
+**Plans**: 1/4 plans executed
 
 Plans:
 **Wave 1**
 
-- [ ] 04-01-PLAN.md — Tracer: soft-reset renegotiation — two-slot key state (primary/lame-duck), key-id increment rule, new TLS+KM2 under the new key-id with no PUSH re-exchange, server-side `Config.RenegSec` timer, key-id hard-error validation (SESS-04)
+- [x] 04-01-PLAN.md — Tracer: soft-reset renegotiation — two-slot key state (primary/lame-duck), key-id increment rule, new TLS+KM2 under the new key-id with no PUSH re-exchange, server-side `Config.RenegSec` timer, key-id hard-error validation (SESS-04)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
@@ -166,7 +166,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 | 1. Handshake | 4/4 | Complete    | 2026-08-24 |
 | 2. Tunnel Up | 4/4 | Complete    | 2026-08-25 |
 | 3. In-Process Termination | 6/6 | Complete    | 2026-08-27 |
-| 4. Durable Sessions | 0/4 | Planned | - |
+| 4. Durable Sessions | 1/4 | In Progress|  |
 
 ## Requirement Coverage
 
