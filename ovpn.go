@@ -1127,7 +1127,20 @@ func (s *Server) runRenegotiation(sess *Session, newConn *ctrlconn.Conn, keyID u
 	}
 
 	sess.mu.Lock()
-	if sess.closing() {
+	// CR-03: re-check sess.pendingReneg == newConn here, symmetric with
+	// enforceRenegotiationWindow's own compare-and-clear. Handshake()/
+	// deriveKeyMethod2 above run without sess.mu held, so the watchdog can
+	// win the race in the window between them succeeding and this Lock()
+	// call: it observes sess.pendingReneg == newConn, clears it, and closes
+	// newConn — all before this goroutine gets here. Without this check,
+	// sess.closing() alone doesn't catch that case (the session itself
+	// isn't closing, only this specific attempt was invalidated), and the
+	// swap below would unconditionally publish the now-closed newConn as
+	// sess.primary.conn, permanently breaking the control channel for this
+	// key-id. Whichever side (this goroutine or the watchdog) observes the
+	// mismatch first is the one that tears newConn down; the other becomes
+	// a no-op.
+	if sess.closing() || sess.pendingReneg != newConn {
 		sess.mu.Unlock()
 		_ = newConn.Close()
 		return

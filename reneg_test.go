@@ -1203,6 +1203,225 @@ func TestEnforceRenegotiationWindowDoesNotCloseSwappedConn(t *testing.T) {
 	}
 }
 
+// TestRunRenegotiationAbandonsSwapWhenPendingRenegAlreadyCleared is
+// 04-REVIEW.md CR-03's regression test: runRenegotiation's swap section
+// must re-check sess.pendingReneg == newConn (symmetric with
+// enforceRenegotiationWindow's own compare-and-clear) at the same point it
+// already checks sess.closing(), before committing the primary/lame-duck
+// swap under sess.mu. Without this check, if enforceRenegotiationWindow
+// wins the race — observing sess.pendingReneg == newConn, clearing it, and
+// closing newConn — in the window between Handshake()/deriveKeyMethod2
+// succeeding and runRenegotiation's own sess.mu.Lock() (ovpn.go:1129),
+// sess.closing() alone doesn't catch it (the session itself isn't
+// closing, only this one renegotiation attempt was invalidated), so the
+// swap would unconditionally publish the now-closed newConn as
+// sess.primary.conn — permanently and silently breaking the session's
+// control channel for that key-id.
+//
+// This drives that exact scenario deterministically, without depending on
+// any real timing race: sess is constructed with pendingReneg already
+// nil — simulating "the watchdog already got here first and cleared it" —
+// while a real client goroutine drives an actual TLS handshake and Key
+// Method 2 exchange to completion over newConn, so runRenegotiation's own
+// Handshake()/deriveKeyMethod2 calls genuinely succeed (this exercises the
+// swap-lock gate itself, not a failed-handshake early return). Because
+// sess.pendingReneg never equals newConn at any point in this test — not
+// just transiently — the fix's re-check is guaranteed to observe the
+// mismatch on every run, regardless of scheduler timing.
+func TestRunRenegotiationAbandonsSwapWhenPendingRenegAlreadyCleared(t *testing.T) {
+	key := testTLSCryptKey(t)
+
+	serverPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("server listen: %v", err)
+	}
+	defer serverPC.Close()
+	clientPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("client listen: %v", err)
+	}
+	defer clientPC.Close()
+
+	serverWrapper, err := tlscrypt.NewWrapper(key, true)
+	if err != nil {
+		t.Fatalf("server wrapper: %v", err)
+	}
+	clientWrapper, err := tlscrypt.NewWrapper(key, false)
+	if err != nil {
+		t.Fatalf("client wrapper: %v", err)
+	}
+
+	var clientSID, serverSID wire.SessionID
+	if _, err := rand.Read(clientSID[:]); err != nil {
+		t.Fatalf("generate client session id: %v", err)
+	}
+	if _, err := rand.Read(serverSID[:]); err != nil {
+		t.Fatalf("generate server session id: %v", err)
+	}
+
+	oldPrimaryConn := ctrlconn.New(serverSID, clientSID, serverWrapper, packetConnTransport{pc: serverPC}, clientPC.LocalAddr(), nil)
+	defer oldPrimaryConn.Close()
+
+	newConn := ctrlconn.NewWithKeyID(serverSID, clientSID, serverWrapper, packetConnTransport{pc: serverPC}, clientPC.LocalAddr(), nil, 1)
+	defer newConn.Close()
+
+	tlsCfg, caPool := testHandshakeTLSConfig(t)
+
+	srv := &Server{
+		pc: serverPC,
+		cfg: Config{
+			TLSConfig: tlsCfg,
+		},
+		sessions:        make(map[sessionKey]*Session),
+		dataSessions:    make(map[uint32]*Session),
+		handshakeWindow: 5 * time.Second,
+	}
+
+	sess := &Session{
+		SessionID:       serverSID,
+		clientSessionID: clientSID,
+		wrapper:         serverWrapper,
+		conn:            oldPrimaryConn,
+		RemoteAddr:      clientPC.LocalAddr(),
+		srv:             srv,
+		stopCh:          make(chan struct{}),
+		primary:         keySlot{keyID: 0, conn: oldPrimaryConn, established: time.Now()},
+		// pendingReneg is deliberately left nil — simulating
+		// enforceRenegotiationWindow having ALREADY observed
+		// sess.pendingReneg == newConn, cleared it, and closed newConn,
+		// exactly the state runRenegotiation's swap-lock section must
+		// detect (CR-03) rather than trusting sess.closing() alone.
+		pendingReneg: nil,
+	}
+
+	// Manual server-side dispatch: this test deliberately runs without a
+	// live srv.Serve(serverPC) loop (so it can hold pendingReneg nil for
+	// the whole test), but session.go's own routeControlPacket — which a
+	// live Serve loop would use to demux inbound datagrams to a Conn —
+	// routes to sess.pendingReneg by definition (session.go:643-645), so
+	// it would never deliver anything to newConn while pendingReneg is
+	// nil. Route straight to newConn instead, independent of
+	// sess.pendingReneg, mirroring ovpn.go's own unwrap-and-parse step
+	// (readAndParseReply's client-side counterpart) so the client's real
+	// TLS handshake bytes actually reach newConn's reassembly buffer.
+	dispatchDone := make(chan struct{})
+	go func() {
+		defer close(dispatchDone)
+		buf := make([]byte, maxDatagramSize)
+		for {
+			n, _, err := serverPC.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			header, plaintext, err := serverWrapper.Unwrap(nil, buf[:n])
+			if err != nil {
+				continue
+			}
+			opcode, keyID := wire.ParseHeaderByte(header[0])
+			if keyID != 1 {
+				continue
+			}
+			var csid wire.SessionID
+			copy(csid[:], header[1:1+wire.SessionIDSize])
+			cp, err := wire.ParseControlPacket(plaintext, wire.Header{Opcode: opcode, KeyID: keyID, SessionID: csid})
+			if err != nil {
+				continue
+			}
+			newConn.Deliver(cp)
+		}
+	}()
+
+	// Real client goroutine: completes an actual TLS handshake and Key
+	// Method 2 exchange over newConn's peer socket, so runRenegotiation's
+	// own Handshake()/deriveKeyMethod2 calls genuinely succeed.
+	clientConn := ctrlconn.NewWithKeyID(clientSID, serverSID, clientWrapper, packetConnTransport{pc: clientPC}, serverPC.LocalAddr(), nil, 1)
+	defer clientConn.Close()
+
+	// Symmetric manual dispatch for the client side: ctrlconn.Conn never
+	// reads its own transport (only writes to it — see conn.go's Transport
+	// interface), so something must read clientPC and call
+	// clientConn.Deliver for the server's handshake/Key-Method-2 replies
+	// to ever reach the client's tls.Conn, exactly like the server-side
+	// dispatch loop above.
+	clientDispatchDone := make(chan struct{})
+	go func() {
+		defer close(clientDispatchDone)
+		buf := make([]byte, maxDatagramSize)
+		for {
+			n, _, err := clientPC.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			header, plaintext, err := clientWrapper.Unwrap(nil, buf[:n])
+			if err != nil {
+				continue
+			}
+			opcode, keyID := wire.ParseHeaderByte(header[0])
+			if keyID != 1 {
+				continue
+			}
+			var ssid wire.SessionID
+			copy(ssid[:], header[1:1+wire.SessionIDSize])
+			cp, err := wire.ParseControlPacket(plaintext, wire.Header{Opcode: opcode, KeyID: keyID, SessionID: ssid})
+			if err != nil {
+				continue
+			}
+			clientConn.Deliver(cp)
+		}
+	}()
+
+	clientDone := make(chan error, 1)
+	go func() {
+		clientTLSConn := tls.Client(clientConn, &tls.Config{
+			RootCAs:    caPool,
+			ServerName: testHandshakeServerCN,
+			MinVersion: tls.VersionTLS12,
+		})
+		if err := clientTLSConn.Handshake(); err != nil {
+			clientDone <- err
+			return
+		}
+		if err := writeTestClientKeyMethod2(clientTLSConn); err != nil {
+			clientDone <- err
+			return
+		}
+		clientDone <- readTestServerKeyMethod2(clientTLSConn)
+	}()
+
+	srv.runRenegotiation(sess, newConn, 1)
+
+	if err := <-clientDone; err != nil {
+		t.Fatalf("client handshake/Key Method 2: %v", err)
+	}
+
+	sess.mu.Lock()
+	gotKeyID := sess.primary.keyID
+	gotConn := sess.primary.conn
+	gotRenegotiations := sess.renegotiations
+	gotPending := sess.pendingReneg
+	sess.mu.Unlock()
+
+	if gotKeyID != 0 || gotConn != oldPrimaryConn {
+		t.Fatalf("sess.primary = {keyID: %d, conn: %p}, want unchanged {keyID: 0, conn: %p} (CR-03 regression: swap committed despite pendingReneg already cleared)", gotKeyID, gotConn, oldPrimaryConn)
+	}
+	if gotRenegotiations != 0 {
+		t.Errorf("sess.renegotiations = %d, want 0 (swap must not have run)", gotRenegotiations)
+	}
+	if gotPending != nil {
+		t.Errorf("sess.pendingReneg = %v, want nil (unchanged)", gotPending)
+	}
+
+	// newConn must have been closed by the abandoned swap (CR-03's fix
+	// path), not left live and not promoted to primary.
+	if err := newConn.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	buf := make([]byte, 16)
+	if _, err := newConn.Read(buf); err != io.EOF {
+		t.Fatalf("newConn.Read = %v, want io.EOF (runRenegotiation must close newConn when abandoning the swap, CR-03)", err)
+	}
+}
+
 // TestRunRenegotiationClearsPendingRenegOnWrapperFailure is 04-REVIEW.md
 // WR-03's regression test. datachan.NewWrapper cannot actually be made to
 // fail from runRenegotiation's call site today — DataKeys' cipher fields
