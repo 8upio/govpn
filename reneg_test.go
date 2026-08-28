@@ -1027,3 +1027,81 @@ func TestDebugDataKeysConcurrentWithWrite(t *testing.T) {
 	close(stop)
 	wg.Wait()
 }
+
+// TestPumpDoesNotDeliverAfterClose is 04-REVIEW.md WR-02's regression test:
+// pump()'s select has no priority between sess.inbound and sess.stopCh, so
+// a packet already sitting in sess.inbound when Close() closes stopCh can
+// still be selected on that same iteration and routed to a Conn Close() is
+// tearing down. This test pre-loads exactly one packet into sess.inbound
+// and closes stopCh BEFORE pump ever runs, so pump's very first select call
+// sees both channels ready simultaneously — reproducing the race window
+// WR-02 describes on every trial. Go's select picks pseudo-randomly
+// between multiple ready cases, so which case fires is not itself
+// deterministic, but the OUTCOME is: with the fix, the closing() check
+// inside the inbound case deterministically skips delivery every time that
+// case is chosen, so touchAuthTraffic (delivery's own observable side
+// effect, ovpn.go:661) must never fire — checked across many trials
+// instead of relying on a single lucky/unlucky select outcome.
+func TestPumpDoesNotDeliverAfterClose(t *testing.T) {
+	key := testTLSCryptKey(t)
+
+	serverPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("server listen: %v", err)
+	}
+	defer serverPC.Close()
+	clientPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("client listen: %v", err)
+	}
+	defer clientPC.Close()
+
+	serverWrapper, err := tlscrypt.NewWrapper(key, true)
+	if err != nil {
+		t.Fatalf("server wrapper: %v", err)
+	}
+
+	var clientSID, serverSID wire.SessionID
+	if _, err := rand.Read(clientSID[:]); err != nil {
+		t.Fatalf("generate client session id: %v", err)
+	}
+	if _, err := rand.Read(serverSID[:]); err != nil {
+		t.Fatalf("generate server session id: %v", err)
+	}
+
+	conn := ctrlconn.New(serverSID, clientSID, serverWrapper, packetConnTransport{pc: serverPC}, clientPC.LocalAddr(), nil)
+	defer conn.Close()
+
+	const trials = 200
+	for i := 0; i < trials; i++ {
+		sess := &Session{
+			inbound: make(chan wire.ControlPacket, 1),
+			stopCh:  make(chan struct{}),
+			primary: keySlot{keyID: 0, conn: conn},
+		}
+		// Ack-only, empty-payload packet: absorb() takes the no-op path
+		// for both its Ack-window update and its receive-window Put/Get
+		// (no bytes ever cross the wire), so this only exercises whether
+		// delivery is attempted at all — not any other absorb behavior.
+		sess.inbound <- wire.ControlPacket{Opcode: wire.OpAckV1}
+		close(sess.stopCh)
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			sess.pump()
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("trial %d: pump() never returned", i)
+		}
+
+		sess.mu.Lock()
+		delivered := !sess.lastAuthTraffic.IsZero()
+		sess.mu.Unlock()
+		if delivered {
+			t.Fatalf("trial %d: pump() delivered a packet to a Conn after stopCh was already closed (WR-02 regression)", i)
+		}
+	}
+}

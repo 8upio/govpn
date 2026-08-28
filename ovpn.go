@@ -651,6 +651,19 @@ func (sess *Session) pump() {
 	for {
 		select {
 		case cp := <-sess.inbound:
+			// WR-02 (04-REVIEW.md): select has no priority between
+			// sess.inbound and sess.stopCh, so a packet already sitting in
+			// sess.inbound can still be selected on the same iteration
+			// Close() closes stopCh — routing it to a Conn that Close() is
+			// about to (or has just) called .Close() on. Checking
+			// sess.closing() here closes that window: once Close() has
+			// decided to tear the session down, no further packet is
+			// dispatched to any Conn, matching the teardown discipline
+			// Close's own WR-05 commentary establishes for
+			// assignedIP/peerID/dataSessions.
+			if sess.closing() {
+				continue
+			}
 			if target := sess.routeControlPacket(cp.KeyID); target != nil {
 				target.Deliver(cp)
 				// D-22/Pattern 6 (forward.c:1093-1103): reset the idle-reap
