@@ -100,9 +100,16 @@ type keySlot struct {
 // buffer too small for the next packet on Read returns an error rather
 // than truncating — backed by the AES-256-GCM data channel
 // (internal/datachan). A 16-byte ping keepalive is absorbed entirely
-// inside the decrypt path and never reaches Read's caller (D-11). Close
-// tears down this session's control channel and releases its tunnel IP
-// and peer-id back to the pool.
+// inside the decrypt path and never reaches Read's caller (D-11).
+//
+// A Session ends in exactly one of three ways, all of which flow through
+// the same Close()/stopOnce contract and leave both Read and Write
+// returning io.EOF: the embedder calling Close directly, the client
+// sending an explicit-exit-notify on the authenticated data channel
+// (D-21), or the server's own idle-session reaper closing a session that
+// has gone silent for the reap window (D-22). In every case, Close tears
+// down this session's control channel and releases its tunnel IP and
+// peer-id back to the pool.
 type Session struct {
 	// SessionID is this session's server-assigned 8-byte control-channel
 	// session ID.
@@ -471,8 +478,18 @@ func (s *Session) Read(p []byte) (int, error) {
 // Write encrypts p as one P_DATA_V2 packet (D-05: one full IP packet per
 // call) and sends it to the client's UDP address over the same
 // net.PacketConn the control channel uses. It returns len(p) on success,
-// matching io.Writer's contract for a full write.
+// matching io.Writer's contract for a full write. After this session has
+// been torn down — by any of the three causes Session's own doc comment
+// names (embedder Close, client exit-notify, idle reap) — Write returns
+// io.EOF (D-22), distinct from the "data channel not yet established"
+// error below, which is the genuinely-pre-tunnel-up case: a session that
+// is merely still negotiating is not the same as one that has already
+// ended.
 func (s *Session) Write(p []byte) (int, error) {
+	if s.closing() {
+		return 0, io.EOF
+	}
+
 	s.mu.Lock()
 	wrapper := s.primary.wrapper
 	s.mu.Unlock()

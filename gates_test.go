@@ -705,6 +705,152 @@ func TestPhase4NoNewModuleDependencies(t *testing.T) {
 	}
 }
 
+// isStopChSelector reports whether e is a selector expression ending in
+// ".stopCh" — used by TestPhase4TeardownAlwaysFlowsThroughClose to find
+// close(...stopCh) call sites regardless of receiver name (s.stopCh,
+// sess.stopCh, etc.).
+func isStopChSelector(e ast.Expr) bool {
+	sel, ok := e.(*ast.SelectorExpr)
+	return ok && sel.Sel.Name == "stopCh"
+}
+
+// TestPhase4TeardownAlwaysFlowsThroughClose asserts that closing a
+// session's stopCh, deleting it from Server.sessions/Server.dataSessions,
+// and releasing its tunnel IP/peer-id back to the pool all happen ONLY
+// from inside Session.Close's own stopOnce body (or a helper Close itself
+// calls, i.e. removeSession) — never from a second, independently-grown
+// teardown path (D-22: reaping and exit-notify both flow through the
+// existing Close()/stopOnce contract, adding no new coupling).
+// performPushExchange's own allocate-then-immediately-roll-back-on-error
+// calls to pool.release are a narrower, pre-existing exception: they
+// release an IP that was allocated moments earlier in the SAME function
+// call, before it was ever published anywhere a session teardown could
+// observe it — not a teardown path.
+func TestPhase4TeardownAlwaysFlowsThroughClose(t *testing.T) {
+	allowedStopChClose := map[string]bool{"Close": true}
+	allowedSessionsDelete := map[string]bool{"removeSession": true}
+	allowedDataSessionsDelete := map[string]bool{"Close": true}
+	allowedPoolRelease := map[string]bool{"Close": true, "performPushExchange": true}
+
+	check := func(path string) {
+		file, fset := parseGoFile(t, path)
+		for _, decl := range file.Decls {
+			fd, ok := decl.(*ast.FuncDecl)
+			if !ok || fd.Body == nil {
+				continue
+			}
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				switch fun := call.Fun.(type) {
+				case *ast.Ident:
+					if fun.Name == "close" && len(call.Args) == 1 && isStopChSelector(call.Args[0]) {
+						if !allowedStopChClose[fd.Name.Name] {
+							pos := fset.Position(call.Pos())
+							t.Errorf("%s:%d: %s closes stopCh outside Close's stopOnce body (D-22)", pos.Filename, pos.Line, fd.Name.Name)
+						}
+					}
+					if fun.Name == "delete" && len(call.Args) == 2 {
+						if sel, ok := call.Args[0].(*ast.SelectorExpr); ok {
+							switch sel.Sel.Name {
+							case "sessions":
+								if !allowedSessionsDelete[fd.Name.Name] {
+									pos := fset.Position(call.Pos())
+									t.Errorf("%s:%d: %s deletes from Server.sessions outside Close/removeSession (D-22)", pos.Filename, pos.Line, fd.Name.Name)
+								}
+							case "dataSessions":
+								if !allowedDataSessionsDelete[fd.Name.Name] {
+									pos := fset.Position(call.Pos())
+									t.Errorf("%s:%d: %s deletes from Server.dataSessions outside Close (D-22)", pos.Filename, pos.Line, fd.Name.Name)
+								}
+							}
+						}
+					}
+				case *ast.SelectorExpr:
+					if fun.Sel.Name == "release" && !allowedPoolRelease[fd.Name.Name] {
+						pos := fset.Position(call.Pos())
+						t.Errorf("%s:%d: %s calls pool.release outside Close/performPushExchange's own rollback-on-error path (D-22)", pos.Filename, pos.Line, fd.Name.Name)
+					}
+				}
+				return true
+			})
+		}
+	}
+	check("session.go")
+	check("ovpn.go")
+}
+
+// TestPhase4ExitNotifyCheckedOnlyPostDecrypt asserts isExitNotify is called
+// from exactly one place in the whole package: inside handleDataPacket,
+// after a successful Wrapper.Open — never from handleDatagram or
+// handleDataDatagram (or anywhere else), which only ever see ciphertext
+// (T-04-06: the exit-notify check must never move earlier than decrypt).
+func TestPhase4ExitNotifyCheckedOnlyPostDecrypt(t *testing.T) {
+	allowed := map[string]bool{"handleDataPacket": true}
+
+	check := func(path string) {
+		file, fset := parseGoFile(t, path)
+		for _, decl := range file.Decls {
+			fd, ok := decl.(*ast.FuncDecl)
+			if !ok || fd.Body == nil {
+				continue
+			}
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				ident, ok := call.Fun.(*ast.Ident)
+				if !ok || ident.Name != "isExitNotify" {
+					return true
+				}
+				if !allowed[fd.Name.Name] {
+					pos := fset.Position(call.Pos())
+					t.Errorf(
+						"%s:%d: %s calls isExitNotify — the ONLY allowed call site is handleDataPacket, after a successful decrypt (T-04-06); handleDatagram/handleDataDatagram only ever see ciphertext",
+						pos.Filename, pos.Line, fd.Name.Name,
+					)
+				}
+				return true
+			})
+		}
+	}
+	check("session.go")
+	check("ovpn.go")
+}
+
+// TestPhase4NoSessionClosedCallback asserts Config declares no
+// OnSessionClosed-style field: 04-CONTEXT.md defers that idea (T-04-10),
+// and the embedder observes teardown as io.EOF from Read/Write instead.
+func TestPhase4NoSessionClosedCallback(t *testing.T) {
+	file, _ := parseGoFile(t, "ovpn.go")
+	for _, decl := range file.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.TYPE {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			ts, ok := spec.(*ast.TypeSpec)
+			if !ok || ts.Name.Name != "Config" {
+				continue
+			}
+			st, ok := ts.Type.(*ast.StructType)
+			if !ok {
+				continue
+			}
+			for _, field := range st.Fields.List {
+				for _, name := range field.Names {
+					if strings.Contains(name.Name, "Closed") {
+						t.Errorf("Config declares field %q — an OnSessionClosed-style callback stays deferred (T-04-10, 04-CONTEXT.md)", name.Name)
+					}
+				}
+			}
+		}
+	}
+}
+
 func TestPhase3StdlibOnlyImports(t *testing.T) {
 	walkGoFiles(t, func(path string, file *ast.File, fset *token.FileSet) {
 		for _, imp := range file.Imports {

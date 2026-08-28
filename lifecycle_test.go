@@ -12,6 +12,7 @@ import (
 	"crypto/tls"
 	"io"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 
@@ -524,4 +525,190 @@ func TestDeliveredControlPacketResetsReapTimer(t *testing.T) {
 	close(sess.stopCh)
 	<-pumpDone
 	<-reapDone
+}
+
+// TestReadWriteReturnEOFAfterEveryTeardownCause is Task 3's D-22 proof:
+// Read and Write both return io.EOF after teardown from any of the four
+// causes — embedder Close, exit-notify, reap, and handshake-window
+// timeout.
+func TestReadWriteReturnEOFAfterEveryTeardownCause(t *testing.T) {
+	cases := []struct {
+		name    string
+		trigger func(t *testing.T) *Session
+	}{
+		{
+			name: "embedder Close",
+			trigger: func(t *testing.T) *Session {
+				sess := &Session{stopCh: make(chan struct{})}
+				_ = sess.Close()
+				return sess
+			},
+		},
+		{
+			name: "exit-notify",
+			trigger: func(t *testing.T) *Session {
+				wrapper, err := datachan.NewWrapper(testSymmetricDataKeys(t), 1, 0)
+				if err != nil {
+					t.Fatalf("NewWrapper: %v", err)
+				}
+				sess := &Session{
+					stopCh:    make(chan struct{}),
+					primary:   keySlot{wrapper: wrapper},
+					ipInbound: make(chan []byte, ipInboundQueueSize),
+				}
+				sealed, err := wrapper.Seal(nil, occExitPayload())
+				if err != nil {
+					t.Fatalf("Seal: %v", err)
+				}
+				sess.handleDataPacket(sealed)
+				return sess
+			},
+		},
+		{
+			name: "reap",
+			trigger: func(t *testing.T) *Session {
+				clock := newFakeClock()
+				sess := newReapTestSession(t, clock, time.Minute)
+				clock.Advance(2 * time.Minute)
+
+				tick := make(chan time.Time)
+				go sess.runReap(tick)
+				tick <- time.Now()
+
+				deadline := time.Now().Add(2 * time.Second)
+				for !sess.closing() {
+					if time.Now().After(deadline) {
+						t.Fatal("runReap never closed the session")
+					}
+					time.Sleep(2 * time.Millisecond)
+				}
+				return sess
+			},
+		},
+		{
+			name: "handshake-window timeout",
+			trigger: func(t *testing.T) *Session {
+				sess := &Session{
+					stopCh: make(chan struct{}),
+					doneCh: make(chan struct{}),
+				}
+				srv := &Server{handshakeWindow: time.Millisecond}
+				srv.enforceHandshakeWindow(sess)
+				return sess
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sess := tc.trigger(t)
+
+			buf := make([]byte, 10)
+			if _, err := readWithTimeout(t, sess, buf, 2*time.Second); err != io.EOF {
+				t.Errorf("Read after %s = %v, want io.EOF", tc.name, err)
+			}
+			if _, err := sess.Write(buf); err != io.EOF {
+				t.Errorf("Write after %s = %v, want io.EOF", tc.name, err)
+			}
+		})
+	}
+}
+
+// TestNoGoroutineLeakAcrossSessionLifecycle is Task 3's T-04-09 proof: a
+// full tunnel-up plus one renegotiation plus a teardown leaves no
+// goroutine behind — pump, keepalive, the reneg ticker, the reaper, and
+// the lame-duck Conn's retransmit loop must all have exited once the
+// session is closed and unreferenced. This is the fast-tier sentinel for
+// the same property plan 04-04 measures against the real client.
+func TestNoGoroutineLeakAcrossSessionLifecycle(t *testing.T) {
+	_, network, err := net.ParseCIDR("10.60.2.0/24")
+	if err != nil {
+		t.Fatalf("parse network: %v", err)
+	}
+	key := testTLSCryptKey(t)
+
+	serverPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("server listen: %v", err)
+	}
+	defer serverPC.Close()
+
+	tlsCfg, caPool := testHandshakeTLSConfig(t)
+
+	sessions := make(chan *Session, 1)
+	srv := NewServer(Config{
+		TLSCryptKey: key,
+		TLSConfig:   tlsCfg,
+		Network:     network,
+		OnSession:   func(sess *Session) { sessions <- sess },
+	})
+	go func() { _ = srv.Serve(serverPC) }()
+	defer srv.Close()
+
+	// Baseline is taken AFTER the Serve loop's own long-lived goroutine
+	// already exists, but BEFORE any session exists — so the only
+	// goroutines this test's own bring-up/renegotiation/teardown sequence
+	// can be blamed for are session-scoped ones (pump, keepalive, the
+	// reneg ticker, the reaper, and any renegotiation Conn's retransmit
+	// loop), not the server's own always-running read loop.
+	runtime.Gosched()
+	time.Sleep(10 * time.Millisecond)
+	baseline := runtime.NumGoroutine()
+
+	client, replyReader := tunnelUpTestClient(t, key, serverPC.LocalAddr(), caPool)
+
+	if err := writeControlString(client.tlsConn, pushRequestLiteral); err != nil {
+		t.Fatalf("write push request: %v", err)
+	}
+	if _, err := readControlString(replyReader, maxControlStringLen); err != nil {
+		t.Fatalf("read push reply: %v", err)
+	}
+
+	var sess *Session
+	select {
+	case sess = <-sessions:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnSession was never called")
+	}
+
+	newConn := client.renegotiate(t, serverPC.LocalAddr(), 1)
+	if err := newConn.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
+		t.Fatalf("set reneg deadline: %v", err)
+	}
+	renegTLSConn := tls.Client(newConn, &tls.Config{
+		RootCAs:    caPool,
+		ServerName: testHandshakeServerCN,
+		MinVersion: tls.VersionTLS12,
+	})
+	if err := renegTLSConn.Handshake(); err != nil {
+		t.Fatalf("reneg client handshake: %v", err)
+	}
+	if err := writeTestClientKeyMethod2(renegTLSConn); err != nil {
+		t.Fatalf("write client Key Method 2 (reneg): %v", err)
+	}
+	if err := readTestServerKeyMethod2(renegTLSConn); err != nil {
+		t.Fatalf("read server Key Method 2 (reneg): %v", err)
+	}
+	if err := newConn.SetDeadline(time.Time{}); err != nil {
+		t.Fatalf("clear reneg deadline: %v", err)
+	}
+	waitForPrimaryKeyID(t, sess, 1)
+
+	if err := sess.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	client.Close()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		runtime.Gosched()
+		n := runtime.NumGoroutine()
+		if n <= baseline {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("goroutine count = %d, want <= baseline %d after full teardown", n, baseline)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
