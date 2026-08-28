@@ -24,6 +24,8 @@ A real, unmodified OpenVPN 2.6 client can connect to a Go process embedding this
 - ✓ Virtual tunnel-IP assignment from `Config.Network` (`topology subnet`, server = first host IP, sequential pool, release-on-close) — Phase 2 (real client logs "Initialization Sequence Completed"; encrypted pings round-trip through Session.Read/Write)
 - ✓ Userspace netstack (`netstack` package): ListenUDP net.PacketConn, minimal server-side TCP with stdlib http.Serve support, built-in ICMP echo, Attach/Detach IP→session routing — Phase 3
 - ✓ Example web server (`examples/tunnelweb`): landing + 4 subpages, reachable only through the tunnel — Phase 3 (real client pings, UDP round-trips, and loads pages live; server container unprivileged, no TUN)
+- ✓ Key renegotiation (soft reset): bidirectional reneg-sec timers, lame-duck key transition, traffic flows across rollovers with zero reconnects — Phase 4 (live-verified, 3 rollovers)
+- ✓ Session lifecycle: explicit-exit-notify immediate close, silent-session reaping, io.EOF observability, leak-free teardown (20-cycle soak flat) — Phase 4
 
 ### Active
 
@@ -100,4 +102,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-08-27 after Phase 3 (In-Process Termination) — tunnel traffic terminates fully in-process; real client pings, UDP round-trips, and browses the example site with an unprivileged server container*
+*Last updated: 2026-08-28 after Phase 4 (Durable Sessions) — milestone v1.0 complete: full OpenVPN 2.6 server-side protocol with renegotiation, clean session lifecycle, and in-process termination, verified end-to-end against a real client*
