@@ -18,7 +18,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 1: Handshake** - A real OpenVPN 2.6 client in Docker completes the TLS handshake against the library (completed 2026-08-24)
 - [x] **Phase 2: Tunnel Up** - Client gets its IP, keys derive byte-exactly, and an encrypted ping round-trips (completed 2026-08-25)
 - [x] **Phase 3: In-Process Termination** - Ping, UDP and an HTTP page load through the tunnel via the userspace netstack (completed 2026-08-27)
-- [ ] **Phase 4: Durable Sessions** - Sessions survive renegotiation and end cleanly without leaks
+- [x] **Phase 4: Durable Sessions** - Sessions survive renegotiation and end cleanly without leaks (completed 2026-08-28)
 
 ## Phase Details
 
@@ -166,7 +166,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 | 1. Handshake | 4/4 | Complete    | 2026-08-24 |
 | 2. Tunnel Up | 4/4 | Complete    | 2026-08-25 |
 | 3. In-Process Termination | 6/6 | Complete    | 2026-08-27 |
-| 4. Durable Sessions | 4/4 | In Progress|  |
+| 4. Durable Sessions | 4/4 | Complete    | 2026-08-28 |
 
 ## Requirement Coverage
 

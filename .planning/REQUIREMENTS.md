@@ -33,8 +33,8 @@ Requirements for initial release. Each maps to roadmap phases.
 - [x] **SESS-01**: Embedder can start a server with `ovpn.NewServer(Config{...}).Serve(net.PacketConn)` — TLS config, cipher, tunnel network, tls-crypt key, OnSession callback
 - [x] **SESS-02**: Each connected client yields a `Session` (`io.ReadWriteCloser` for raw IP packets) with its assigned tunnel IP exposed
 - [x] **SESS-03**: Tunnel IPs are assigned from a configurable `*net.IPNet` of any size (server = first host IP, `topology subnet`, 1 IP per client)
-- [ ] **SESS-04**: Soft reset / key renegotiation works: session survives client-initiated renegotiation (default `reneg-sec 3600`) with key rollover and no traffic interruption beyond the protocol's own switchover
-- [ ] **SESS-05**: Sessions end cleanly: explicit-exit-notify is handled, idle sessions time out and are reaped, `Session.Close()` tears down state without goroutine leaks
+- [x] **SESS-04**: Soft reset / key renegotiation works: session survives client-initiated renegotiation (default `reneg-sec 3600`) with key rollover and no traffic interruption beyond the protocol's own switchover
+- [x] **SESS-05**: Sessions end cleanly: explicit-exit-notify is handled, idle sessions time out and are reaped, `Session.Close()` tears down state without goroutine leaks
 
 ### Userspace Netstack
 
@@ -113,8 +113,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 | NET-04 | Phase 3 | Complete |
 | XMPL-01 | Phase 3 | Complete |
 | VRFY-02 | Phase 3 | Complete |
-| SESS-04 | Phase 4 | Pending |
-| SESS-05 | Phase 4 | Pending |
+| SESS-04 | Phase 4 | Complete |
+| SESS-05 | Phase 4 | Complete |
 
 **Coverage:**
 
