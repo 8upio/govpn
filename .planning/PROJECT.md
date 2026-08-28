@@ -8,6 +8,14 @@ A pure-Go library (`github.com/8upio/govpn`, package `ovpn`) implementing the **
 
 A real, unmodified OpenVPN 2.6 client can connect to a Go process embedding this library and exchange traffic through the tunnel — verified against the reference implementation, not approximated from memory.
 
+## Current State (v1.0 shipped 2026-08-28)
+
+govpn v1.0 is complete: a real, unmodified OpenVPN 2.6 client connects, tunnels up, exchanges encrypted traffic terminated fully in-process (no TUN, no privileges), renegotiates keys without interruption, and leaves cleanly — all verified live against the reference client. Core module remains stdlib-only. Requirements archived at .planning/milestones/v1.0-REQUIREMENTS.md.
+
+## Next Milestone Goals
+
+Not yet defined — run /gsd-new-milestone. Candidate seeds from deferred items: real GitHub CI activation, NCP/epoch data format, server-sent exit-notify, session stats surface, catch-all UDP port-range demux, TUN integration.
+
 ## Requirements
 
 ### Validated
