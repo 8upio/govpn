@@ -2,246 +2,208 @@
 phase: 04-durable-sessions
 reviewed: 2026-08-28T00:00:00Z
 depth: standard
-files_reviewed: 13
+files_reviewed: 2
 files_reviewed_list:
-  - Makefile
-  - cmd/gentestpki/main.go
-  - gates_test.go
-  - internal/ctrlconn/conn.go
-  - lifecycle_test.go
   - ovpn.go
-  - ovpn_test.go
   - reneg_test.go
-  - session.go
-  - test/interop/docker-compose.reneg.yml
-  - test/interop/docker-compose.soak.yml
-  - test/interop/entrypoint.sh
-  - test/interop/interop_test.go
-  - test/interop/server/main.go
 findings:
-  critical: 1
-  warning: 2
+  critical: 0
+  warning: 0
   info: 1
-  total: 4
-status: issues_found
+  total: 1
+status: clean
 ---
 
-# Phase 04: Code Review Report
+# Phase 04: Code Review Report (Iteration 3 — Final Verification)
 
 **Reviewed:** 2026-08-28T00:00:00Z
 **Depth:** standard
-**Files Reviewed:** 13
+**Files Reviewed:** 2 (`ovpn.go`, `reneg_test.go` — narrowly scoped to re-verify CR-02 (`4f25152`) and WR-03 (`296e63e`))
 **Status:** issues_found
 
 ## Summary
 
-Phase 4 adds soft-reset key renegotiation, explicit-exit-notify teardown, and
-idle-session reaping on top of the Phase 1-3 control/data channel. The
-concurrency discipline documented in the code (`sess.mu` → `srv.mu` lock
-ordering, snapshot-under-lock-then-operate-outside-lock for the data-channel
-decrypt path, `stopOnce`-gated teardown) was traced through the renegotiation
-swap, the lame-duck expiry sweep, `Close()`'s teardown, and the reneg
-rate-limit / SOFT_RESET dedup fix, and holds up: no lock-order inversion, no
-double-release of pool state, no use-after-close panic was found, and the
-04-03 dedup fix for the both-sides-initiate-at-once race genuinely resolves
-it (the routing table match happens under the same `sess.mu` that publishes
-`pendingReneg`, so there is no window where a fresh, correctly-keyed
-SOFT_RESET_V1 can be dropped instead of delivered to the already-pending
-`Conn`).
+This is a narrowly-scoped final verification pass over the two fixes from
+iteration 2: CR-02 (`4f25152`, watchdog closing an already-promoted `Conn`)
+and WR-03 (`296e63e`, `runRenegotiation`'s `datachan.NewWrapper` failure path
+not clearing `pendingReneg`).
 
-However, one significant gap was found: **an in-flight renegotiation has no
-timeout of its own**, unlike the initial handshake (which is protected by
-`enforceHandshakeWindow`). A renegotiation that starts and then stalls (client
-disappears mid-handshake, packet loss beyond what the reliability layer
-recovers, etc.) leaks the `runRenegotiation` goroutine and its `Conn`'s
-retransmit loop forever, and — more importantly — permanently disables all
-further renegotiation for that session, because `sess.pendingReneg` never
-clears. Ordinary data traffic on the still-live old primary key keeps
-`lastAuthTraffic` fresh, so the idle-session reaper never rescues the session
-either: it can run for its entire remaining lifetime on a key that was
-supposed to have been rotated away from reneg-sec ago, silently defeating the
-one behavior this phase exists to add. This is classified as a blocker.
+**Both CR-02 and WR-03 are genuinely and correctly fixed for the exact
+scenarios they targeted.**
 
-Two further issues are classified as warnings: an inconsistency between the
-locked write and unlocked read of `Session.dataKeys` (a real, if narrow, data
-race for a caller of the public `DebugDataKeys`/`DebugKeyMethod2Material`
-accessors), and residual routing of already-queued packets to closed `Conn`s
-after `Close()` returns. One info-level dead-code item is also noted.
+- CR-02: `enforceRenegotiationWindow`'s timeout branch now only calls
+  `newConn.Close()` when `stillPending` (the same variable that gated the
+  `pendingReneg` clear) is true — verified by direct code trace and by
+  `TestEnforceRenegotiationWindowDoesNotCloseSwappedConn`, which reproduces
+  the exact post-swap/pre-`done` window (sess already has `pendingReneg ==
+  nil` and `primary.conn == newConn`, `done` deliberately never closed) and
+  confirms `newConn` is not torn down.
+- WR-03: the `datachan.NewWrapper` failure branch in `runRenegotiation` now
+  clears `sess.pendingReneg` (guarded by the same `== newConn` check used
+  elsewhere) before unlocking and closing `newConn` — verified by direct
+  code trace and by `TestRunRenegotiationClearsPendingRenegOnWrapperFailure`
+  (a structural `go/ast` assertion, since the failure itself has no runtime
+  injection seam today).
+- CR-01's original guarantees are intact: `TestStalledRenegotiationRecoversAfterWindow`
+  still passes and still proves a stalled renegotiation's goroutine exits,
+  `pendingReneg` clears, and a fresh renegotiation attempt re-arms afterward.
+  `go build ./...` is clean and `go test -race -count=1 .` passes in full
+  (all packages, all reneg tests included).
+
+**However, tracing every interleaving of `enforceRenegotiationWindow`'s
+timeout branch against `runRenegotiation`'s *success* (swap) path — as this
+verification pass was specifically asked to do — surfaces a related, still-open
+race that CR-02's fix does not cover**, because CR-02 only closed the window
+*after* the swap commits; it left open a mirror-image window *before* the
+swap commits. See CR-03 below. `pendingReneg` itself is never cleared twice
+(every clear site uses the same `if sess.pendingReneg == newConn { ... =
+nil }` compare-and-clear idiom under `sess.mu`, so at most one caller's clear
+ever "wins" and every other caller correctly observes it already gone) — the
+new finding is not a `pendingReneg` double-clear, but the swap path
+unconditionally publishing `newConn` as the new primary `Conn` without
+re-checking that this specific renegotiation attempt is still the live one.
 
 ## Critical Issues
 
-### CR-01: In-flight renegotiation has no timeout — a stalled reneg leaks a goroutine and permanently disables future rekeying for the session
+### CR-03 (CLOSED, `e647f49`): `runRenegotiation`'s success path can promote an already-closed `newConn` to `sess.primary.conn`, because it never re-checks `sess.pendingReneg == newConn` before committing the swap
 
-**File:** `ovpn.go:994-1141` (`startRenegotiation`, `beginRenegotiation`, `runRenegotiation`); compare `ovpn.go:1146-1153` (`enforceHandshakeWindow`)
+**Status: fixed in `e647f49` (04-REVIEW-FIX.md iteration 3).** Applied the
+fix exactly as proposed below: `runRenegotiation`'s swap section now
+re-checks `sess.pendingReneg != newConn` alongside `sess.closing()` before
+committing the swap, abandoning it (closing `newConn`) if the watchdog
+already cleared `pendingReneg` in the interim. Regression test
+`TestRunRenegotiationAbandonsSwapWhenPendingRenegAlreadyCleared` added in
+`reneg_test.go`, confirmed to fail against the pre-fix code and pass
+against the fix; `TestStalledRenegotiationRecoversAfterWindow` and
+`TestEnforceRenegotiationWindowDoesNotCloseSwappedConn` re-verified with no
+regression. `go build ./...`, `go vet ./...`, `go test -race -count=1
+./...`, and `make gates` all pass. See 04-REVIEW-FIX.md for full detail.
 
-**Issue:** The *initial* control-channel handshake is protected by a
-companion goroutine, `enforceHandshakeWindow` (started at `ovpn.go:546`
-alongside `runHandshake`), which tears the session down if the handshake
-doesn't complete within `s.handshakeWindow` (60s in production). No
-equivalent exists for a *renegotiation* handshake: `runRenegotiation`
-(`ovpn.go:1073`) calls `tls.Server(newConn, s.cfg.TLSConfig).Handshake()`
-(line 1084) and `s.deriveKeyMethod2(...)` (line 1089) with no deadline ever
-set on `newConn`, and no watchdog goroutine racing it. `ctrlconn.Conn.Read`
-(`internal/ctrlconn/conn.go:244-266`) blocks indefinitely when no read
-deadline has been set, so if the peer never completes this handshake (goes
-silent, drops the network mid-exchange, or simply never responds to a
-server-initiated bare `SOFT_RESET_V1` from `checkReneg`), `runRenegotiation`
-blocks forever.
+**File:** `ovpn.go:1092-1183` (`runRenegotiation`), specifically the gap between the `tlsConn.Handshake()`/`deriveKeyMethod2` calls (`ovpn.go:1117-1127`) and the swap's lock acquisition (`ovpn.go:1129`); compare `ovpn.go:1206-1227` (`enforceRenegotiationWindow`).
 
-While it's blocked:
+**Issue:** CR-02 fixed the race where the watchdog fires *after* the swap has
+already published `newConn` as `sess.primary.conn` and cleared
+`sess.pendingReneg` — the watchdog now checks `sess.pendingReneg == newConn`
+before closing, and by the time the swap has committed that's already false,
+so it correctly does nothing.
 
-1. The `runRenegotiation` goroutine and `newConn`'s own `retransmitLoop`
-   goroutine (started inside `ctrlconn.NewWithKeyID`, `conn.go:139`) both leak
-   for the remaining lifetime of the process or session.
-2. `sess.pendingReneg` (set at `ovpn.go:1039`) never clears. Every subsequent
-   check in `startRenegotiation` (`ovpn.go:1008-1013`, "a renegotiation is
-   already in flight ... the timer tick or a second SOFT_RESET_V1 is a
-   no-op") now refuses *every* future renegotiation attempt for this
-   session — both the server's own `checkReneg` timer (`session.go:735-762`)
-   and any further client-initiated `SOFT_RESET_V1` — for as long as the
-   session lives. The session's data-channel key is never rotated again.
-3. This is not caught by the idle-session reaper (`session.go:804-822`):
-   the *old* primary key slot is untouched until the atomic swap at the end
-   of `runRenegotiation` (`ovpn.go:1120-1125`), so ordinary data/control
-   traffic on the still-live old key keeps calling `touchAuthTraffic()`
-   (`session.go:576`, `session.go:661`) and the session looks perfectly
-   healthy to the reaper indefinitely — it just silently never rekeys again.
-4. Nothing surfaces this to the embedder: `checkReneg`'s
-   `if !ok { return }` (`session.go:753-755`) and `beginRenegotiation`'s
-   `if !ok { return }` (`ovpn.go:1057-1059`) are both silent no-ops, so
-   there is no diagnostic signal that a session's renegotiation capability
-   is permanently stuck.
+But `sess.pendingReneg` is only cleared *inside* the swap's own critical
+section, at the very end (`ovpn.go:1170-1172`), immediately before its
+`sess.mu.Unlock()`. Nothing checks `sess.pendingReneg` (or `newConn`'s own
+closed state) at the *start* of that critical section, before deciding to
+proceed with the swap. The only gate at that point is `sess.closing()`
+(`ovpn.go:1130`), which asks "is the whole *session* tearing down?" — not
+"is *this specific renegotiation attempt* still the one the watchdog
+believes is live?"
 
-`lifecycle_test.go`'s `TestNoGoroutineLeakAcrossSessionLifecycle` and
-`reneg_test.go`'s renegotiation tests all exercise a renegotiation that
-*completes* successfully; none of them exercise a stalled/abandoned
-renegotiation, so this gap is untested as well as unmitigated.
+Concretely:
 
-**Fix:** Add a renegotiation-scoped watchdog mirroring
-`enforceHandshakeWindow`, e.g.:
+1. `tlsConn.Handshake()` (`ovpn.go:1118`) and `s.deriveKeyMethod2(...)`
+   (`ovpn.go:1123`) both complete successfully over `newConn` — the client's
+   renegotiation genuinely succeeded, real bytes were exchanged.
+2. Before `runRenegotiation`'s next line reaches `sess.mu.Lock()`
+   (`ovpn.go:1129`), the independent `enforceRenegotiationWindow` goroutine's
+   `time.After(s.handshakeWindow)` fires (this only requires wall-clock time
+   elapsed since the renegotiation began to have reached `s.handshakeWindow`
+   — entirely plausible for a real client whose network conditions make the
+   handshake take close to the full window, and trivially reproducible with
+   a short `handshakeWindow` such as the ones several of this file's own
+   tests already configure, e.g. `1ms`/`30ms`).
+3. The watchdog wins the race for `sess.mu`: `sess.pendingReneg == newConn`
+   is still true at this point (nothing has cleared it yet — the swap
+   hasn't run), so it sets `stillPending = true`, clears
+   `sess.pendingReneg = nil`, unlocks, and — per CR-02's own (correct) logic
+   for *this* scenario — closes `newConn`, because as far as the watchdog
+   can tell this attempt genuinely timed out.
+4. `runRenegotiation` then acquires `sess.mu` (`ovpn.go:1129`). `sess.closing()`
+   is false (the *session* isn't closing — only this one renegotiation
+   attempt was just invalidated by the watchdog). `datachan.NewWrapper(...)`
+   (`ovpn.go:1136`) succeeds — it only depends on already-derived key
+   material and IDs, not on `newConn`'s liveness. The function then
+   unconditionally proceeds through the swap (`ovpn.go:1151-1173`): it
+   demotes the OLD, still-good primary key to lame-duck
+   (`sess.lameDuck = sess.primary`, with a `transitionWindow` expiry), and
+   publishes `sess.primary = keySlot{conn: newConn, ...}` — where `newConn`
+   was closed by the watchdog one step ago. The trailing
+   `if sess.pendingReneg == newConn { sess.pendingReneg = nil }`
+   (`ovpn.go:1176-1178`) is a no-op (already nil from step 3), so nothing
+   here notices anything went wrong.
+
+Result: `sess.primary.conn` now points at a `Conn` whose `closed` field is
+already `true` (`internal/ctrlconn/conn.go:383-388`). Any further
+control-channel traffic routed to this key-id —
+`routeControlPacket`/`pump`'s `Deliver` call (`ovpn.go:667-668`,
+`session.go:626-647`), which matches purely on `keyID` with no liveness
+check — silently fails: `Deliver` → `absorb` → `flushAckOnly` → `transmit`
+goes through `writeChunk`/`waitForSendSlot`, which observes `c.closed` and
+errors out (`internal/ctrlconn/conn.go:307-329`), and any read on that `Conn`
+returns `io.EOF` immediately. Meanwhile the previously-live primary key was
+needlessly demoted to a lame-duck that will itself be torn down after
+`transitionWindow`. The already-derived data-channel key (`newWrapper`) still
+works for actual tunnel traffic (data-channel packets never go through
+`ctrlconn.Conn`), so this is not a total outage, but it silently and
+permanently breaks this session's control channel for the just-negotiated
+key-id — e.g. a lost final ACK that would otherwise be retransmitted is now
+simply dropped forever, and the corruption is invisible to the embedder
+(`OnSession` already fired long ago; nothing surfaces this failure).
+
+This is not a `pendingReneg` double-clear (the compare-and-clear idiom
+correctly prevents that) and it is not the literal CR-02 scenario (the
+watchdog does not close an *already-primary* `Conn` here — it closes
+`newConn` *before* the swap runs). It is the mirror-image gap: the runtime
+sequence never re-validates, immediately before committing state that treats
+`newConn` as live, that the watchdog hasn't already invalidated it in the
+interim. None of the existing regression tests exercise this window —
+`TestEnforceRenegotiationWindowDoesNotCloseSwappedConn` starts from a state
+where the swap has *already* happened; `TestStalledRenegotiationRecoversAfterWindow`
+never lets the handshake succeed at all.
+
+**Fix:** Re-check `sess.pendingReneg == newConn` at the same point
+`sess.closing()` is already checked, and abandon the swap (closing `newConn`,
+exactly as the `closing()` branch already does) if it no longer matches —
+this makes the swap section symmetric with the watchdog's own
+compare-and-clear, so whichever side observes the mismatch first is the one
+that tears `newConn` down, and the other becomes a no-op:
 
 ```go
-// enforceRenegotiationWindow tears the in-flight renegotiation newConn down
-// (mirroring abandon()'s own cleanup) if it hasn't completed within the same
-// handshake-window budget the initial handshake gets.
-func (s *Server) enforceRenegotiationWindow(sess *Session, newConn *ctrlconn.Conn, done <-chan struct{}) {
-	select {
-	case <-done:
-		return
-	case <-time.After(s.handshakeWindow):
-		sess.mu.Lock()
-		if sess.pendingReneg == newConn {
-			sess.pendingReneg = nil
-		}
-		sess.mu.Unlock()
-		_ = newConn.Close() // unblocks the stalled Handshake()/deriveKeyMethod2 call
-	}
+sess.mu.Lock()
+if sess.closing() || sess.pendingReneg != newConn {
+	sess.mu.Unlock()
+	_ = newConn.Close()
+	return
 }
+
+newWrapper, err := datachan.NewWrapper(dataKeys.ServerSlots(), sess.peerID, keyID)
+...
 ```
 
-started alongside `go s.runRenegotiation(sess, newConn, keyID)` at both call
-sites (`session.go:761`, `ovpn.go:1061`), with `runRenegotiation` closing a
-`done` channel on every return path (success, `abandon()`, and the
-`sess.closing()` early-outs) so the watchdog goroutine itself doesn't leak
-once the reneg finishes normally.
+With this change, the final `if sess.pendingReneg == newConn { sess.pendingReneg
+= nil }` at the end of the swap becomes unconditionally true (never a no-op)
+since the lock is held continuously from the new check through the clear, so
+it can simply become an unconditional `sess.pendingReneg = nil` if desired —
+though leaving the guarded form is harmless and keeps the two clear sites
+textually consistent.
 
-## Warnings
-
-### WR-01: `Session.dataKeys` is written under `sess.mu` in `runRenegotiation` but read without any lock in `DebugDataKeys`/`DebugKeyMethod2Material`
-
-**File:** `session.go:436-468` (accessors), `session.go:224-238` (`mu`'s own
-doc comment enumerating guarded fields), `ovpn.go:1128` (the write site)
-
-**Issue:** `runRenegotiation` writes `sess.dataKeys = dataKeys` at
-`ovpn.go:1128`, inside the same `sess.mu`-guarded critical section
-(`ovpn.go:1095-1137`) that publishes `sess.primary`/`sess.lameDuck`/
-`sess.renegotiations`. But `Session.mu`'s own doc comment
-(`session.go:224-238`) enumerates exactly which fields it guards —
-`assignedIP, peerID, primary, lameDuck, pendingReneg, pendingRenegKeyID,
-lastRenegAccepted, and lastAuthTraffic` — and conspicuously omits
-`dataKeys`. Consistent with that omission, `DebugDataKeys()`
-(`session.go:463-468`) and `DebugKeyMethod2Material()` (`session.go:448-453`)
-read `s.dataKeys`/`s.clientKM`/`s.serverKM` with no locking at all.
-
-Every call site in this phase's own test suite happens to be safe only
-because it is preceded by a separate `sess.mu.Lock()/Unlock()` poll (e.g.
-`waitForPrimaryKeyID` in `reneg_test.go:77-92`) that incidentally
-establishes a happens-before edge with the writer's critical section. But
-these are public, documented-as-debug-but-exported accessors
-(`session.go:436-447`'s own doc comment: "so a test harness can
-independently re-run keyderiv.DeriveKeys"), and nothing stops an embedder or
-a harness from calling `DebugDataKeys()` from an unrelated goroutine
-concurrently with a live renegotiation, with no intervening synchronization
-point — which `go test -race` would flag as a genuine data race on
-`s.dataKeys`.
-
-**Fix:** Either guard the read with `sess.mu` (cheapest, and consistent with
-the rest of the type's locking discipline):
-
-```go
-func (s *Session) DebugDataKeys() (keys keyderiv.DataKeys, ok bool) {
-	s.mu.Lock()
-	dataKeys := s.dataKeys
-	s.mu.Unlock()
-	if dataKeys == nil {
-		return keyderiv.DataKeys{}, false
-	}
-	return dataKeys.ServerSlots(), true
-}
-```
-
-and add `dataKeys` to the `mu` doc comment's guarded-field list — or, if
-`dataKeys`/`clientKM`/`serverKM` are meant to stay unguarded (single-writer
-during bootstrap only), stop writing to `sess.dataKeys` under `sess.mu` in
-`runRenegotiation` and instead use a separate, dedicated mechanism (e.g. an
-`atomic.Pointer[keyderiv.Key2]`) so the locking story for this field is
-unambiguous either way.
-
-### WR-02: Packets already queued before `Close()` can still be routed to an already-closed `Conn`
-
-**File:** `ovpn.go:650-667` (`pump`), `session.go:611-632`
-(`routeControlPacket`), `session.go:868-944` (`Close`)
-
-**Issue:** `pump()`'s loop selects on `case cp := <-sess.inbound:` and
-`case <-sess.stopCh:` with no priority between them. Once `Close()` closes
-`stopCh` (`session.go:870`, before it closes any of the session's `Conn`s),
-a packet already sitting in `sess.inbound` can still be selected on the same
-iteration, routed via `routeControlPacket` to a `Conn` that `Close()` is
-about to (or has just) called `.Close()` on, and delivered via
-`target.Deliver(cp)`. `Conn.absorb` (`internal/ctrlconn/conn.go:181-209`)
-does not check `c.closed` before mutating `sendRel`/`recvRel`/`readBuf`, so
-this delivery proceeds against a `Conn` whose retransmit loop has already
-exited. This causes no crash or leak (the mutated `readBuf` is never read by
-anyone once the session is torn down), but it is dead-session state
-mutation that the teardown discipline elsewhere in this file otherwise goes
-out of its way to make impossible (see `Close`'s own extensive WR-05
-commentary on avoiding exactly this class of "state published after
-teardown decided" race for `assignedIP`/`peerID`/`dataSessions`).
-
-**Fix:** Have `pump()` check `sess.closing()` before dispatching a packet it
-happened to win the race on, or restructure the `select` to give `stopCh` an
-explicit fast-path check first:
-
-```go
-case cp := <-sess.inbound:
-    if sess.closing() {
-        continue
-    }
-    if target := sess.routeControlPacket(cp.KeyID); target != nil {
-        ...
-```
+A regression test can reproduce this deterministically without a real
+timing race, mirroring `TestEnforceRenegotiationWindowDoesNotCloseSwappedConn`'s
+own technique: construct `sess` with `pendingReneg` already `nil` (simulating
+"the watchdog got here first") and `primary` still pointing at the *old* key,
+then call `runRenegotiation`'s post-handshake continuation directly (or
+factor the swap into a small helper that can be called with a pre-closed
+`newConn` and asserted to leave `sess.primary` unchanged / `newConn` closed
+rather than promoted).
 
 ## Info
 
-### IN-01: Dead variable `rootCert` in `cmd/gentestpki/main.go`
+### IN-01 (carried forward, unfixed, out of this iteration's file scope): Dead variable `rootCert` in `cmd/gentestpki/main.go`
 
-**File:** `cmd/gentestpki/main.go:122-193`
+**File:** `cmd/gentestpki/main.go:122-193` (declaration `:123`, assignments `:140`/`:160`, discard `:193`)
 
-**Issue:** `rootCert` is declared, assigned in both the `profileSmall` and
-`profileLarge` branches (`rootCert = caCert` at lines 140 and 160), and then
-immediately discarded via `_ = rootCert` at line 193 — it is never read for
-any purpose. This is dead code that adds a variable and a blank-assignment
-line for no behavioral effect.
+**Issue:** Unchanged since iteration 1 — `cmd/gentestpki/main.go` is outside
+this iteration's fix surface (`ovpn.go`, `reneg_test.go` only), so this item
+was not addressed. `rootCert` is still declared, assigned in both the
+`profileSmall` and `profileLarge` branches, and then immediately discarded
+via `_ = rootCert` with no other use.
 
 **Fix:** Remove the `rootCert` variable and its two assignments along with
 the `_ = rootCert` line, since nothing downstream uses it.
@@ -251,3 +213,12 @@ the `_ = rootCert` line, since nothing downstream uses it.
 _Reviewed: 2026-08-28T00:00:00Z_
 _Reviewer: Claude (gsd-code-reviewer)_
 _Depth: standard_
+_Verification: `go build ./...` clean; `go test -race -count=1 .` passes (all
+existing tests, including the CR-01/CR-02/WR-01/WR-02/WR-03 regression tests,
+pass under the race detector). CR-02 and WR-03 were confirmed fixed by direct
+code trace against commits `4f25152` and `296e63e` respectively, and by their
+dedicated regression tests. CR-03 (new) is not caught by the current suite —
+it requires the same class of narrow wall-clock/scheduler timing window
+already acknowledged for CR-02, but one step earlier in `runRenegotiation`'s
+sequence (between `deriveKeyMethod2` succeeding and the swap's
+`sess.mu.Lock()`), which no existing test drives._
