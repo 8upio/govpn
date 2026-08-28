@@ -1,4 +1,4 @@
-.PHONY: test interop golden gates
+.PHONY: test interop golden gates soak
 
 # Fast tier: vet, build, and the race-enabled unit + golden-vector tests
 # (including internal/wire/golden_test.go and
@@ -37,5 +37,22 @@ interop:
 # effect of `test` or `interop` — see test/interop/golden_export.go.
 golden:
 	go test -tags interop -count=1 -timeout 900s ./test/interop/ -run TestInteropScenarios -update-golden -v
+
+# Soak tier (04-04-PLAN.md Task 2): drives ONE long-lived server process
+# through 20 real connect/use/clean-disconnect cycles from a real,
+# unmodified OpenVPN 2.6 client, proving dead sessions do not accumulate —
+# goroutine count and post-GC HeapAlloc both return to their
+# post-first-cycle baseline, and the tunnel-IP pool is served from the
+# same small address range rather than climbing (ROADMAP Phase 4 success
+# criterion 3). Deliberately NOT a dependency of `test` or `interop`: it
+# takes several minutes, far longer than either of those two targets is
+# meant to cost a developer on every run (T-04-19,
+# TestPhase4SoakIsNotInDefaultTargets). TestSoak is its own test function,
+# never folded into TestInteropScenarios' scenario table, and
+# interop_test.go's runFlagOnlyTargets guard keeps this `-run 'TestSoak'`
+# invocation from also paying for that unrelated table's own Docker runs.
+soak:
+	go run ./cmd/gentestpki -out test/interop/pki -profile small
+	go test -tags interop -count=1 -timeout 1800s ./test/interop/ -run 'TestSoak' -v
 
 .DEFAULT_GOAL := test

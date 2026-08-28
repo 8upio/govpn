@@ -31,6 +31,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -428,13 +429,50 @@ func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorder
 // documented single-reader contract).
 const soakPollInterval = 200 * time.Millisecond
 
+// soakSampleSettleDelay is given before EVERY goroutine/heap sample this
+// soak run takes (04-04-PLAN.md Task 2) — both the baseline, taken
+// immediately after cycle 1's session is observed closed, and the final
+// sample, taken after the last configured cycle's session is observed
+// closed. A goroutine that is exiting (its stopCh case has already fired)
+// but has not yet been descheduled by the Go runtime must not be
+// miscounted as still alive: 250ms is comfortably longer than
+// soakPollInterval's own close-detection granularity, giving every
+// per-session goroutine (04-02-SUMMARY.md's own enumerated pump,
+// keepalive, reneg/expiry ticker, reaper, and any lame-duck Conn
+// retransmit loop) time to actually finish unwinding before
+// runtime.NumGoroutine reads the count.
+const soakSampleSettleDelay = 250 * time.Millisecond
+
+// soakSample is one point-in-time reading of runtime.NumGoroutine and
+// runtime.ReadMemStats' HeapAlloc (04-04-PLAN.md Task 2) — the two flatness
+// properties this soak run exists to prove hold across many real
+// connect/use/clean-disconnect cycles.
+type soakSample struct {
+	goroutines int
+	heapAlloc  uint64
+}
+
+// takeSoakSample waits soakSampleSettleDelay, forces two full garbage
+// collections — a single runtime.GC() call is not guaranteed to reclaim in
+// the same pass memory that only becomes unreachable during that
+// collection's OWN finalization, so a second call accounts for exactly
+// that case — then reads runtime.NumGoroutine() and
+// runtime.ReadMemStats().HeapAlloc.
+func takeSoakSample() soakSample {
+	time.Sleep(soakSampleSettleDelay)
+	runtime.GC()
+	runtime.GC()
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return soakSample{goroutines: runtime.NumGoroutine(), heapAlloc: m.HeapAlloc}
+}
+
 // soakTracker counts cycles opened/closed during a soak run and records
 // each cycle's assigned tunnel IP in close order, so runSoak's PASS line
-// can report soak_cycles_observed= (this task) and, from 04-04-PLAN.md
-// Task 2 onward, feed the pool-reuse assertion something to parse. A
-// session's close is detected by polling its own sessionCloseObserver
-// (04-03-PLAN.md Task 3's own precedent), never by adding a second reader
-// of the *ovpn.Session.
+// can report soak_cycles_observed= and feed the pool-reuse assertion
+// something to parse (04-04-PLAN.md Task 2). A session's close is detected
+// by polling its own sessionCloseObserver (04-03-PLAN.md Task 3's own
+// precedent), never by adding a second reader of the *ovpn.Session.
 type soakTracker struct {
 	cycles int
 
@@ -443,13 +481,21 @@ type soakTracker struct {
 	closes int
 	ips    []string
 
-	// allClosed closes exactly once, when the configured cycle count has
-	// been observed opened AND subsequently closed.
-	allClosed chan struct{}
+	// firstClosed and allClosed each close exactly once: firstClosed the
+	// moment the FIRST cycle's session is observed closed — the baseline-
+	// sampling trigger (04-04-PLAN.md Task 2). Baseline is deliberately
+	// never sampled at process start: a cold-start baseline would hide the
+	// first session's own lazily-initialized runtime state (listeners,
+	// buffers, pools) and make ordinary warm-up look like a leak.
+	// allClosed closes once every configured cycle has been observed
+	// closed — this soak's own survival condition, in place of run()'s
+	// probe-driven waitForProbes.
+	firstClosed chan struct{}
+	allClosed   chan struct{}
 }
 
 func newSoakTracker(cycles int) *soakTracker {
-	return &soakTracker{cycles: cycles, allClosed: make(chan struct{})}
+	return &soakTracker{cycles: cycles, firstClosed: make(chan struct{}), allClosed: make(chan struct{})}
 }
 
 // opened records a newly-established session and returns its 1-based
@@ -488,8 +534,10 @@ func (s *soakTracker) ipHistory() []string {
 // cycle has been observed closed, closing allClosed exactly once (a second
 // close of an already-closed channel would panic, so this path only runs
 // once per soak run by construction: s.closes only ever increments here,
-// under s.mu, and the done check happens in the same critical section as
-// the increment that could make it true).
+// under s.mu, and the done/isFirst checks happen in the same critical
+// section as the increment that could make either true). firstClosed is
+// likewise closed exactly once, the moment the very first cycle's session
+// is observed closed.
 func (s *soakTracker) watchClose(cycleNum int, obs *sessionCloseObserver) {
 	ticker := time.NewTicker(soakPollInterval)
 	defer ticker.Stop()
@@ -500,11 +548,15 @@ func (s *soakTracker) watchClose(cycleNum int, obs *sessionCloseObserver) {
 			s.mu.Lock()
 			s.closes++
 			s.ips = append(s.ips, ip)
+			isFirst := s.closes == 1
 			done := s.closes == s.cycles
 			s.mu.Unlock()
 
 			log.Printf("soak cycle %d/%d: session closed (Read observed io.EOF) assigned_ip=%s", cycleNum, s.cycles, ip)
 
+			if isFirst {
+				close(s.firstClosed)
+			}
 			if done {
 				close(s.allClosed)
 			}
@@ -578,6 +630,20 @@ func runSoak(pkiDir, listenAddr string, deadline time.Duration, httpPort, udpPor
 
 	tracker := newSoakTracker(cycles)
 
+	// baseline is sampled AFTER cycle 1's session is observed closed
+	// (04-04-PLAN.md Task 2), asynchronously so it doesn't block cycle 2
+	// from starting — the client's own cycle loop paces cycles far apart
+	// enough (a full openvpn client restart) that this sample completes
+	// long before it would otherwise matter.
+	var baseline soakSample
+	baselineReady := make(chan struct{})
+	go func() {
+		<-tracker.firstClosed
+		baseline = takeSoakSample()
+		log.Printf("soak baseline sampled after cycle 1: soak_goroutines_baseline=%d soak_heap_baseline=%d", baseline.goroutines, baseline.heapAlloc)
+		close(baselineReady)
+	}()
+
 	srv := ovpn.NewServer(ovpn.Config{
 		TLSConfig:   tlsCfg,
 		TLSCryptKey: tlsCryptKey,
@@ -620,10 +686,20 @@ func runSoak(pkiDir, listenAddr string, deadline time.Duration, httpPort, udpPor
 		)
 	}
 
+	// baselineReady is guaranteed already closed by this point: cycle 1
+	// always closes strictly before the last configured cycle does (the
+	// client's own cycle loop runs one connect/disconnect at a time, never
+	// concurrently), so tracker.allClosed firing implies tracker.firstClosed
+	// fired first. The receive below is therefore non-blocking in practice;
+	// it exists for correctness (happens-before on baseline), not to wait.
+	<-baselineReady
+	final := takeSoakSample()
+	log.Printf("soak final sample: soak_goroutines_final=%d soak_heap_final=%d", final.goroutines, final.heapAlloc)
+
 	ips := tracker.ipHistory()
 	log.Printf(
-		"PASS: soak completed soak_cycles_observed=%d soak_ips=%s http_requests=%d udp_rx=%d udp_tx=%d",
-		tracker.closedCount(), strings.Join(ips, ","), httpRequests.Load(), udpRx.Load(), udpTx.Load(),
+		"PASS: soak completed soak_cycles_observed=%d soak_goroutines_baseline=%d soak_goroutines_final=%d soak_heap_baseline=%d soak_heap_final=%d soak_ips=%s http_requests=%d udp_rx=%d udp_tx=%d",
+		tracker.closedCount(), baseline.goroutines, final.goroutines, baseline.heapAlloc, final.heapAlloc, strings.Join(ips, ","), httpRequests.Load(), udpRx.Load(), udpTx.Load(),
 	)
 
 	_ = srv.Close()
