@@ -142,17 +142,26 @@ const (
 	// = 3600).
 	defaultRenegSec = 3600 * time.Second
 
-	// renegMinInterval is the minimum time between two ACCEPTED
-	// renegotiations on the same session (T-04-01): a small fraction of
-	// the reference's own reneg-sec default (defaultRenegSec/60 = 60s),
-	// chosen so it never interferes with a legitimate reneg-sec-driven
-	// rollover but still bounds how often a peer can force a full new TLS
-	// handshake. tls-crypt's own replay window (Phase 1) is the primary
-	// defense against a byte-identical REPLAYED SOFT_RESET_V1 packet — it
-	// never reaches this check twice with the same bytes. This interval is
-	// defense in depth against a legitimate but abusive peer sending
-	// distinct, validly-signed SOFT_RESET_V1 requests in rapid succession.
-	renegMinInterval = defaultRenegSec / 60
+	// renegMinIntervalDivisor computes Server.renegMinInterval as a
+	// fraction (1/60th) of s.renegSec — the ACTIVE reneg-sec value
+	// (Config.RenegSec, possibly shortened by a test harness, D-19), not a
+	// fixed floor derived from the reference's own 3600s default. This is
+	// a bug fix (04-03-PLAN.md Task 2, Rule 1): the original 04-01 design
+	// fixed this at defaultRenegSec/60 = 60s regardless of the configured
+	// RenegSec, which silently refused EVERY renegotiation after the first
+	// whenever a harness configured a reneg-sec shorter than 60s (exactly
+	// what D-23's own "~20s on both sides" interop scenario needs to
+	// observe multiple rollovers) — discovered running this plan's own
+	// "reneg" scenario, which reported renegotiations=1 no matter how many
+	// times the real client's own 15-second reneg-sec timer re-fired.
+	// Scaling by the same 1/60 ratio to whatever reneg-sec IS configured
+	// preserves the original design intent (defense in depth against a
+	// legitimate but abusive peer forcing rapid, distinct, validly-signed
+	// SOFT_RESET_V1 requests — tls-crypt's own replay window, Phase 1,
+	// remains the PRIMARY defense against a byte-identical REPLAYED
+	// packet) while no longer conflicting with a deliberately shortened
+	// reneg-sec.
+	renegMinIntervalDivisor = 60
 
 	// renegPollInterval is how often each session's reneg-sec timer
 	// (Session.startReneg/runReneg) checks whether it's due — a
@@ -262,6 +271,15 @@ type Server struct {
 	// already-defaulted value rather than re-resolving it per session.
 	renegSec time.Duration
 
+	// renegMinInterval is resolved once in Serve, alongside renegSec, as
+	// renegSec/renegMinIntervalDivisor (04-03-PLAN.md Task 2 bug fix — see
+	// renegMinIntervalDivisor's own doc comment). A hand-built *Server in a
+	// test bypasses this resolution and must set it explicitly if the test
+	// exercises rate-limiting behavior, mirroring handshakeWindow/
+	// reapWindow's own established explicit-set-required precedent for
+	// hand-built Servers.
+	renegMinInterval time.Duration
+
 	// clock is a test-only override for every new Session's own clock
 	// field (Session.now, the reneg-sec timer, lame-duck mustDie, and the
 	// reneg-flood rate limit). nil in production, meaning
@@ -320,6 +338,7 @@ func (s *Server) Serve(pc net.PacketConn) error {
 	if s.renegSec == 0 {
 		s.renegSec = defaultRenegSec
 	}
+	s.renegMinInterval = s.renegSec / renegMinIntervalDivisor
 	// Config.Network is intentionally not required here: a Server built
 	// without it can still complete Phase 1's TLS handshake (existing
 	// tests exercise exactly that). It is only needed once a session
@@ -540,7 +559,35 @@ func (s *Server) handleDatagram(pc net.PacketConn, addr net.Addr, packet []byte)
 	// it must be intercepted here, before pump ever sees it, because
 	// beginRenegotiation may need to publish a brand-new Conn for the new
 	// key-id before pump can route to it (04-01-PLAN.md Task 1 action 6).
+	//
+	// BUT first check whether a renegotiation to this EXACT key-id is
+	// already in flight (sess.routeControlPacket's existing pendingReneg
+	// match) — if so, this is a RETRANSMISSION racing the OTHER side's own
+	// independent initiation, not a fresh request (04-03-PLAN.md Task 2 bug
+	// fix, discovered running this plan's own "reneg" scenario for real):
+	// both sides run independent, symmetric reneg-sec timers (D-17), and
+	// with a short reneg-sec they can fire within the same poll tick of
+	// each other. When the SERVER's own checkReneg fires first (a bare,
+	// payload-less SendReset) and the REAL CLIENT independently, at nearly
+	// the same moment, sends ITS OWN SOFT_RESET_V1 carrying its actual
+	// ClientHello, beginRenegotiation's own startRenegotiation call would
+	// refuse it outright (sess.pendingReneg != nil, the in-flight-wins
+	// guard, T-04-01) and silently drop the packet FOREVER — the
+	// ClientHello inside it is never delivered anywhere, so the pending
+	// Conn's tls.Server(...).Handshake() blocks forever waiting to read
+	// one, and the client's own reliability layer just keeps retransmitting
+	// the same now-permanently-dropped packet. Delivering it to the
+	// ALREADY-pending Conn instead — exactly what routeControlPacket
+	// already does for every OTHER kind of post-handshake control packet —
+	// closes that gap: whichever side's SOFT_RESET_V1 arrives SECOND is
+	// simply the other side's own ClientHello arriving at the Conn that is
+	// already waiting for it.
 	if opcode == wire.OpControlSoftResetV1 {
+		if target := sess.routeControlPacket(cp.KeyID); target != nil {
+			target.Deliver(cp)
+			sess.touchAuthTraffic()
+			return
+		}
 		s.beginRenegotiation(sess, cp, addr, pc)
 		return
 	}
@@ -964,7 +1011,7 @@ func (s *Server) startRenegotiation(sess *Session, pc net.PacketConn, addr net.A
 		// SOFT_RESET_V1 is a no-op.
 		return nil, 0, false
 	}
-	if !sess.lastRenegAccepted.IsZero() && sess.now().Sub(sess.lastRenegAccepted) < renegMinInterval {
+	if !sess.lastRenegAccepted.IsZero() && sess.now().Sub(sess.lastRenegAccepted) < s.renegMinInterval {
 		// T-04-01: reneg-flood rate limit. This is defense in depth on top
 		// of tls-crypt's own replay window (Phase 1), which already
 		// rejects a byte-identical REPLAYED SOFT_RESET_V1 before it ever

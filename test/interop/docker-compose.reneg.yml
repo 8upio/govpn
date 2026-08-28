@@ -22,6 +22,22 @@
 # comfortably fits this file's own -hold/deadline budget and
 # interop_test.go's contextTimeout ceiling without needing an unusually long
 # scenario run.
+#
+# ROUND_COUNT/ROUND_INTERVAL (04-03-PLAN.md Task 2) drive the client's own
+# entrypoint.sh into 5 rounds of http_landing/udp_echo probes, 8 seconds
+# apart — a ~32-second probe span that, on top of the pre-existing ~10-second
+# ping sequence that always runs first, comfortably spans more than two
+# 15-second reneg-sec intervals (D-23's own "at least two rollovers"
+# requirement) without depending on exact per-probe timing. -hold is raised
+# from Task 1's 30s to 60s so the server survives this longer round span
+# (plus the remaining http_status/http_echo/http_headers/outside_tunnel
+# probes after it) before its probe-driven trigger's settle delay would
+# otherwise let it exit.
 services:
+  client:
+    environment:
+      - ROUND_COUNT=5
+      - ROUND_INTERVAL=8
+
   server:
-    command: ["-pki", "/pki", "-listen", "0.0.0.0:1194", "-deadline", "60s", "-reneg-sec", "15s", "-hold", "30s"]
+    command: ["-pki", "/pki", "-listen", "0.0.0.0:1194", "-deadline", "60s", "-reneg-sec", "15s", "-hold", "60s"]

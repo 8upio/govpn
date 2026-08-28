@@ -67,6 +67,15 @@ type scenario struct {
 	// soft-reset rollovers (assertRenegotiation below). 0 (every
 	// pre-existing scenario) skips the assertion entirely.
 	minRenegotiations int
+
+	// probeRounds (04-03-PLAN.md Task 2), when greater than 1, drives
+	// entrypoint.sh's ROUND_COUNT env var and switches this scenario's
+	// assertions from the single-round assertHTTPPageLoad/assertUDPRoundTrip
+	// pair to assertMultiRoundProbes (round-suffixed probe names) plus
+	// assertNoReconnect (T-04-11: a rollover satisfied by a reconnect is a
+	// failure, not a pass). 0 or 1 (every pre-existing scenario) keeps the
+	// original single-round assertions unchanged.
+	probeRounds int
 }
 
 // scenarios covers, at minimum, the clean-small/clean-large/lossy-large
@@ -96,10 +105,11 @@ var scenarios = []scenario{
 		profile:           "small",
 		lossy:             false,
 		largeCert:         false,
-		contextTimeout:    3 * time.Minute,
+		contextTimeout:    4 * time.Minute,
 		composeOverlay:    "docker-compose.reneg.yml",
 		clientDirectives:  []string{"reneg-sec 15"},
-		minRenegotiations: 1,
+		minRenegotiations: 2,
+		probeRounds:       5,
 	},
 }
 
@@ -363,15 +373,28 @@ func TestInteropScenarios(t *testing.T) {
 			// lossy one — the netstack's fixed-RTO retransmission is
 			// precisely what should carry a page load across a 5-10%
 			// loss link.
-			assertHTTPPageLoad(t, res)
-
+			//
 			// 03-06-PLAN.md Task 2 (NET-01, VRFY-02): a UDP round trip
 			// and the three remaining HTTP subpages, both parameterized
 			// by the same !sc.lossy strictness convention
 			// assertPingRoundTrip already established — see each
 			// function's own doc comment for exactly what is tolerated
 			// on the lossy scenario and why.
-			assertUDPRoundTrip(t, res, !sc.lossy)
+			//
+			// 04-03-PLAN.md Task 2 (T-04-11): a scenario with probeRounds > 1
+			// (only "reneg") replaces this single-round
+			// assertHTTPPageLoad/assertUDPRoundTrip pair's probe-name
+			// checks — entrypoint.sh's round loop no longer emits the
+			// unsuffixed "http_landing"/"udp_echo" probes once
+			// ROUND_COUNT > 1 — with assertMultiRoundProbes' round-suffixed
+			// equivalent, plus assertNoReconnect's zero-reconnect proof.
+			if sc.probeRounds > 1 {
+				assertMultiRoundProbes(t, res, sc.probeRounds)
+				assertNoReconnect(t, res)
+			} else {
+				assertHTTPPageLoad(t, res)
+				assertUDPRoundTrip(t, res, !sc.lossy)
+			}
 			assertHTTPSubpages(t, res, !sc.lossy)
 
 			// 03-06-PLAN.md Task 3 (ROADMAP Phase 3 success criterion 3):
@@ -799,6 +822,90 @@ func assertHTTPSubpages(t *testing.T, res scenarioResult, strict bool) {
 	assertProbe(t, res, "http_status", strict)
 	assertProbe(t, res, "http_echo", strict)
 	assertProbe(t, res, "http_headers", strict)
+}
+
+// assertMultiRoundProbes is assertHTTPPageLoad/assertUDPRoundTrip's
+// multi-round analog (04-03-PLAN.md Task 2, for scenario.probeRounds > 1):
+// every round's http_landing_rN/udp_echo_rN probe must report result=ok —
+// strict, since the reneg scenario carries no loss injection, unlike
+// lossy-large — and the server's own http_requests=/udp_rx=/udp_tx=
+// PASS-line counters must each be greater than zero, exactly like the
+// single-round assertions this replaces for a multi-round scenario.
+func assertMultiRoundProbes(t *testing.T, res scenarioResult, rounds int) {
+	t.Helper()
+
+	if res.composeErr != nil {
+		return
+	}
+
+	for i := 1; i <= rounds; i++ {
+		assertProbe(t, res, fmt.Sprintf("http_landing_r%d", i), true)
+		assertProbe(t, res, fmt.Sprintf("udp_echo_r%d", i), true)
+	}
+
+	if m := httpRequestsRe.FindStringSubmatch(res.composeOut); m == nil {
+		t.Fatal("server output does not contain a parsable http_requests= field — see log above")
+	} else if n, err := strconv.Atoi(m[1]); err != nil {
+		t.Fatalf("parse http_requests=%q: %v", m[1], err)
+	} else if n == 0 {
+		t.Fatal("server output reports http_requests=0, want greater than zero — see log above")
+	} else {
+		t.Logf("server observed http_requests=%d across %d rounds", n, rounds)
+	}
+
+	m := udpRxTxRe.FindStringSubmatch(res.composeOut)
+	if m == nil {
+		t.Fatal("server output does not contain a parsable udp_rx=/udp_tx= field — see log above")
+	}
+	udpRx, err := strconv.Atoi(m[1])
+	if err != nil {
+		t.Fatalf("parse udp_rx=%q: %v", m[1], err)
+	}
+	udpTx, err := strconv.Atoi(m[2])
+	if err != nil {
+		t.Fatalf("parse udp_tx=%q: %v", m[2], err)
+	}
+	if udpRx == 0 || udpTx == 0 {
+		t.Fatalf("server output reports udp_rx=%d udp_tx=%d, want both greater than zero — see log above", udpRx, udpTx)
+	}
+	t.Logf("server observed udp_rx=%d udp_tx=%d across %d rounds", udpRx, udpTx, rounds)
+}
+
+// clientSoftResetLogLine is the real Debian-packaged OpenVPN 2.6.3-based
+// client's own renegotiation diagnostic line, captured VERBATIM from this
+// project's own Task 1 interop run against the "reneg" scenario (not
+// guessed): "TLS: soft reset sec=15/15 bytes=11024/-1 pkts=72/0" (ssl.c's
+// own key_state_soft_reset()/tls_process() diagnostic, printed once per
+// side that INITIATES a rollover — client or server). Only the fixed
+// prefix is asserted on; the sec=/bytes=/pkts= fields vary run to run.
+const clientSoftResetLogPrefix = "TLS: soft reset sec="
+
+// assertNoReconnect is 04-03-PLAN.md Task 2's zero-reconnect proof
+// (T-04-11 in this plan's own threat register): the renegotiation scenario
+// must not be satisfiable by a reconnect. It asserts BOTH that the client's
+// own log shows at least one renegotiation (clientSoftResetLogPrefix above)
+// AND that the client's log contains EXACTLY ONE occurrence of
+// "Initialization Sequence Completed" (initSequenceCompletedRe, the same
+// literal assertTunnelUp already asserts is present at least once) — a
+// SECOND occurrence would mean the tunnel was torn down and rebuilt rather
+// than rekeyed in place, which is a failure, not a pass, no matter how many
+// rollovers the server's own PASS line reports.
+func assertNoReconnect(t *testing.T, res scenarioResult) {
+	t.Helper()
+
+	if res.composeErr != nil {
+		return
+	}
+
+	if !strings.Contains(res.composeOut, clientSoftResetLogPrefix) {
+		t.Fatalf("client output does not contain %q — the client's own log shows no evidence of a renegotiation — see log above", clientSoftResetLogPrefix)
+	}
+
+	n := len(initSequenceCompletedRe.FindAllStringIndex(res.composeOut, -1))
+	if n != 1 {
+		t.Fatalf("client output contains %d occurrences of \"Initialization Sequence Completed\", want exactly 1 — more than one means the tunnel was torn down and rebuilt (a reconnect), not rekeyed in place (T-04-11) — see log above", n)
+	}
+	t.Log("client log shows renegotiation evidence and exactly one completed initialization sequence — every rollover rekeyed in place, none reconnected")
 }
 
 // assertUnreachableOutsideTunnel is 03-06-PLAN.md Task 3's negative proof

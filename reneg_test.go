@@ -581,9 +581,16 @@ func newRenegTestFixture(t testing.TB) *renegTestFixture {
 		// A large renegSec keeps checkReneg's own server-initiated-timer
 		// trigger (Task 2) from firing spuriously in these Task 3 tests,
 		// which target the receive-side rejection/expiry mechanisms only.
-		renegSec:     time.Hour,
-		sessions:     make(map[sessionKey]*Session),
-		dataSessions: make(map[uint32]*Session),
+		renegSec: time.Hour,
+		// renegMinInterval is normally resolved in Serve as
+		// renegSec/renegMinIntervalDivisor (04-03-PLAN.md Task 2 bug fix);
+		// this hand-built Server bypasses that resolution and must set it
+		// explicitly — mirroring handshakeWindow/reapWindow's own
+		// established precedent — to preserve TestRenegFloodRateLimited's
+		// exact original 60s rate-limit window.
+		renegMinInterval: time.Hour / renegMinIntervalDivisor,
+		sessions:         make(map[sessionKey]*Session),
+		dataSessions:     make(map[uint32]*Session),
 	}
 
 	return &renegTestFixture{
