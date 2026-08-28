@@ -137,7 +137,24 @@ Plans:
   2. A client sending explicit-exit-notify ends its session immediately, and the embedder observes the `Session` closing rather than waiting for a timeout
   3. Silent sessions time out and are reaped, and `Session.Close()` tears down all state — a soak run over many connect/disconnect cycles shows goroutine and memory counts flat
 
-**Plans**: TBD
+**Plans**: 4 plans
+
+Plans:
+**Wave 1**
+
+- [ ] 04-01-PLAN.md — Tracer: soft-reset renegotiation — two-slot key state (primary/lame-duck), key-id increment rule, new TLS+KM2 under the new key-id with no PUSH re-exchange, server-side `Config.RenegSec` timer, key-id hard-error validation (SESS-04)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [ ] 04-02-PLAN.md — Exit-notify (data-channel OCC_EXIT, post-decrypt only), idle-session reaping on an injectable clock, `io.EOF` from Read/Write after every teardown cause, no per-session goroutine leaks (SESS-05)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [ ] 04-03-PLAN.md — Interop: a real OpenVPN 2.6 client renegotiates twice with HTTP+UDP flowing across the rollovers and zero reconnects, then leaves via explicit-exit-notify with the close observed immediately (SESS-04, SESS-05)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
+- [ ] 04-04-PLAN.md — Soak: 20 real connect/disconnect cycles against one server process, goroutine count and post-GC HeapAlloc flat against a post-first-cycle baseline, on its own `make soak` target (SESS-05)
 
 ## Progress
 
@@ -149,7 +166,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 | 1. Handshake | 4/4 | Complete    | 2026-08-24 |
 | 2. Tunnel Up | 4/4 | Complete    | 2026-08-25 |
 | 3. In-Process Termination | 6/6 | Complete    | 2026-08-27 |
-| 4. Durable Sessions | 0/TBD | Not started | - |
+| 4. Durable Sessions | 0/4 | Planned | - |
 
 ## Requirement Coverage
 
