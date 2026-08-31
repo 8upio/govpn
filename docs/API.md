@@ -1,0 +1,303 @@
+<!-- generated-by: gsd-doc-writer -->
+[← Back to README](../README.md)
+
+# API Reference
+
+This is the library usage reference for `govpn` (module `github.com/8upio/govpn`,
+package `ovpn`): how to construct a `Server`, start it, and work with the
+`Session` your program receives for each connected OpenVPN client. Every
+signature below is taken directly from `ovpn.go` and `session.go` — nothing
+here is invented.
+
+For field-by-field configuration details see [CONFIGURATION.md](CONFIGURATION.md).
+For how these pieces fit into the rest of the library (control channel,
+data channel, netstack) see [ARCHITECTURE.md](ARCHITECTURE.md) and
+[NETSTACK.md](NETSTACK.md). For a first-run walkthrough see
+[GETTING-STARTED.md](GETTING-STARTED.md) and the runnable
+[`examples/tunnelweb`](../examples/tunnelweb/README.md) example, which this
+page's snippets are drawn from.
+
+## Overview
+
+Embedding `govpn` is three steps:
+
+1. Build an `ovpn.Config` — a `*tls.Config` for mutual certificate auth, a
+   `tls-crypt` static key, the tunnel IP range, and an `OnSession` callback.
+2. Pass it to `ovpn.NewServer` and call `Server.Serve` with a `net.PacketConn`.
+3. For each client that completes the full OpenVPN bring-up sequence,
+   `OnSession` is invoked with a `*ovpn.Session` — an `io.ReadWriteCloser` of
+   that client's raw, decrypted IP packets.
+
+```go
+srv := ovpn.NewServer(ovpn.Config{
+    TLSConfig:   tlsCfg,        // mutual cert auth: ClientCAs, Certificates, MinVersion
+    TLSCryptKey: tlsCryptKey,   // from ovpn.ParseStaticKeyV1
+    Network:     tunnelNetwork, // *net.IPNet, e.g. 10.8.0.0/24 (topology subnet)
+    Cipher:      "AES-256-GCM",
+    OnSession: func(sess *ovpn.Session) {
+        // sess is an io.ReadWriteCloser of raw, decrypted IP packets.
+        // sess.AssignedIP() is already populated here.
+    },
+})
+
+pc, err := net.ListenPacket("udp", "0.0.0.0:1194")
+if err != nil {
+    log.Fatal(err)
+}
+if err := srv.Serve(pc); err != nil {
+    log.Fatal(err)
+}
+```
+
+## `ovpn.Config`
+
+```go
+type Config struct {
+    TLSConfig      *tls.Config
+    TLSCryptKey    []byte
+    Network        *net.IPNet
+    Cipher         string
+    OnSession      func(*Session)
+    OnSessionPanic func(sess *Session, recovered any, stack []byte)
+    RenegSec       time.Duration
+}
+```
+
+Passed by value to `NewServer`. See [CONFIGURATION.md](CONFIGURATION.md) for
+what each field controls, which are required, and their defaults. The two
+fields most relevant to the API surface on this page:
+
+- **`OnSession func(*Session)`** — invoked exactly once per client, after Key
+  Method 2 and the `PUSH_REQUEST`/`PUSH_REPLY` exchange have both completed
+  and the data-channel keys and assigned tunnel IP are live — not merely
+  after the TLS handshake returns. The `*Session` handed to `OnSession` is
+  therefore immediately usable: `Session.AssignedIP()` is already populated
+  and `Session.PeerCN` is the verified client CommonName.
+- **`OnSessionPanic func(sess *Session, recovered any, stack []byte)`** — if
+  set, called when `OnSession` panics, instead of letting the panic crash
+  the embedding process. It receives the `Session`, the recovered panic
+  value, and a captured stack trace (`runtime/debug.Stack()`).
+
+## `ovpn.ParseStaticKeyV1`
+
+```go
+func ParseStaticKeyV1(data []byte) ([]byte, error)
+```
+
+Parses an OpenVPN "Static key V1" PEM-style envelope into its 256 raw bytes,
+suitable for `Config.TLSCryptKey`:
+
+```go
+tlsCryptPEM, err := os.ReadFile(pkiDir + "/tls-crypt.key")
+if err != nil {
+    return err
+}
+tlsCryptKey, err := ovpn.ParseStaticKeyV1(tlsCryptPEM)
+if err != nil {
+    return err
+}
+```
+
+## `ovpn.NewServer` and `*Server`
+
+```go
+func NewServer(cfg Config) *Server
+```
+
+Builds a `Server` from `cfg`. It does not start listening — call `Serve` to
+begin reading from a `net.PacketConn`. `Server`'s fields are all unexported;
+it is used entirely through the three methods below.
+
+### `Server.Serve`
+
+```go
+func (s *Server) Serve(pc net.PacketConn) error
+```
+
+Runs the server's UDP read loop over `pc` until `pc` is closed or `Close` is
+called. It returns an error immediately (before entering the read loop) if
+`cfg.TLSCryptKey` is malformed or `cfg.TLSConfig` is nil. `cfg.Network` is
+not required to start `Serve` — a server without it can still complete a
+client's TLS handshake, but that client's session fails once it reaches the
+`PUSH_REQUEST`/`PUSH_REPLY` exchange and never reaches `OnSession`.
+
+Each accepted datagram is handled on its own goroutine, so datagrams
+belonging to distinct client sessions are processed concurrently and
+`Serve` itself never blocks on a single client. `Serve` blocks the calling
+goroutine until the underlying `net.PacketConn` is closed (by `Close` or
+externally), returning `nil` in that case, or a non-nil error for any other
+read failure.
+
+### `Server.Close`
+
+```go
+func (s *Server) Close() error
+```
+
+Unblocks `Serve`'s read loop by closing the underlying `net.PacketConn`
+(making `Serve` return `nil`), and closes every in-flight session's control
+channel so their handshake goroutines and retransmit loops don't leak past
+server shutdown.
+
+```go
+srv := ovpn.NewServer(cfg)
+done := make(chan error, 1)
+go func() { done <- srv.Serve(pc) }()
+
+// ... later, e.g. on SIGTERM ...
+_ = srv.Close()
+```
+
+## `Session`
+
+`Session` represents an established, TLS-authenticated client connection —
+the value `Config.OnSession` is invoked with, exactly once per client. It is
+a full `io.ReadWriteCloser` for that client's raw, decrypted IP packets:
+
+```go
+var _ io.ReadWriteCloser = (*Session)(nil)
+```
+
+### Exported fields
+
+```go
+type Session struct {
+    SessionID  [8]byte  // server-assigned control-channel session ID
+    RemoteAddr net.Addr // the client's UDP address
+    PeerCN     string   // verified client CommonName from the peer certificate
+    // ... unexported fields
+}
+```
+
+`PeerCN` is read from `tls.Conn.ConnectionState().PeerCertificates[0].Subject.CommonName`
+only after the handshake succeeds — never from any client-supplied value
+outside the CA-verified certificate chain.
+
+### Read/Write semantics
+
+```go
+func (s *Session) Read(p []byte) (int, error)
+func (s *Session) Write(p []byte) (int, error)
+```
+
+`Read` and `Write` are **datagram-shaped**, not stream-shaped: one full,
+raw, decrypted IP packet per call. If `p` is too small to hold the next
+packet, `Read` returns a descriptive error and *retains* the packet — it is
+neither truncated nor discarded, and a subsequent `Read` with a large
+enough buffer still receives it in full. `Read` blocks until a packet
+arrives or the session closes, in which case it returns `io.EOF`.
+
+`Write` encrypts `p` as one data-channel packet and sends it to the
+client's UDP address, returning `len(p)` on success. After the session has
+been torn down, `Write` returns `io.EOF`. If called before the data channel
+is established (which should not happen for a `Session` obtained via
+`OnSession`, since that only fires after the data channel is live), `Write`
+returns a plain error.
+
+A 16-byte ping keepalive received from the client is absorbed entirely
+inside the decrypt path and never reaches `Read`'s caller.
+
+### Concurrency
+
+A single `Session`'s `Read`/`Write`/`Close` may each be called concurrently
+with one another (mirroring the usual `io.ReadWriteCloser` convention), but
+**concurrent calls to `Read` on the same `Session` are not supported** — the
+doc comment notes `Read` assumes the single-reader-goroutine convention
+ordinary `io.Reader` implementations rely on (the same contract
+`bufio.Reader` has). All exported accessor methods below (`AssignedIP`,
+`PeerID`, `PushRequestSeen`, `RenegotiationCount`, `ConnectionState`,
+`DebugDataKeys`, `DebugKeyMethod2Material`) are safe to call from any
+goroutine at any time.
+
+### Lifecycle and `Close`
+
+```go
+func (s *Session) Close() error
+```
+
+A `Session` ends in exactly one of three ways, all flowing through the same
+idempotent `Close`, after which both `Read` and `Write` return `io.EOF`:
+
+1. The embedder calls `Close` directly.
+2. The client sends an explicit-exit-notify on the authenticated data
+   channel (the client disconnected cleanly).
+3. The server's own idle-session reaper closes a session that has gone
+   silent (no authenticated traffic, control or data) for the reap window.
+
+In every case, `Close` tears down the session's control channel and
+releases its assigned tunnel IP and peer-id back to the server's pool for
+immediate reuse. `Close` is safe to call more than once and safe to call
+concurrently.
+
+### Other accessors
+
+```go
+func (s *Session) AssignedIP() net.IP
+func (s *Session) PeerID() uint32
+func (s *Session) PushRequestSeen() bool
+func (s *Session) RenegotiationCount() uint32
+func (s *Session) ConnectionState() tls.ConnectionState
+```
+
+- **`AssignedIP`** — this session's tunnel address, allocated from
+  `Config.Network` and pushed to the client in `PUSH_REPLY`. Always
+  populated by the time `OnSession` is invoked. Returns a defensive copy.
+- **`PeerID`** — this session's 24-bit peer-id, pushed to the client as
+  `peer-id <n>`. 0 both before assignment and for the (valid, distinct)
+  allocated peer-id 0 itself; use `AssignedIP() != nil` to check whether
+  assignment has happened.
+- **`PushRequestSeen`** — whether the client's `PUSH_REQUEST` has been
+  answered with a `PUSH_REPLY`. `AssignedIP()` is populated at the same
+  point and is generally the preferred check.
+- **`RenegotiationCount`** — how many soft-reset key rollovers (TLS
+  renegotiations) this session has completed. Diagnostic; not needed by a
+  typical embedder.
+- **`ConnectionState`** — the underlying `tls.Conn.ConnectionState()`
+  (negotiated version, cipher suite, peer certificate chain), captured once
+  immediately after the handshake completes. Calling it before `OnSession`
+  has fired for this session returns the zero value.
+
+Two additional methods, `DebugKeyMethod2Material` and `DebugDataKeys`,
+expose raw key-derivation material for test/interop harnesses that need to
+independently reproduce this session's data-channel keys. They are
+debug/test-only accessors — a production embedder has no reason to call
+them.
+
+## Errors
+
+`ovpn.ErrPoolExhausted` (`errors.New("ovpn: tunnel IP pool exhausted")`) is
+returned, wrapped, when `Config.Network` has no free host addresses left to
+assign to a newly connecting client. Check for it with `errors.Is` if your
+embedder needs to distinguish pool exhaustion from other session-setup
+failures.
+
+## Full example
+
+The complete, runnable version of the pattern above — including PKI
+loading, graceful shutdown, and attaching each `Session` to the userspace
+netstack to serve HTTP through the tunnel — is
+[`examples/tunnelweb/main.go`](../examples/tunnelweb/main.go):
+
+```go
+srv := ovpn.NewServer(ovpn.Config{
+    TLSConfig:   tlsCfg,
+    TLSCryptKey: tlsCryptKey,
+    Network:     tunnelNetwork,
+    Cipher:      "AES-256-GCM",
+    OnSession: func(sess *ovpn.Session) {
+        // The embedder attaches; nothing in ovpn.Config knows the netstack
+        // exists.
+        if err := stack.Attach(sess, sess.AssignedIP()); err != nil {
+            log.Printf("warning: netstack attach failed for %s: %v", sess.AssignedIP(), err)
+        }
+    },
+})
+
+ovpnDone := make(chan error, 1)
+go func() { ovpnDone <- srv.Serve(pc) }()
+```
+
+See [examples/tunnelweb/README.md](../examples/tunnelweb/README.md) for the
+full walkthrough, including PKI generation and connecting a real OpenVPN
+client.
+</content>
