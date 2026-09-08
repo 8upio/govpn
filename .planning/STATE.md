@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-08-22)
 Phase: 04
 Plan: Not started
 Status: All phases complete
-Last activity: 2026-08-28 — Phase 04 complete
+Last activity: 2026-09-08 - Completed quick task 260908-fva: IPv4-Fragment-Reassembly (RFC 815) mit Per-Session-Bounds und Outbound-Fragmentierung ab konfigurierbarer MTU im netstack
 
 Progress: [░░░░░░░░░░] 0%
 
@@ -87,6 +87,12 @@ None yet.
 ### Blockers/Concerns
 
 - (resolved in Phase 2) Key Method 2 byte offsets verified against C source in 02-RESEARCH.md before data-channel code
+
+### Quick Tasks Completed
+
+| # | Description | Date | Commit | Directory |
+|---|-------------|------|--------|-----------|
+| 260908-fva | IPv4-Fragment-Reassembly (RFC 815) mit Per-Session-Bounds und Outbound-Fragmentierung ab konfigurierbarer MTU im netstack | 2026-09-08 | 78c3157 | [260908-fva-ipv4-fragment-reassembly-rfc-815-mit-per](./quick/260908-fva-ipv4-fragment-reassembly-rfc-815-mit-per/) |
 
 ## Deferred Items
 
