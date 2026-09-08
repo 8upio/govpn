@@ -221,6 +221,26 @@ type Session struct {
 	// goroutine.
 	pushRequested atomic.Bool
 
+	// closeReason records why this session ended (CloseReason), set as the
+	// FIRST statement inside closeWithReason's stopOnce.Do body — before
+	// close(stopCh) — so any goroutine that observes stopCh closed also
+	// observes the reason (CloseReason's own doc comment). An atomic, not
+	// a plain field guarded by mu: CloseReason() is documented legal to
+	// call from any goroutine at any time, including before teardown,
+	// which a plain field would make a data race under -race.
+	closeReason atomic.Int32
+
+	// published records whether this session was ever handed to
+	// Config.OnSession — set in ovpn.go's runHandshake, in the same
+	// OnSession-non-nil guard that calls callOnSession, immediately before
+	// that call (so it is set even if callOnSession itself recovers a
+	// panic: the session did reach OnSession). This is what gates
+	// Config.OnSessionClosed: a session torn down before OnSession ever
+	// fired (a failed handshake, a handshake-window timeout) must never
+	// trigger OnSessionClosed, since the embedder never received it in the
+	// first place.
+	published atomic.Bool
+
 	// mu guards assignedIP, peerID, primary, lameDuck, pendingReneg,
 	// pendingRenegKeyID, lastRenegAccepted, lastAuthTraffic, and dataKeys
 	// below (WR-03, extended by 04-01-PLAN.md Task 1 from the single
@@ -598,7 +618,7 @@ func (s *Session) handleDataPacket(packet []byte) {
 	// payload itself is never delivered to ipInbound and never treated as
 	// an error.
 	if isExitNotify(plaintext) {
-		_ = s.Close()
+		_ = s.closeWithReason(CloseReasonClientExitNotify)
 		return
 	}
 
@@ -647,12 +667,26 @@ func (sess *Session) routeControlPacket(keyID uint8) *ctrlconn.Conn {
 }
 
 // startKeepalive starts this session's per-session keepalive goroutine
-// (D-11): a real time.Ticker at pingInterval feeds runKeepalive below.
+// (D-11): a real time.Ticker at s.srv.pingInterval (Config.PingInterval,
+// resolved once in NewServer) feeds runKeepalive below — this is what
+// keeps the emitted schedule from drifting from buildPushReply's own
+// pushed `ping N` value, both reading the same resolved field. Falls back
+// to the package pingInterval constant when s.srv is nil (some fast-tier
+// tests build a Session by hand with no owning Server) OR when s.srv is
+// non-nil but its pingInterval field is still its zero value (a hand-built
+// *Server in a test that bypassed NewServer's resolution, mirroring the
+// same defensive posture reapWindow's own zero-value comparison in runReap
+// already tolerates) — time.NewTicker panics on a non-positive duration,
+// so this fallback is a correctness requirement, not just a convenience.
 // Called once, from ovpn.go's performPushExchange, at the same point the
 // data wrapper goes live — alongside the PUSH_REPLY write, before
 // OnSession ever fires.
 func (s *Session) startKeepalive() {
-	ticker := time.NewTicker(pingInterval)
+	interval := pingInterval
+	if s.srv != nil && s.srv.pingInterval > 0 {
+		interval = s.srv.pingInterval
+	}
+	ticker := time.NewTicker(interval)
 	go func() {
 		defer ticker.Stop()
 		s.runKeepalive(ticker.C)
@@ -827,7 +861,7 @@ func (s *Session) runReap(tickCh <-chan time.Time) {
 			last := s.lastAuthTraffic
 			s.mu.Unlock()
 			if s.now().Sub(last) >= s.srv.reapWindow {
-				_ = s.Close()
+				_ = s.closeWithReason(CloseReasonIdleReap)
 				return
 			}
 		case <-s.stopCh:
@@ -871,17 +905,26 @@ func (s *Session) ConnectionState() tls.ConnectionState {
 	return s.connState
 }
 
-// Close tears down this session's control channel: it stops the
-// per-session pump goroutine (by closing stopCh, never inbound itself —
-// see stopCh's docs), removes this session from its owning Server's
-// session table so it can be garbage collected, releases its tunnel IP and
-// peer-id back to Server.pool for immediate reuse (D-02) if they were ever
-// assigned, and closes the underlying control-channel Conn. Safe to call
-// more than once (idempotent — the release happens inside the same
-// stopOnce.Do as everything else, so a double Close can never double
-// release) and safe to call concurrently.
-func (s *Session) Close() error {
+// closeWithReason is the single teardown funnel every internal teardown
+// site (the embedder's own Close, an authenticated client exit-notify, the
+// idle-session reaper, Server.Close, and the pre-publish handshake-failure
+// paths) now calls, naming WHY the session ended. It tears down this
+// session's control channel: it stops the per-session pump goroutine (by
+// closing stopCh, never inbound itself — see stopCh's docs), removes this
+// session from its owning Server's session table so it can be garbage
+// collected, releases its tunnel IP and peer-id back to Server.pool for
+// immediate reuse (D-02) if they were ever assigned, and closes the
+// underlying control-channel Conn. Safe to call more than once (idempotent
+// — the release happens inside the same stopOnce.Do as everything else, so
+// a double call can never double release) and safe to call concurrently.
+// Only the FIRST call's reason is ever recorded (stopOnce guarantees the
+// body — including the closeReason store below — runs exactly once).
+func (s *Session) closeWithReason(r CloseReason) error {
 	s.stopOnce.Do(func() {
+		// Recorded FIRST, before close(stopCh): any goroutine that
+		// observes stopCh closed (the only synchronizing signal this type
+		// documents) must also observe the reason that produced it.
+		s.closeReason.Store(int32(r))
 		close(s.stopCh)
 		if s.srv != nil {
 			// WR-05: hold mu across BOTH the assignedIP/peerID/dataWrapper
@@ -951,11 +994,52 @@ func (s *Session) Close() error {
 				}
 			}
 		}
+
+		// OnSessionClosed fires here, at the very end of this stopOnce.Do
+		// body — after every other teardown step above has completed —
+		// and only for a session that was actually published to
+		// Config.OnSession (s.published; see its own doc comment: a
+		// handshake-failure or handshake-window-timeout teardown never
+		// sets it, so it never reaches here). cbBegin runs on THIS
+		// goroutine, before the go statement, so Server.Close's cbWait can
+		// never observe a zero in-flight count while this callback is
+		// still being scheduled.
+		if s.srv != nil && s.srv.cfg.OnSessionClosed != nil && s.published.Load() {
+			s.srv.cbBegin()
+			go func() {
+				defer s.srv.cbEnd()
+				s.srv.callOnSessionClosed(s, r)
+			}()
+		}
 	})
 	if s.conn == nil {
 		return nil
 	}
 	return s.conn.Close()
+}
+
+// Close tears down this session, recording CloseReasonEmbedder: the
+// embedder called Close directly. See closeWithReason for the full
+// teardown contract; Close is a thin wrapper over it and is the only
+// public teardown entry point — every internal teardown path funnels
+// through closeWithReason with its own, more specific reason instead.
+func (s *Session) Close() error {
+	return s.closeWithReason(CloseReasonEmbedder)
+}
+
+// Done returns a channel that is closed once this session has finished
+// tearing down, regardless of cause — the same stopCh every other
+// per-session goroutine already selects on. CloseReason() is meaningful
+// only after Done() has fired.
+func (s *Session) Done() <-chan struct{} {
+	return s.stopCh
+}
+
+// CloseReason reports why this session ended. Before Done() has fired (or
+// for a session that never ends), it returns CloseReasonUnknown — the
+// zero value.
+func (s *Session) CloseReason() CloseReason {
+	return CloseReason(s.closeReason.Load())
 }
 
 var _ io.ReadWriteCloser = (*Session)(nil)

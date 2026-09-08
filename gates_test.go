@@ -717,20 +717,26 @@ func isStopChSelector(e ast.Expr) bool {
 // TestPhase4TeardownAlwaysFlowsThroughClose asserts that closing a
 // session's stopCh, deleting it from Server.sessions/Server.dataSessions,
 // and releasing its tunnel IP/peer-id back to the pool all happen ONLY
-// from inside Session.Close's own stopOnce body (or a helper Close itself
+// from inside Session.closeWithReason's own stopOnce body (or a helper it
 // calls, i.e. removeSession) — never from a second, independently-grown
 // teardown path (D-22: reaping and exit-notify both flow through the
-// existing Close()/stopOnce contract, adding no new coupling).
+// existing closeWithReason/stopOnce contract, adding no new coupling).
+// closeWithReason is the single teardown funnel every internal teardown
+// site now names a CloseReason and calls directly; the exported Close is a
+// thin wrapper over it (closeWithReason(CloseReasonEmbedder)) — this gate
+// is actually STRENGTHENED by that refactor, not weakened: there is still
+// exactly one function in the package allowed to close stopCh, and it is
+// now impossible to reach that function without also naming why.
 // performPushExchange's own allocate-then-immediately-roll-back-on-error
 // calls to pool.release are a narrower, pre-existing exception: they
 // release an IP that was allocated moments earlier in the SAME function
 // call, before it was ever published anywhere a session teardown could
 // observe it — not a teardown path.
 func TestPhase4TeardownAlwaysFlowsThroughClose(t *testing.T) {
-	allowedStopChClose := map[string]bool{"Close": true}
+	allowedStopChClose := map[string]bool{"closeWithReason": true}
 	allowedSessionsDelete := map[string]bool{"removeSession": true}
-	allowedDataSessionsDelete := map[string]bool{"Close": true}
-	allowedPoolRelease := map[string]bool{"Close": true, "performPushExchange": true}
+	allowedDataSessionsDelete := map[string]bool{"closeWithReason": true}
+	allowedPoolRelease := map[string]bool{"closeWithReason": true, "performPushExchange": true}
 
 	check := func(path string) {
 		file, fset := parseGoFile(t, path)
@@ -819,36 +825,6 @@ func TestPhase4ExitNotifyCheckedOnlyPostDecrypt(t *testing.T) {
 	}
 	check("session.go")
 	check("ovpn.go")
-}
-
-// TestPhase4NoSessionClosedCallback asserts Config declares no
-// OnSessionClosed-style field: 04-CONTEXT.md defers that idea (T-04-10),
-// and the embedder observes teardown as io.EOF from Read/Write instead.
-func TestPhase4NoSessionClosedCallback(t *testing.T) {
-	file, _ := parseGoFile(t, "ovpn.go")
-	for _, decl := range file.Decls {
-		gd, ok := decl.(*ast.GenDecl)
-		if !ok || gd.Tok != token.TYPE {
-			continue
-		}
-		for _, spec := range gd.Specs {
-			ts, ok := spec.(*ast.TypeSpec)
-			if !ok || ts.Name.Name != "Config" {
-				continue
-			}
-			st, ok := ts.Type.(*ast.StructType)
-			if !ok {
-				continue
-			}
-			for _, field := range st.Fields.List {
-				for _, name := range field.Names {
-					if strings.Contains(name.Name, "Closed") {
-						t.Errorf("Config declares field %q — an OnSessionClosed-style callback stays deferred (T-04-10, 04-CONTEXT.md)", name.Name)
-					}
-				}
-			}
-		}
-	}
 }
 
 // TestPhase4InteropClientConfigCarriesLifecycleDirectives is 04-03-PLAN.md

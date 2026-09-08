@@ -89,6 +89,117 @@ type Config struct {
 	// Deliberately never pushed to the client as a `reneg-sec` option — see
 	// D-19.
 	RenegSec time.Duration
+
+	// OnSessionClosed, if set, is invoked at most once per session — ONLY
+	// for a session that was actually handed to OnSession — after that
+	// session's teardown has fully completed, with the CloseReason
+	// distinguishing why: the embedder calling Session.Close directly
+	// (CloseReasonEmbedder), an authenticated client-side
+	// explicit-exit-notify (CloseReasonClientExitNotify), the server's own
+	// idle-session reaper (CloseReasonIdleReap), or Server.Close tearing
+	// down every live session (CloseReasonServerClose). It runs on its own
+	// goroutine, separate from whatever goroutine performed the teardown,
+	// so a slow or blocking OnSessionClosed never delays that teardown
+	// itself — but Server.Close DOES wait for every OnSessionClosed
+	// invocation it triggered to return before Server.Close itself
+	// returns, so OnSessionClosed must never call Server.Close (that would
+	// deadlock). Panics are recovered and routed to Config.OnSessionPanic,
+	// exactly like OnSession's own panic-recovery contract.
+	OnSessionClosed func(sess *Session, reason CloseReason)
+
+	// PingInterval is how often this server emits its own data-channel
+	// ping keepalive AND the value pushed to the client as `ping N`
+	// (seconds, floored at 1). Zero means the reference's own 10-second
+	// default (pingInterval). Server-authoritative: changing it changes
+	// both what this server actually does and what it tells the client to
+	// expect, so the two can never drift apart (the same property the
+	// fixed pingIntervalSeconds constant used to guarantee by
+	// construction).
+	PingInterval time.Duration
+
+	// ReapWindow is how long a session may go without any authenticated
+	// traffic before the idle-session reaper (D-22) closes it, AND the
+	// value pushed to the client as `ping-restart M` (seconds, floored at
+	// 1). Zero means the reference's own 60-second default
+	// (defaultReapWindow). Server-authoritative and independent of
+	// whatever the client believes, exactly like the previous fixed
+	// ping-restart 60 literal — only now derived from this field instead
+	// of hardcoded. Serve rejects a configured ReapWindow smaller than
+	// twice the resolved PingInterval.
+	ReapWindow time.Duration
+
+	// SessionInboundQueue overrides the per-session inbound raw-IP-packet
+	// queue depth (D-14) a Session's Read drains from. Zero means the
+	// reference's own default (ipInboundQueueSize, 32). A larger value
+	// tolerates a bigger burst of inbound packets before the queue's
+	// existing drop-newest overflow policy (D-06) kicks in — useful for a
+	// bursty embedder (e.g. RTP) that can occasionally fall behind Read.
+	SessionInboundQueue int
+}
+
+// CloseReason distinguishes why a Session ended, reported to
+// Config.OnSessionClosed and readable at any time via Session.CloseReason.
+type CloseReason int
+
+const (
+	// CloseReasonUnknown is a still-live session's CloseReason (Done() has
+	// not fired yet), and is also what a session torn down BEFORE it was
+	// ever published to OnSession records — a handshake failure or
+	// handshake-window timeout, for instance. Such a session never
+	// triggers OnSessionClosed at all (see Session.published), so
+	// CloseReasonUnknown is never itself the reason argument
+	// OnSessionClosed observes; it is only ever visible through
+	// CloseReason() called on a session that has not (yet, or ever)
+	// completed teardown, or was never published.
+	CloseReasonUnknown CloseReason = iota
+
+	// CloseReasonEmbedder is recorded when the embedder calls
+	// Session.Close directly.
+	CloseReasonEmbedder
+
+	// CloseReasonClientExitNotify is recorded when the client sends an
+	// authenticated explicit-exit-notify on the data channel (D-21).
+	CloseReasonClientExitNotify
+
+	// CloseReasonIdleReap is recorded when the server's own idle-session
+	// reaper closes a session that has gone silent for the reap window
+	// (D-22).
+	CloseReasonIdleReap
+
+	// CloseReasonServerClose is recorded when Server.Close tears down
+	// every still-live session.
+	CloseReasonServerClose
+
+	// CloseReasonReplaced is reserved for a future static-IP "replace the
+	// existing session for this identity" teardown path. It is never
+	// produced by this package today — declared now, ahead of that
+	// feature, so the CloseReason enum's wire/API shape is stable across
+	// the v0.1.0 -> v0.2.0 boundary rather than growing a new constant
+	// value later that could renumber nothing (iota-based enums are
+	// append-only safe) but would still be a mid-cycle behavioral surprise
+	// for anyone switching exhaustively on CloseReason today.
+	CloseReasonReplaced
+)
+
+// String returns a lowercase-kebab token for r, or a numeric fallback for
+// an unrecognized value.
+func (r CloseReason) String() string {
+	switch r {
+	case CloseReasonUnknown:
+		return "unknown"
+	case CloseReasonEmbedder:
+		return "embedder"
+	case CloseReasonClientExitNotify:
+		return "client-exit-notify"
+	case CloseReasonIdleReap:
+		return "idle-reap"
+	case CloseReasonServerClose:
+		return "server-close"
+	case CloseReasonReplaced:
+		return "replaced"
+	default:
+		return fmt.Sprintf("CloseReason(%d)", int(r))
+	}
 }
 
 // ParseStaticKeyV1 parses an OpenVPN "Static key V1" PEM-style envelope
@@ -170,28 +281,30 @@ const (
 	// in for the reference's own exact-wakeup event loop).
 	renegPollInterval = 1 * time.Second
 
-	// pingIntervalSeconds is the fixed v1 keepalive schedule (D-11):
-	// push.go's buildPushReply pushes `ping N` using this exact value, and
-	// session.go's per-session keepalive goroutine emits its own pings on
-	// this exact period — reading both from one constant is what makes the
-	// pushed schedule and the emitted schedule structurally unable to
-	// drift apart. Not configurable in v1 (RESEARCH.md Deferred Ideas).
+	// pingIntervalSeconds/pingInterval are Config.PingInterval's DEFAULT
+	// (D-11): Server.pingInterval resolves to this constant when
+	// Config.PingInterval is left at its zero value (NewServer). Both
+	// push.go's buildPushReply `ping N` and session.go's per-session
+	// keepalive goroutine read the SAME resolved Server.pingInterval
+	// field, never this constant directly once a Server exists — that is
+	// what keeps the pushed schedule and the emitted schedule
+	// structurally unable to drift apart, the same guarantee this
+	// constant alone used to provide back when PingInterval was not yet
+	// configurable (Welle-1 item 1e superseded that v1 restriction).
 	pingIntervalSeconds = 10
 	pingInterval        = pingIntervalSeconds * time.Second
 
-	// defaultReapWindow is how long a session may go without any
-	// authenticated traffic (control or data, primary or lame-duck) before
-	// the idle-session reaper (Session.startReap/runReap) closes it
-	// (D-22): this is the ping-restart window 04-CONTEXT.md locks — 60
-	// seconds — server-authoritative and deliberately independent of what
-	// the client believes. Expressed as 6*pingInterval rather than a bare
-	// 60*time.Second so the relationship to the pushed keepalive schedule
-	// (buildPushReply's own `ping N`) is structural, not just documented:
-	// a live client emitting on that pushed schedule resets this window
-	// many times over before it can ever expire. Not configurable via
-	// Config in v1 (deliberately deferred, like RenegSec's own
-	// non-pushed-to-client posture, D-19) — Server.reapWindow below exists
-	// only so tests can override it directly.
+	// defaultReapWindow is Config.ReapWindow's DEFAULT: how long a session
+	// may go without any authenticated traffic (control or data, primary
+	// or lame-duck) before the idle-session reaper (Session.startReap/
+	// runReap) closes it (D-22) when Config.ReapWindow is left at its zero
+	// value (NewServer). This is the ping-restart window 04-CONTEXT.md
+	// originally locked at 60 seconds, server-authoritative and
+	// deliberately independent of what the client believes — Welle-1 item
+	// 1e made it configurable via Config.ReapWindow, but the DEFAULT
+	// stays expressed as 6*pingInterval rather than a bare 60*time.Second
+	// so the unconfigured relationship to the default pushed keepalive
+	// schedule stays structural, not just documented.
 	// Source: 04-CONTEXT.md D-22; forward.c:1093-1103/1184 (Pattern 6).
 	defaultReapWindow = 6 * pingInterval
 
@@ -259,6 +372,32 @@ type Server struct {
 	// already establishes.
 	reapWindow time.Duration
 
+	// pingInterval is Config.PingInterval resolved once in NewServer (0 ->
+	// pingInterval constant), read by every session's keepalive goroutine
+	// (Session.startKeepalive) and by buildPushReply's `ping N` value.
+	// Resolved in NewServer rather than Serve so the existing
+	// direct-field-override test precedent (srv.reapWindow set by hand
+	// after NewServer) keeps working unchanged for this field too.
+	pingInterval time.Duration
+
+	// sessionInboundQueue is Config.SessionInboundQueue resolved once in
+	// NewServer (0 -> ipInboundQueueSize), sized into each session's
+	// ipInbound channel by performPushExchange.
+	sessionInboundQueue int
+
+	// cbMu/cbCount/cbDone track in-flight OnSessionClosed callback
+	// goroutines so Server.Close can wait for all of them to return before
+	// Close itself returns. Deliberately NOT a sync.WaitGroup: a
+	// reap/exit-notify-driven cbBegin can land while Close is already
+	// inside cbWait and the counter has fallen back to zero — exactly the
+	// reuse-after-zero hazard sync.WaitGroup's own docs warn against
+	// (calling Add concurrently with a Wait that could return). A
+	// mutex-guarded counter plus a one-shot completion channel, created
+	// fresh by cbWait itself, has no such restriction.
+	cbMu    sync.Mutex
+	cbCount int
+	cbDone  chan struct{}
+
 	// pool is this server's tunnel-IP and peer-id allocator, built from
 	// Config.Network in Serve. nil if Config.Network was never set — a
 	// session that reaches the PUSH_REQUEST/PUSH_REPLY exchange with a nil
@@ -305,12 +444,26 @@ type Server struct {
 // NewServer builds a Server from cfg. It does not start listening — call
 // Serve to begin reading from a net.PacketConn.
 func NewServer(cfg Config) *Server {
+	reapWindow := cfg.ReapWindow
+	if reapWindow == 0 {
+		reapWindow = defaultReapWindow
+	}
+	pi := cfg.PingInterval
+	if pi == 0 {
+		pi = pingInterval
+	}
+	sessionInboundQueue := cfg.SessionInboundQueue
+	if sessionInboundQueue == 0 {
+		sessionInboundQueue = ipInboundQueueSize
+	}
 	return &Server{
-		cfg:             cfg,
-		handshakeWindow: reliable.HandshakeWindow,
-		reapWindow:      defaultReapWindow,
-		sessions:        make(map[sessionKey]*Session),
-		dataSessions:    make(map[uint32]*Session),
+		cfg:                 cfg,
+		handshakeWindow:     reliable.HandshakeWindow,
+		reapWindow:          reapWindow,
+		pingInterval:        pi,
+		sessionInboundQueue: sessionInboundQueue,
+		sessions:            make(map[sessionKey]*Session),
+		dataSessions:        make(map[uint32]*Session),
 	}
 }
 
@@ -333,6 +486,32 @@ func (s *Server) Serve(pc net.PacketConn) error {
 	}
 	if s.cfg.TLSConfig == nil {
 		return errors.New("ovpn: Config.TLSConfig must be set")
+	}
+	// Validated from s.cfg directly, never from the already-resolved
+	// s.pingInterval/s.reapWindow/s.sessionInboundQueue fields NewServer
+	// set: a test that overrides one of those resolved fields by hand
+	// after NewServer (the same direct-field-override precedent
+	// s.handshakeWindow already establishes) deliberately bypasses this
+	// validation, exactly as it does today.
+	if s.cfg.PingInterval < 0 {
+		return errors.New("ovpn: Config.PingInterval must not be negative")
+	}
+	if s.cfg.ReapWindow < 0 {
+		return errors.New("ovpn: Config.ReapWindow must not be negative")
+	}
+	if s.cfg.SessionInboundQueue < 0 {
+		return errors.New("ovpn: Config.SessionInboundQueue must not be negative")
+	}
+	resolvedPing := s.cfg.PingInterval
+	if resolvedPing == 0 {
+		resolvedPing = pingInterval
+	}
+	resolvedReap := s.cfg.ReapWindow
+	if resolvedReap == 0 {
+		resolvedReap = defaultReapWindow
+	}
+	if resolvedReap < 2*resolvedPing {
+		return fmt.Errorf("ovpn: Config.ReapWindow (%s) must be at least twice Config.PingInterval (%s)", resolvedReap, resolvedPing)
 	}
 	s.renegSec = s.cfg.RenegSec
 	if s.renegSec == 0 {
@@ -400,12 +579,64 @@ func (s *Server) Close() error {
 	s.mu.Unlock()
 
 	for _, sess := range sessions {
-		_ = sess.Close()
+		_ = sess.closeWithReason(CloseReasonServerClose)
 	}
+
+	// Wait for every OnSessionClosed callback the loop above triggered to
+	// return before this call returns, so an embedder that tears down
+	// resources OnSessionClosed depends on, immediately after Close
+	// returns, can never race a still-running callback (see cbWait's own
+	// doc comment for why this is not a sync.WaitGroup).
+	s.cbWait()
+
 	if pc != nil {
 		return pc.Close()
 	}
 	return nil
+}
+
+// cbBegin records one in-flight OnSessionClosed callback goroutine. Must
+// be called on the goroutine that is about to spawn the callback, BEFORE
+// the go statement — otherwise Server.Close's cbWait could observe a
+// zero count and return before the callback goroutine has even
+// registered itself.
+func (s *Server) cbBegin() {
+	s.cbMu.Lock()
+	s.cbCount++
+	s.cbMu.Unlock()
+}
+
+// cbEnd records that one in-flight OnSessionClosed callback goroutine has
+// returned. If this was the last one AND Server.Close is currently waiting
+// (cbDone non-nil), it wakes that wait.
+func (s *Server) cbEnd() {
+	s.cbMu.Lock()
+	s.cbCount--
+	if s.cbCount == 0 && s.cbDone != nil {
+		close(s.cbDone)
+		s.cbDone = nil
+	}
+	s.cbMu.Unlock()
+}
+
+// cbWait blocks until every OnSessionClosed callback goroutine currently
+// in flight (per cbBegin/cbEnd) has returned. Deliberately not a
+// sync.WaitGroup: a reap- or exit-notify-driven cbBegin can land
+// concurrently while Close is already inside cbWait and the counter has
+// fallen to zero — exactly the "Add concurrently with a possibly-returning
+// Wait" reuse hazard sync.WaitGroup's own docs warn against. A one-shot
+// completion channel created fresh here, under the same mutex the count
+// itself is guarded by, has no such restriction.
+func (s *Server) cbWait() {
+	s.cbMu.Lock()
+	if s.cbCount == 0 {
+		s.cbMu.Unlock()
+		return
+	}
+	ch := make(chan struct{})
+	s.cbDone = ch
+	s.cbMu.Unlock()
+	<-ch
 }
 
 // packetConnTransport adapts a net.PacketConn to ctrlconn.Transport.
@@ -695,7 +926,7 @@ func (s *Server) runHandshake(sess *Session) {
 	err := tlsConn.Handshake()
 	if err != nil {
 		close(sess.doneCh)
-		_ = sess.Close()
+		_ = sess.closeWithReason(CloseReasonUnknown)
 		return
 	}
 
@@ -707,13 +938,13 @@ func (s *Server) runHandshake(sess *Session) {
 
 	if err := s.performKeyMethod2Exchange(sess, tlsConn); err != nil {
 		close(sess.doneCh)
-		_ = sess.Close()
+		_ = sess.closeWithReason(CloseReasonUnknown)
 		return
 	}
 
 	if err := s.performPushExchange(sess, tlsConn); err != nil {
 		close(sess.doneCh)
-		_ = sess.Close()
+		_ = sess.closeWithReason(CloseReasonUnknown)
 		return
 	}
 
@@ -735,7 +966,7 @@ func (s *Server) runHandshake(sess *Session) {
 	// bring-up (Close is idempotent via stopOnce, so this second call is a
 	// no-op) rather than handed to the embedder.
 	if sess.closing() {
-		_ = sess.Close()
+		_ = sess.closeWithReason(CloseReasonUnknown)
 		return
 	}
 
@@ -744,6 +975,11 @@ func (s *Server) runHandshake(sess *Session) {
 	// sess.assignedIP/sess.dataKeys are both live — so the Session handed
 	// to the embedder is immediately usable.
 	if s.cfg.OnSession != nil {
+		// published means "was handed to the embedder": set even though
+		// callOnSession may itself recover a panic below — the session
+		// did reach OnSession, which is what gates OnSessionClosed
+		// (Session.published's own doc comment).
+		sess.published.Store(true)
 		s.callOnSession(sess)
 	}
 }
@@ -812,7 +1048,7 @@ func (s *Server) performPushExchange(sess *Session, w io.Writer) error {
 				s.pool.release(ip, peerID)
 				return fmt.Errorf("ovpn: build data-channel wrapper: %w", err)
 			}
-			ipInbound := make(chan []byte, ipInboundQueueSize)
+			ipInbound := make(chan []byte, s.sessionInboundQueue)
 
 			// WR-05: enforceHandshakeWindow's timeout goroutine can call
 			// sess.Close() concurrently at any point until sess.doneCh
@@ -888,7 +1124,8 @@ func (s *Server) performPushExchange(sess *Session, w io.Writer) error {
 			sess.startReap()
 		}
 
-		reply := buildPushReply(sess.assignedIP, s.cfg.Network, sess.peerID, cipher)
+		reply := buildPushReply(sess.assignedIP, s.cfg.Network, sess.peerID, cipher,
+			durationToPushedSeconds(s.pingInterval), durationToPushedSeconds(s.reapWindow))
 		if _, err := w.Write(reply); err != nil {
 			return fmt.Errorf("ovpn: write push reply: %w", err)
 		}
@@ -991,6 +1228,23 @@ func (s *Server) callOnSession(sess *Session) {
 		}
 	}()
 	s.cfg.OnSession(sess)
+}
+
+// callOnSessionClosed invokes Config.OnSessionClosed with the same
+// panic-recovery contract callOnSession above already establishes: this
+// runs on its own per-callback goroutine (see Session.closeWithReason), so
+// an unrecovered panic in caller-supplied code would otherwise crash the
+// entire embedding process. The recovered value and a stack trace are
+// routed to Config.OnSessionPanic, exactly like a panicking OnSession.
+func (s *Server) callOnSessionClosed(sess *Session, r CloseReason) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			if s.cfg.OnSessionPanic != nil {
+				s.cfg.OnSessionPanic(sess, rec, debug.Stack())
+			}
+		}
+	}()
+	s.cfg.OnSessionClosed(sess, r)
 }
 
 // startRenegotiation validates it is safe to begin a new key-id's handshake
@@ -1203,7 +1457,7 @@ func (s *Server) enforceHandshakeWindow(sess *Session) {
 	case <-sess.doneCh:
 		return
 	case <-time.After(s.handshakeWindow):
-		_ = sess.Close()
+		_ = sess.closeWithReason(CloseReasonUnknown)
 	}
 }
 

@@ -27,6 +27,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"time"
 )
 
 // maxControlStringLen bounds readControlString's search for a NUL
@@ -66,18 +67,34 @@ func writeControlString(w io.Writer, s string) error {
 	return err
 }
 
+// durationToPushedSeconds converts d to whole seconds for a pushed `ping`/
+// `ping-restart` directive, floored at 1: a sub-second test override (or a
+// pathological embedder Config value) must still produce a valid,
+// non-zero directive rather than `ping 0`, which a real client would
+// reject or misinterpret.
+func durationToPushedSeconds(d time.Duration) int {
+	secs := int(d / time.Second)
+	if secs < 1 {
+		secs = 1
+	}
+	return secs
+}
+
 // buildPushReply assembles the server's PUSH_REPLY payload for clientIP
-// (drawn from network by the caller's ipPool) and peerID, in the exact
-// option order and content a real OpenVPN 2.6 server transmits (Pattern 6,
-// D-03 "minimal reference defaults only"): ifconfig under subnet topology,
-// topology subnet, peer-id, the fixed data-channel cipher, and the
-// keepalive helper's own pushed expansion (ping 10 / ping-restart 60 — NOT
-// the doubled local value of 120, and NOT the literal "keepalive 10 60"
-// token). Nothing else is pushed: no route, no redirect-gateway, no
-// dhcp-option, no compression (D-03; routes are Phase 3). The returned
-// slice ends with exactly one 0x00 byte and is written to the wire
-// unmodified — no length prefix (Pattern 6).
-func buildPushReply(clientIP net.IP, network *net.IPNet, peerID uint32, cipher string) []byte {
+// (drawn from network by the caller's ipPool), peerID, cipher, and the
+// server-authoritative ping/ping-restart values (seconds, already resolved
+// by the caller from Config.PingInterval/Config.ReapWindow — see
+// durationToPushedSeconds), in the exact option order and content a real
+// OpenVPN 2.6 server transmits (Pattern 6, D-03 "minimal reference
+// defaults only"): ifconfig under subnet topology, topology subnet,
+// peer-id, the data-channel cipher, and the keepalive helper's own pushed
+// expansion (ping N / ping-restart M — NOT the doubled local value of
+// 2*N, and NOT the literal "keepalive N M" token). Nothing else is
+// pushed: no route, no redirect-gateway, no dhcp-option, no compression
+// (D-03; routes are Phase 3). The returned slice ends with exactly one
+// 0x00 byte and is written to the wire unmodified — no length prefix
+// (Pattern 6).
+func buildPushReply(clientIP net.IP, network *net.IPNet, peerID uint32, cipher string, pingSeconds, pingRestartSeconds int) []byte {
 	if cipher == "" {
 		cipher = "AES-256-GCM"
 	}
@@ -89,11 +106,15 @@ func buildPushReply(clientIP net.IP, network *net.IPNet, peerID uint32, cipher s
 		"topology subnet",
 		fmt.Sprintf("peer-id %d", peerID),
 		fmt.Sprintf("cipher %s", cipher),
-		// pingIntervalSeconds (ovpn.go, D-11) is the SAME constant
-		// session.go's keepalive goroutine reads for its own emission
-		// period — the pushed and emitted schedules cannot drift apart.
-		fmt.Sprintf("ping %d", pingIntervalSeconds),
-		"ping-restart 60",
+		// pingSeconds/pingRestartSeconds are derived by the caller
+		// (performPushExchange) from the SAME Server.pingInterval/
+		// Server.reapWindow fields session.go's keepalive goroutine and
+		// idle-reap timer read — the pushed and enforced schedules cannot
+		// drift apart, the same structural guarantee the old fixed
+		// pingIntervalSeconds constant and "ping-restart 60" literal used
+		// to provide, now derived from Config instead of hardcoded.
+		fmt.Sprintf("ping %d", pingSeconds),
+		fmt.Sprintf("ping-restart %d", pingRestartSeconds),
 	}
 	reply := strings.Join(opts, ",")
 	return append([]byte(reply), 0)

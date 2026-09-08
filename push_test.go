@@ -6,6 +6,7 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPushReplyStringExact(t *testing.T) {
@@ -15,7 +16,7 @@ func TestPushReplyStringExact(t *testing.T) {
 	}
 	clientIP := net.ParseIP("10.8.0.2")
 
-	got := buildPushReply(clientIP, network, 0, "AES-256-GCM")
+	got := buildPushReply(clientIP, network, 0, "AES-256-GCM", 10, 60)
 
 	want := append([]byte("PUSH_REPLY,ifconfig 10.8.0.2 255.255.255.0,topology subnet,peer-id 0,cipher AES-256-GCM,ping 10,ping-restart 60"), 0)
 
@@ -39,7 +40,7 @@ func TestPushReplyNetmaskFromPrefix(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse network %s: %v", c.cidr, err)
 		}
-		reply := buildPushReply(net.ParseIP(c.clientIP), network, 1, "AES-256-GCM")
+		reply := buildPushReply(net.ParseIP(c.clientIP), network, 1, "AES-256-GCM", 10, 60)
 		wantSegment := "ifconfig " + c.clientIP + " " + c.wantNetmask
 		if !bytes.Contains(reply, []byte(wantSegment)) {
 			t.Errorf("buildPushReply(%s) = %q, want it to contain %q", c.cidr, reply, wantSegment)
@@ -64,7 +65,7 @@ func TestPushReplyNormalizesSixteenByteMask(t *testing.T) {
 	copy(sixteenByteMask[12:], network.Mask)
 	network.Mask = sixteenByteMask
 
-	reply := buildPushReply(net.ParseIP("10.8.0.2"), network, 0, "AES-256-GCM")
+	reply := buildPushReply(net.ParseIP("10.8.0.2"), network, 0, "AES-256-GCM", 10, 60)
 
 	wantSegment := "ifconfig 10.8.0.2 255.255.255.0"
 	if !bytes.Contains(reply, []byte(wantSegment)) {
@@ -77,7 +78,7 @@ func TestPushReplyEndsWithSingleNUL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse network: %v", err)
 	}
-	reply := buildPushReply(net.ParseIP("10.8.0.2"), network, 0, "AES-256-GCM")
+	reply := buildPushReply(net.ParseIP("10.8.0.2"), network, 0, "AES-256-GCM", 10, 60)
 
 	if n := bytes.Count(reply, []byte{0}); n != 1 {
 		t.Fatalf("reply contains %d NUL bytes, want exactly 1: %q", n, reply)
@@ -130,6 +131,43 @@ func TestReadPushRequestRejectsUnterminatedFlood(t *testing.T) {
 	_, err := readControlString(r, maxControlStringLen)
 	if err == nil {
 		t.Fatal("readControlString did not error on a 64KiB flood with no NUL terminator")
+	}
+}
+
+// TestPushReplyCarriesCallerSuppliedPingValues asserts buildPushReply
+// pushes exactly the pingSeconds/pingRestartSeconds arguments it was
+// given — the ping-restart literal is no longer hardcoded.
+func TestPushReplyCarriesCallerSuppliedPingValues(t *testing.T) {
+	_, network, err := net.ParseCIDR("10.8.0.0/24")
+	if err != nil {
+		t.Fatalf("parse network: %v", err)
+	}
+	reply := buildPushReply(net.ParseIP("10.8.0.2"), network, 0, "AES-256-GCM", 5, 30)
+
+	if !bytes.Contains(reply, []byte("ping 5,ping-restart 30")) {
+		t.Errorf("buildPushReply(pingSeconds=5, pingRestartSeconds=30) = %q, want it to contain %q", reply, "ping 5,ping-restart 30")
+	}
+}
+
+// TestDurationToPushedSecondsFloorsAtOne asserts the sub-second-override
+// floor: a duration under one second still produces a valid, non-zero
+// pushed directive.
+func TestDurationToPushedSecondsFloorsAtOne(t *testing.T) {
+	cases := []struct {
+		d    time.Duration
+		want int
+	}{
+		{0, 1},
+		{100 * time.Millisecond, 1},
+		{999 * time.Millisecond, 1},
+		{time.Second, 1},
+		{5 * time.Second, 5},
+		{90 * time.Second, 90},
+	}
+	for _, c := range cases {
+		if got := durationToPushedSeconds(c.d); got != c.want {
+			t.Errorf("durationToPushedSeconds(%v) = %d, want %d", c.d, got, c.want)
+		}
 	}
 }
 
