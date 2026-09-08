@@ -65,6 +65,7 @@ type Config struct {
     ReapWindow          time.Duration
     SessionInboundQueue int
     AuthUserPass        func(username, password string, cs tls.ConnectionState) error
+    AssignIP            func(peerCN string, cs tls.ConnectionState) (net.IP, error)
     Logger              *slog.Logger
 }
 ```
@@ -102,6 +103,16 @@ fields most relevant to the API surface on this page:
   certificate — see [CONFIGURATION.md](CONFIGURATION.md#authuserpass) for the
   full validation order, panic-recovery contract, and the certificate-less
   operation pattern.
+- **`AssignIP func(peerCN string, cs tls.ConnectionState) (net.IP, error)`**
+  — chooses a client's tunnel IP instead of the default dynamic pool. `nil`
+  (the default) leaves every session's tunnel IP coming from the dynamic
+  pool, byte-for-byte the same as before this hook existed. Returning
+  `(nil, nil)` falls back to the pool for that one session only. If the
+  returned address is currently held by another live session, that older
+  session is evicted with `CloseReasonReplaced` and the new session takes
+  over the address — see [CONFIGURATION.md](CONFIGURATION.md#assignip) for
+  the full validation list, the panic/error fail-closed contract, and the
+  replace semantics' SIP-registrar rationale.
 - **`Logger *slog.Logger`** — optional structured logging for handshake
   progress and failure, session lifecycle, authentication decisions,
   renegotiation, and per-datagram drops. `nil` (the default) costs nothing.
@@ -192,6 +203,59 @@ go func() { done <- srv.Serve(pc) }()
 // ... later, e.g. on SIGTERM ...
 _ = srv.Close()
 ```
+
+### `Server.Sessions`
+
+```go
+func (s *Server) Sessions() []*Session
+```
+
+Returns a point-in-time, best-effort snapshot of every established,
+not-yet-closing session, sorted ascending by `AssignedIP()` for
+deterministic output. Non-empty even when `Config.OnSession` is nil — it
+keys on internal established state, not on whether a session was ever
+handed to `OnSession`. A session may close the instant after it is
+returned in this slice, so treat every element as possibly-already-closed.
+Safe to call concurrently with handshakes and teardowns.
+
+### `Server.Stats`
+
+```go
+func (s *Server) Stats() ServerStats
+
+type ServerStats struct {
+    ActiveSessions       int
+    HandshakesStarted    uint64
+    HandshakesCompleted  uint64
+    HandshakesFailed     uint64
+    HandshakesTimedOut   uint64
+    AuthFailed           uint64
+    AssignIPRejected     uint64
+    PoolExhausted        uint64
+    DatagramsRejected    uint64
+}
+```
+
+A point-in-time snapshot of session inventory and handshake/dispatch
+counters. `ActiveSessions` is `len(Server.Sessions())` — the only gauge;
+every other field is monotonic since server construction. The four
+handshake-outcome counters (`HandshakesCompleted`/`HandshakesFailed`/
+`HandshakesTimedOut`/`AuthFailed`) partition every settled initial
+handshake: `HandshakesStarted == HandshakesCompleted + HandshakesFailed +
+HandshakesTimedOut + AuthFailed`, except for a handshake still in flight
+when `Server.Close` runs, which records no outcome at all.
+
+| Field | Counts |
+|---|---|
+| `ActiveSessions` | `len(Server.Sessions())` at the moment `Stats()` ran. |
+| `HandshakesStarted` | Every new control channel opened (one per session, initial handshakes only). |
+| `HandshakesCompleted` | Every initial handshake that reached "session established". |
+| `HandshakesFailed` | Every initial handshake that failed at the TLS, Key Method 2, or push stage, or was already closing during bring-up. |
+| `HandshakesTimedOut` | Every initial handshake torn down by the handshake-window timeout. |
+| `AuthFailed` | Every **initial-handshake** `Config.AuthUserPass` rejection. A renegotiation-time rejection is reported through `OnSessionClosed(CloseReasonAuthFailed)` instead, not counted here. |
+| `AssignIPRejected` | Every `Config.AssignIP` rejection: invalid address, hook error, hook panic, or an unresolved replace-path conflict. |
+| `PoolExhausted` | Every `ErrPoolExhausted` observed, from the dynamic pool or from `AssignIP`'s own reservation retry. |
+| `DatagramsRejected` | Every datagram dropped before dispatch to a session's own routing (bad length/opcode, unknown session, tls-crypt/parse failure, session-closing, queue-full, unsupported/short data, unknown peer-id). |
 
 ## `Session`
 
@@ -306,7 +370,7 @@ const (
     CloseReasonClientExitNotify
     CloseReasonIdleReap
     CloseReasonServerClose
-    CloseReasonReplaced // reserved; never produced by this package today
+    CloseReasonReplaced // Config.AssignIP evicted this session for another client
     CloseReasonAuthFailed
 )
 
@@ -320,7 +384,7 @@ func (r CloseReason) String() string
 | `CloseReasonClientExitNotify` | An authenticated client-side explicit-exit-notify. |
 | `CloseReasonIdleReap` | The server's own idle-session reaper. |
 | `CloseReasonServerClose` | `Server.Close` tearing down every live session. |
-| `CloseReasonReplaced` | Reserved for a future static-IP "replace" teardown path — never produced today. |
+| `CloseReasonReplaced` | `Config.AssignIP` handed this session's tunnel IP to a newly connecting client (mirrors the reference's default no-`--duplicate-cn` eviction); this session was already published, so `OnSessionClosed` DOES fire with this reason. |
 | `CloseReasonAuthFailed` | `Config.AuthUserPass` rejected the client's credentials. **Only fires `OnSessionClosed` for a renegotiation-time rejection** — an initial-handshake rejection never reaches `OnSession` in the first place (same rule as `CloseReasonUnknown`), so it never reaches `OnSessionClosed` either. |
 
 ### Other accessors

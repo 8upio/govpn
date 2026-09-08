@@ -157,6 +157,24 @@ its read loop; it returns whether a route was actually removed. It does not
 close the underlying session — again, session lifetime belongs to the
 embedder.
 
+`IsAttached(ip net.IP) bool` reports whether `ip` currently has a route: true
+only for an address currently registered via `Attach` and not yet removed by
+`Detach`. It never panics on its argument — a nil, IPv6, or otherwise
+malformed `ip` simply reports `false`, same as an address that was never
+attached. The stack's own server tunnel IP always reports `false` too
+(`Attach` rejects it with `ErrAttachServerIP`, so it can never become a
+route).
+
+`Routes() []net.IP` returns a point-in-time snapshot of every currently
+attached IP, sorted in ascending address order for deterministic output. It
+is safe to call concurrently with `Attach`/`Detach` and with in-flight
+handshakes and teardowns. Every returned `net.IP` is a freshly allocated
+defensive copy — mutating an element of the returned slice cannot reach or
+corrupt the stack's own routing state. An empty stack returns a zero-length
+slice. `Routes` is the inventory surface (which IPs are attached right now);
+`Stack.Stats()` is the companion counter surface (how many packets flowed) —
+use `Routes` for identity, `Stats` for a count.
+
 ### Access control on attached traffic
 
 Every inbound packet from an attachment is checked before any protocol
@@ -507,6 +525,76 @@ two packages are wired together entirely by the embedder's own code, inside
 `OnSession`. An embedder that wants raw IP packets instead of an in-process
 netstack can simply read/write `*ovpn.Session` directly and skip `netstack`
 altogether; see [API.md](API.md) for the `Session` surface.
+
+## Test helpers (netstacktest)
+
+Package `netstack/netstacktest` (`github.com/8upio/govpn/netstack/netstacktest`)
+is a supported, exported package of test helpers for embedders driving a
+`netstack.Stack` from their own tests: builders for valid, checksummed
+IPv4/UDP/ICMP-echo/fragment frames that `netstack`'s own parsers accept,
+plus `FakeSession`, an in-memory `io.ReadWriteCloser` that structurally
+satisfies `netstack.Session`. It is `netstack`'s own test suite's ONE
+implementation of these helpers too — there is no private duplicate
+anywhere in `netstack`'s own `_test.go` files.
+
+It depends on the standard library and `netstack/internal/frame` only — it
+does **not** import `netstack` itself, and carries no `testing` import
+either, so it is usable from ordinary `main` programs and fuzzers, not just
+from `*testing.T`-driven tests.
+
+```go
+import "github.com/8upio/govpn/netstack/netstacktest"
+
+func MustAddr(ip net.IP) netip.Addr
+func BuildIPv4(src, dst netip.Addr, proto uint8, payload []byte) []byte
+func BuildUDP(src, dst netip.Addr, srcPort, dstPort uint16, payload []byte) []byte
+func BuildICMPEchoRequest(src, dst netip.Addr, id, seq uint16, payload []byte) []byte
+func BuildFragment(src, dst netip.Addr, proto uint8, id uint16, offsetBytes int, mf bool, payload []byte) []byte
+
+func NewFakeSession() *FakeSession
+```
+
+Every builder takes `netip.Addr`, not `net.IP` — `MustAddr` converts a
+`net.IP` in one call, which is what a caller holding, say, an
+`ovpn.Session.AssignedIP()` result needs to do first. `BuildFragment`'s
+`offsetBytes` argument is in **bytes**, not the on-wire 8-octet units — the
+division happens inside the builder, so no caller has to remember it.
+
+`FakeSession` structurally satisfies `netstack.Session` (`Read`/`Write`/
+`Close`), with the same Read-retention semantics `ovpn.Session.Read` has: an
+oversized packet on a too-small `Read` buffer returns `ErrShortReadBuffer`
+and is retained for the next `Read` with a big enough buffer, and `Read`
+returns `io.EOF` after `Close`.
+
+```go
+func (f *FakeSession) Inject(frame []byte)
+func (f *FakeSession) Outbound() <-chan []byte
+func (f *FakeSession) ReadObservations() ReadObservations
+
+type ReadObservations struct {
+    DistinctReaders int
+    Overlapped      bool
+}
+```
+
+`Inject` delivers a frame to the session as if it had arrived from the
+network (feeding `Stack.Attach`'s own read loop); `Outbound` is the channel
+a test drains to observe what the stack wrote back. `ReadObservations`
+exposes the session's single-reader bookkeeping — useful for asserting that
+`Stack.Attach` never starts more than one reader goroutine per attached
+session.
+
+```go
+stack, _ := netstack.New(serverIP)
+fs := netstacktest.NewFakeSession()
+_ = stack.Attach(fs, clientIP)
+
+req := netstacktest.BuildICMPEchoRequest(
+    netstacktest.MustAddr(clientIP), netstacktest.MustAddr(serverIP), 1, 1, []byte("ping"))
+fs.Inject(req)
+
+reply := <-fs.Outbound() // the stack's ICMP echo reply
+```
 
 ## Related documentation
 

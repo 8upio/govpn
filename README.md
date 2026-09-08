@@ -10,6 +10,8 @@ Per connected client, `govpn` hands your program a `Session` that behaves as an 
 - **Dependencies:** Go standard library only — `go.mod` declares no third-party requirements.
 - **Compatibility target:** a real, unmodified OpenVPN 2.6 client with `tls-crypt`, certificate auth, AES-256-GCM, and `topology subnet`.
 - **Client authentication:** a client certificate, username/password via `Config.AuthUserPass`, or both — see [CONFIGURATION.md](docs/CONFIGURATION.md#authuserpass).
+- **Static per-client tunnel IPs:** `Config.AssignIP` assigns a fixed address by client identity instead of the dynamic pool, with reference-matching replace-on-reconnect semantics — see [CONFIGURATION.md](docs/CONFIGURATION.md#assignip).
+- **Test helpers for the netstack:** `netstack/netstacktest` exports frame builders and an in-memory `FakeSession` for driving a `netstack.Stack` from your own tests — see [NETSTACK.md](docs/NETSTACK.md#test-helpers-netstacktest).
 
 ## Installation
 

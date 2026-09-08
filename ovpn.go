@@ -25,6 +25,7 @@ import (
 	"log/slog"
 	"net"
 	"runtime/debug"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -866,12 +867,14 @@ func (t packetConnTransport) WriteTo(p []byte, addr net.Addr) (int, error) {
 
 func (s *Server) handleDatagram(pc net.PacketConn, addr net.Addr, packet []byte) {
 	if len(packet) < 1 || len(packet) > maxDatagramSize {
+		s.stats.datagramsRejected.Add(1)
 		s.logger().Debug("datagram dropped", "reason", "bad-length", "remote", addr, "bytes", len(packet))
 		return
 	}
 
 	opcode, keyID := wire.ParseHeaderByte(packet[0])
 	if !wire.ValidOpcode(opcode) {
+		s.stats.datagramsRejected.Add(1)
 		s.logger().Debug("datagram dropped", "reason", "bad-opcode", "remote", addr, "opcode", int(opcode))
 		return
 	}
@@ -896,6 +899,7 @@ func (s *Server) handleDatagram(pc net.PacketConn, addr net.Addr, packet []byte)
 	// minDatagramSize (the tls-crypt prefix) only applies to control-channel
 	// packets, which are always tls-crypt wrapped.
 	if len(packet) < minDatagramSize {
+		s.stats.datagramsRejected.Add(1)
 		s.logger().Debug("datagram dropped", "reason", "short-control", "remote", addr, "opcode", int(opcode), "bytes", len(packet))
 		return
 	}
@@ -916,6 +920,7 @@ func (s *Server) handleDatagram(pc net.PacketConn, addr net.Addr, packet []byte)
 		// has nowhere to be routed and is dropped, before any allocation
 		// at all.
 		if opcode != wire.OpControlHardResetClientV2 || keyID != 0 {
+			s.stats.datagramsRejected.Add(1)
 			if lg := s.logger(); lg.Enabled(context.Background(), slog.LevelDebug) {
 				lg.Debug("datagram dropped", "reason", "unknown-session", "remote", addr,
 					"session_id", hex.EncodeToString(sid[:]), "opcode", int(opcode), "key_id", int(keyID))
@@ -963,6 +968,7 @@ func (s *Server) handleDatagram(pc net.PacketConn, addr net.Addr, packet []byte)
 
 	_, plaintext, err := sess.wrapper.Unwrap(nil, packet)
 	if err != nil {
+		s.stats.datagramsRejected.Add(1)
 		if lg := s.logger(); lg.Enabled(context.Background(), slog.LevelDebug) {
 			lg.Debug("datagram dropped", "reason", "tls-crypt-unwrap", "remote", addr,
 				"session_id", hex.EncodeToString(sid[:]), "opcode", int(opcode), "err", err)
@@ -972,6 +978,7 @@ func (s *Server) handleDatagram(pc net.PacketConn, addr net.Addr, packet []byte)
 	hdr := wire.Header{Opcode: opcode, KeyID: keyID, SessionID: sid}
 	cp, err := wire.ParseControlPacket(plaintext, hdr)
 	if err != nil {
+		s.stats.datagramsRejected.Add(1)
 		if lg := s.logger(); lg.Enabled(context.Background(), slog.LevelDebug) {
 			lg.Debug("datagram dropped", "reason", "parse-control", "remote", addr,
 				"session_id", hex.EncodeToString(sid[:]), "opcode", int(opcode), "err", err)
@@ -1014,6 +1021,7 @@ func (s *Server) handleDatagram(pc net.PacketConn, addr net.Addr, packet []byte)
 				"session_id", hex.EncodeToString(sess.SessionID[:]),
 				"client_session_id", hex.EncodeToString(sess.clientSessionID[:]))
 		}
+		s.stats.handshakesStarted.Add(1)
 		go sess.pump()
 		go s.runHandshake(sess)
 		go s.enforceHandshakeWindow(sess)
@@ -1073,12 +1081,14 @@ func (s *Server) handleDatagram(pc net.PacketConn, addr net.Addr, packet []byte)
 	case <-sess.stopCh:
 		// Session is mid-teardown (Close was called): don't block trying
 		// to enqueue into a pump that has already stopped ranging.
+		s.stats.datagramsRejected.Add(1)
 		s.logger().Debug("datagram dropped", "reason", "session-closing", "key_id", int(cp.KeyID))
 	default:
 		// Queue full: drop this datagram exactly as a genuinely lost UDP
 		// packet would be dropped — the reliability layer's own
 		// retransmission (on both sides) is what recovers from this, not
 		// a synchronous retry here.
+		s.stats.datagramsRejected.Add(1)
 		s.logger().Debug("datagram dropped", "reason", "control-queue-full", "key_id", int(cp.KeyID))
 	}
 }
@@ -1095,10 +1105,12 @@ func (s *Server) handleDatagram(pc net.PacketConn, addr net.Addr, packet []byte)
 // as V2.
 func (s *Server) handleDataDatagram(opcode wire.Opcode, packet []byte) {
 	if opcode != wire.OpDataV2 {
+		s.stats.datagramsRejected.Add(1)
 		s.logger().Debug("datagram dropped", "reason", "data-v1-unsupported", "opcode", int(opcode))
 		return
 	}
 	if len(packet) < 4 {
+		s.stats.datagramsRejected.Add(1)
 		s.logger().Debug("datagram dropped", "reason", "short-data", "bytes", len(packet))
 		return
 	}
@@ -1108,6 +1120,7 @@ func (s *Server) handleDataDatagram(opcode wire.Opcode, packet []byte) {
 	sess, ok := s.dataSessions[peerID]
 	s.mu.Unlock()
 	if !ok {
+		s.stats.datagramsRejected.Add(1)
 		s.logger().Debug("datagram dropped", "reason", "unknown-peer-id", "peer_id", peerID)
 		return
 	}
@@ -1175,6 +1188,7 @@ func (s *Server) runHandshake(sess *Session) {
 	tlsConn := tls.Server(sess.conn, s.cfg.TLSConfig)
 	err := tlsConn.Handshake()
 	if err != nil {
+		s.recordHandshakeOutcome(sess, &s.stats.handshakesFailed)
 		sess.logger().Warn("handshake failed", "stage", "tls", "err", err)
 		close(sess.doneCh)
 		_ = sess.closeWithReason(CloseReasonUnknown)
@@ -1197,12 +1211,14 @@ func (s *Server) runHandshake(sess *Session) {
 			// the OUTER handshakeWindow bound (60s default) still covers
 			// this path, with authFailedWindow (2s) as the tighter INNER
 			// bound on the read-then-drain sequence itself.
+			s.recordHandshakeOutcome(sess, &s.stats.authFailed)
 			s.rejectAuthAfterPushRequest(sess, tlsConn, af.clientReason)
 			sess.logger().Debug("auth failed sent to client", "has_client_reason", af.clientReason != "")
 			close(sess.doneCh)
 			_ = sess.closeWithReason(CloseReasonAuthFailed)
 			return
 		}
+		s.recordHandshakeOutcome(sess, &s.stats.handshakesFailed)
 		sess.logger().Warn("handshake failed", "stage", "key-method-2", "err", err)
 		close(sess.doneCh)
 		_ = sess.closeWithReason(CloseReasonUnknown)
@@ -1210,6 +1226,7 @@ func (s *Server) runHandshake(sess *Session) {
 	}
 
 	if err := s.performPushExchange(sess, tlsConn); err != nil {
+		s.recordHandshakeOutcome(sess, &s.stats.handshakesFailed)
 		if errors.Is(err, ErrPoolExhausted) {
 			sess.logger().Warn("tunnel ip pool exhausted", "err", err)
 		} else {
@@ -1238,10 +1255,14 @@ func (s *Server) runHandshake(sess *Session) {
 	// bring-up (Close is idempotent via stopOnce, so this second call is a
 	// no-op) rather than handed to the embedder.
 	if sess.closing() {
+		s.recordHandshakeOutcome(sess, &s.stats.handshakesFailed)
 		sess.logger().Debug("session closed during bring-up")
 		_ = sess.closeWithReason(CloseReasonUnknown)
 		return
 	}
+
+	s.recordHandshakeOutcome(sess, &s.stats.handshakesCompleted)
+	sess.established.Store(true)
 
 	// E6: fires before Config.OnSession is ever invoked, so a nil or
 	// blocking OnSession can never suppress this record (T-na1-07).
@@ -1592,6 +1613,150 @@ func (s *Server) sessionByIP(ip net.IP) *Session {
 		}
 	}
 	return nil
+}
+
+// ServerStats is a point-in-time snapshot of a Server's session inventory
+// and handshake/dispatch counters, returned by Server.Stats(). The reads
+// backing each field are individually atomic, but not a consistent
+// snapshot ACROSS fields — two counters read a few nanoseconds apart on a
+// busy server may not describe the exact same instant. Every counter here
+// is monotonic since server construction (never reset, never decremented)
+// except ActiveSessions, the only gauge in this struct.
+type ServerStats struct {
+	// ActiveSessions is len(Server.Sessions()) at the moment Stats() ran:
+	// established, not-yet-closing sessions. The only gauge field here —
+	// every other field only ever grows.
+	ActiveSessions int
+
+	// HandshakesStarted counts every new control channel opened
+	// (handleDatagram's justCreated branch) — one per session, initial
+	// handshakes only, never per-datagram and never per-renegotiation.
+	HandshakesStarted uint64
+
+	// HandshakesCompleted counts every initial handshake that reached
+	// "session established" (the same point Session.established is set).
+	HandshakesCompleted uint64
+
+	// HandshakesFailed counts every initial handshake that failed at the
+	// TLS, Key Method 2, or PUSH_REQUEST/PUSH_REPLY stage, or was torn down
+	// while already closing during bring-up. Does not include an
+	// AuthUserPass rejection (see AuthFailed) or a handshake-window
+	// timeout (see HandshakesTimedOut) — those are counted separately so
+	// the four outcome counters partition rather than overlap.
+	HandshakesFailed uint64
+
+	// HandshakesTimedOut counts every initial handshake torn down by
+	// enforceHandshakeWindow because it did not complete within the
+	// configured handshake window.
+	HandshakesTimedOut uint64
+
+	// AuthFailed counts every INITIAL-handshake Config.AuthUserPass
+	// rejection (a non-nil error, an empty/over-long credential field, or a
+	// recovered hook panic). A renegotiation-time AuthUserPass rejection is
+	// already reported through Config.OnSessionClosed(CloseReasonAuthFailed)
+	// and is deliberately not counted here — counting it here too would
+	// double-report the same event through two different surfaces.
+	AuthFailed uint64
+
+	// AssignIPRejected counts every Config.AssignIP rejection: an invalid
+	// address (not IPv4, outside Config.Network, or the network/server/
+	// broadcast address), a non-nil hook error, a recovered hook panic, or
+	// an address collision the replace-path retry still could not resolve
+	// (a genuine concurrent conflict, "reason"=in-use in the paired Warn
+	// log record — see docs/CONFIGURATION.md#assignip). Does NOT count a
+	// successful replace (that is CloseReasonReplaced on the evicted
+	// session, not a rejection of the new one).
+	AssignIPRejected uint64
+
+	// PoolExhausted counts every ErrPoolExhausted a handshake observed,
+	// whether from the dynamic pool (Config.AssignIP nil or returning
+	// (nil, nil)) or from Config.AssignIP's own reservation retry running
+	// out of peer-ids. Every PoolExhausted event is also counted in
+	// AssignIPRejected when it originated from the AssignIP path; a
+	// dynamic-pool exhaustion is not, since it never reached AssignIP at
+	// all.
+	PoolExhausted uint64
+
+	// DatagramsRejected counts every datagram handleDatagram/
+	// handleDataDatagram dropped before it could be attributed to a live
+	// session's own control-packet routing: bad length, bad opcode, short
+	// control, unknown session, tls-crypt unwrap failure, control parse
+	// failure, session-closing, control-queue-full, unsupported P_DATA_V1,
+	// short data, and unknown peer-id. Deliberately does NOT include pump's
+	// own two "control packet dropped" sites: those are per-session routing
+	// decisions on already-authenticated framing, not dispatch-level
+	// rejections of unauthenticated input.
+	DatagramsRejected uint64
+}
+
+// Sessions returns a point-in-time, best-effort snapshot of every
+// established, not-yet-closing session, sorted by assigned IP for
+// deterministic output. "Established" means Session.established — set once
+// a session's data channel is live, regardless of whether Config.OnSession
+// is set — NOT Session.published, which only latches when Config.OnSession
+// is non-nil (published's own doc comment) and exists solely to gate
+// Config.OnSessionClosed; keying Sessions() on published would make a
+// server with no OnSession hook report zero sessions despite tunnels
+// genuinely being up.
+//
+// A session may close the instant after it is returned in this slice — the
+// snapshot is inherently racy against concurrent teardown — so a caller
+// must treat every element as possibly-already-closed.
+//
+// Same lock discipline as sessionByIP: s.mu is released before any
+// session's own AssignedIP() (which takes that session's mu) is consulted,
+// so this never holds s.mu while taking a session's mu.
+func (s *Server) Sessions() []*Session {
+	s.mu.Lock()
+	candidates := make([]*Session, 0, len(s.sessions))
+	for _, sess := range s.sessions {
+		candidates = append(candidates, sess)
+	}
+	s.mu.Unlock()
+
+	type sessionWithIP struct {
+		ip   net.IP
+		sess *Session
+	}
+	live := make([]sessionWithIP, 0, len(candidates))
+	for _, sess := range candidates {
+		if !sess.established.Load() || sess.closing() {
+			continue
+		}
+		// AssignedIP() allocates a defensive copy per call, so it is read
+		// exactly once per session here rather than inside the sort
+		// comparator below.
+		live = append(live, sessionWithIP{ip: sess.AssignedIP(), sess: sess})
+	}
+
+	slices.SortFunc(live, func(a, b sessionWithIP) int {
+		return bytes.Compare(a.ip, b.ip)
+	})
+
+	out := make([]*Session, len(live))
+	for i, sw := range live {
+		out[i] = sw.sess
+	}
+	return out
+}
+
+// Stats returns a point-in-time snapshot of this Server's session inventory
+// and handshake/dispatch counters. ActiveSessions is len(s.Sessions()); the
+// remaining fields are each read with one atomic Load(). See ServerStats's
+// own doc comment for what each field counts and the cross-field
+// consistency caveat.
+func (s *Server) Stats() ServerStats {
+	return ServerStats{
+		ActiveSessions:      len(s.Sessions()),
+		HandshakesStarted:   s.stats.handshakesStarted.Load(),
+		HandshakesCompleted: s.stats.handshakesCompleted.Load(),
+		HandshakesFailed:    s.stats.handshakesFailed.Load(),
+		HandshakesTimedOut:  s.stats.handshakesTimedOut.Load(),
+		AuthFailed:          s.stats.authFailed.Load(),
+		AssignIPRejected:    s.stats.assignIPRejected.Load(),
+		PoolExhausted:       s.stats.poolExhausted.Load(),
+		DatagramsRejected:   s.stats.datagramsRejected.Load(),
+	}
 }
 
 // allocateFromPool wraps s.pool.allocate(), incrementing poolExhausted on
@@ -2181,6 +2346,25 @@ func (s *Server) runRenegotiation(sess *Session, newConn *ctrlconn.Conn, keyID u
 	// renegotiation (D-16) — no routing-table write is needed here.
 }
 
+// recordHandshakeOutcome increments c exactly once for sess, via
+// sess.outcomeOnce — the latch that makes the four handshake-outcome
+// counters (HandshakesCompleted/Failed/TimedOut/AuthFailed) partition per
+// settled handshake rather than drift into four independently-incremented
+// counters. More than one call site can observe the same session's
+// teardown: a session torn down by enforceHandshakeWindow's timeout
+// goroutine will typically ALSO surface as a stage failure inside
+// runHandshake a moment later, on a different goroutine, once its control
+// channel closes under it — sess.outcomeOnce.Do is what keeps that from
+// being counted twice. The one deliberate gap: a handshake still in flight
+// when Server.Close runs records no outcome at all (Close tears sessions
+// down without ever routing through runHandshake's own return paths), so
+// Started can exceed Completed+Failed+TimedOut+AuthFailed only in that one
+// shutdown-race window — never during ordinary operation, where the
+// partition is exact.
+func (s *Server) recordHandshakeOutcome(sess *Session, c *atomic.Uint64) {
+	sess.outcomeOnce.Do(func() { c.Add(1) })
+}
+
 // enforceHandshakeWindow tears sess down and releases its state if the
 // handshake has not completed within reliable.HandshakeWindow (the
 // reference's --hand-window default, 60 seconds).
@@ -2189,6 +2373,7 @@ func (s *Server) enforceHandshakeWindow(sess *Session) {
 	case <-sess.doneCh:
 		return
 	case <-time.After(s.handshakeWindow):
+		s.recordHandshakeOutcome(sess, &s.stats.handshakesTimedOut)
 		sess.logger().Warn("handshake window expired", "window", s.handshakeWindow)
 		_ = sess.closeWithReason(CloseReasonUnknown)
 	}

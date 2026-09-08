@@ -243,6 +243,29 @@ type Session struct {
 	// first place.
 	published atomic.Bool
 
+	// established is set exactly once, in ovpn.go's runHandshake, right
+	// after the session's data channel goes live and its own final
+	// "session closed during bring-up" re-check has passed — the same
+	// point handshakesCompleted is incremented. It is NOT published: it is
+	// set unconditionally, regardless of whether Config.OnSession is nil,
+	// which is exactly why it — not published — is what Server.Sessions()/
+	// Server.Stats().ActiveSessions key on. published is only ever stored
+	// when Config.OnSession != nil (its own doc comment above), because its
+	// sole job is gating Config.OnSessionClosed; widening it to also gate
+	// Sessions()/Stats() would silently change that documented
+	// OnSessionClosed contract. A server running with no OnSession hook at
+	// all would otherwise report zero active sessions and zero completed
+	// handshakes despite tunnels genuinely being up — established exists
+	// so it does not.
+	established atomic.Bool
+
+	// outcomeOnce is the latch that makes Server's four handshake-outcome
+	// counters (HandshakesCompleted/Failed/TimedOut/AuthFailed) a
+	// partition rather than four independently-incremented counters: see
+	// Server.recordHandshakeOutcome's own doc comment for why more than
+	// one call site can observe the same session's teardown.
+	outcomeOnce sync.Once
+
 	// log is this session's per-session *slog.Logger, published exactly
 	// once by ovpn.go's performPushExchange (D-03), immediately after the
 	// atomic sess.mu.Unlock() that publishes assignedIP/peerID/primary and

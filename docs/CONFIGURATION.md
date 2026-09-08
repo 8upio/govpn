@@ -34,6 +34,7 @@ type Config struct {
     ReapWindow          time.Duration
     SessionInboundQueue int
     AuthUserPass        func(username, password string, cs tls.ConnectionState) error
+    AssignIP            func(peerCN string, cs tls.ConnectionState) (net.IP, error)
     Logger              *slog.Logger
 }
 ```
@@ -52,6 +53,7 @@ type Config struct {
 | `ReapWindow` | `time.Duration` | No | `60 * time.Second` — must be at least twice the resolved `PingInterval`, or `Serve` returns an error |
 | `SessionInboundQueue` | `int` | No | `32` |
 | `AuthUserPass` | `func(username, password string, cs tls.ConnectionState) error` | No, unless `TLSConfig.ClientAuth` does not mandate a client certificate — then `Serve` returns an error if nil | credentials are parsed off the wire and ignored |
+| `AssignIP` | `func(peerCN string, cs tls.ConnectionState) (net.IP, error)` | No | every session's tunnel IP comes from the dynamic pool |
 | `Logger` | `*slog.Logger` | No | no-op logger — the library emits nothing |
 
 ### `TLSConfig`
@@ -216,6 +218,102 @@ auth-user-pass /path/to/credentials-file
 
 where `credentials-file` contains the username on the first line and the
 password on the second, each newline-terminated.
+
+### `AssignIP`
+
+`func(peerCN string, cs tls.ConnectionState) (net.IP, error)` — chooses a
+client's tunnel IP instead of letting the dynamic pool pick the next free
+address. Consulted **exactly once per session, on the initial handshake
+only** (never on a renegotiation), immediately before the pool would
+otherwise allocate.
+
+`nil` (the zero value) means today's behaviour exactly: every session's
+tunnel IP comes from the dynamic pool, byte-for-byte the same PUSH_REPLY as
+before this field existed.
+
+Returning `(nil, nil)` falls back to the dynamic pool **for that one
+session only** — it does not disable the hook for any other session. A
+server can freely mix static and dynamic clients under a single hook.
+
+**Validation.** A non-nil returned address must satisfy every one of these,
+checked in order:
+
+1. **IPv4.** `ip.To4()` must succeed.
+2. **Inside `Config.Network`.** The address must fall within the pool's own
+   base/size arithmetic — the same arithmetic `Network` above is built
+   from, not a second, independently-computed `Network.Contains` check that
+   could disagree with it.
+3. **Not the network address** (`Network`'s own base, offset 0).
+4. **Not the server's own tunnel address** (`base + 1` — the address
+   `stack.New(...)`/your own netstack binds as the server's tunnel IP).
+5. **Not the broadcast address** (the network's last address).
+
+Any of those, a non-nil error from the hook, or a panic **fails the
+handshake before `PUSH_REPLY`** (fail closed): `Config.OnSession` never
+fires, and therefore `Config.OnSessionClosed` never fires either — same
+rule as any other pre-`PUSH_REPLY` handshake failure. The rejection is
+visible as one `Warn` log record (`"assign ip rejected"`, with a stable
+`reason` token — see the Logger section below) and as
+`Server.Stats().AssignIPRejected` (see [API.md](API.md#serverstats)). A
+panicking hook is recovered, routed to `Config.OnSessionPanic` exactly like
+a panicking `OnSession`/`AuthUserPass`, and treated as a rejection — its
+`(nil, non-nil error)` return shape can never be confused with the
+`(nil, nil)` pool-fallback.
+
+**Replace semantics.** If the returned address is currently held by
+another **live** session, that older session is evicted —
+`Session.Close`d with the new `CloseReasonReplaced` (its
+`Config.OnSessionClosed` DOES fire with that reason, since it was already
+published) — and the new session takes over the address. This mirrors the
+OpenVPN reference server's own *default* behaviour with no
+`--duplicate-cn` set (`multi.c: multi_delete_dup`): a second connection for
+an identity already on the server evicts the first rather than being
+refused.
+
+This exists for Voxio's own motivating case: a SIP registrar pins a desk
+phone's registration to its tunnel IP. A CGNAT link flap leaves the phone's
+old session alive on the server for up to a full idle-reap window
+(`Config.ReapWindow`) even after the phone itself has already reconnected
+with a new UDP 4-tuple. Refusing the new connection until that window
+expires would lock the phone out of its own registration for the whole
+window; evicting the stale session instead — exactly what the reference
+does without `--duplicate-cn` — lets the phone reclaim its address
+immediately.
+
+**Lock/ordering guarantee.** The hook is never called while the library
+holds a session lock or the server's own internal lock — the eviction call
+above happens with no lock held by the evicting goroutine at all (see
+`assignTunnelIP`'s own doc comment in `ovpn.go` for the full argument), so
+it can never deadlock against the evicted session's own concurrent
+teardown.
+
+**Concurrency and blocking**, same contract as `AuthUserPass`: the hook may
+be called concurrently from many sessions' own goroutines and must be safe
+for that, and must not block for long — it runs inside the session's
+handshake window, so a slow hook only starves that one session's budget
+(visible via `Server.Stats().HandshakesTimedOut`), never the whole server.
+
+A worked example mapping a verified CommonName to a fixed address, with a
+dynamic fallback for anyone else:
+
+```go
+staticIPs := map[string]net.IP{
+    "desk-phone-lobby.voxio":  net.IPv4(10, 8, 0, 50),
+    "desk-phone-reception.voxio": net.IPv4(10, 8, 0, 51),
+}
+
+cfg := ovpn.Config{
+    AssignIP: func(peerCN string, cs tls.ConnectionState) (net.IP, error) {
+        if ip, ok := staticIPs[peerCN]; ok {
+            return ip, nil
+        }
+        return nil, nil // fall back to the dynamic pool
+    },
+}
+```
+
+There is no client-side directive equivalent — address assignment is
+entirely server-side, exactly like the dynamic pool it extends.
 
 ### `TLSCryptKey`
 
@@ -447,10 +545,18 @@ opened`, `session established`, `session closed`, `session closed during
 bring-up`, `handshake failed`, `handshake window expired`, `tunnel ip pool
 exhausted`, `tls-crypt wrapper init failed`, `session id generation
 failed`, `auth rejected`, `auth accepted`, `auth failed sent to client`,
+`assign ip rejected`, `evicting session for replaced tunnel ip`,
 `callback panicked`, `renegotiation started`, `renegotiation refused`,
 `renegotiation completed`, `renegotiation failed`, `renegotiation
 abandoned`, `renegotiation window expired`, `session reaped`, `lame-duck
 key expired`, `keepalive ping failed`.
+
+`assign ip rejected` carries a `reason` token distinguishing which check
+failed: `not-ipv4`, `outside-network`, `reserved-address`, `in-use`,
+`pool-exhausted`, `hook-error`, or `unknown`. `callback panicked` carries
+`"callback": "AssignIP"` (alongside the existing `"OnSession"`,
+`"OnSessionClosed"`, and `"AuthUserPass"` values) when `Config.AssignIP`
+itself panicked.
 
 **Attribute vocabulary** (use `reason`/`stage` to distinguish *why*, never
 the message string): `addr`, `remote`, `session_id`, `client_session_id`,

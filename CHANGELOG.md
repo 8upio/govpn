@@ -37,6 +37,31 @@ version numbers below still increase monotonically with each release.
   the default level. Credentials, tls-crypt/data-channel key material, and
   packet payload bytes are never logged. See
   [docs/CONFIGURATION.md#logger](docs/CONFIGURATION.md#logger).
+- `Config.AssignIP` — chooses a client's tunnel IP instead of the default
+  dynamic pool. `nil` (the default) leaves every session's tunnel IP coming
+  from the dynamic pool, byte-for-byte unchanged. Returning `(nil, nil)`
+  falls back to the pool for that one session only. If the returned address
+  is currently held by another live session, that session is evicted with
+  the now-produced `CloseReasonReplaced` and the new session takes over the
+  address — mirroring the OpenVPN reference's own default no-`--duplicate-cn`
+  eviction behaviour, so a client reconnecting after a transient network
+  flap is never locked out by its own still-live prior session. See
+  [docs/CONFIGURATION.md#assignip](docs/CONFIGURATION.md#assignip).
+- `Server.Sessions()` / `Server.Stats()` / `ServerStats` — a point-in-time,
+  sorted-by-IP snapshot of established sessions, and eight counters
+  covering handshake outcomes (which partition per settled handshake),
+  `Config.AssignIP` rejections, pool exhaustion, and dispatch-level
+  datagram drops. See [docs/API.md#serverstats](docs/API.md#serverstats).
+- `(*netstack.Stack).IsAttached(ip)` / `Routes()` — the inventory
+  counterpart to `Stack.Stats()`'s counters: which IPs are attached right
+  now, as defensive copies sorted for deterministic output. See
+  [docs/NETSTACK.md](docs/NETSTACK.md#attaching-a-session).
+- `netstack/netstacktest` — an exported package of test helpers (frame
+  builders for IPv4/UDP/ICMP-echo/fragment, plus `FakeSession`) for
+  embedders driving a `netstack.Stack` from their own tests, with no
+  `testing` dependency. `netstack`'s own test suite now uses this package
+  exclusively — no private duplicate remains. See
+  [docs/NETSTACK.md#test-helpers-netstacktest](docs/NETSTACK.md#test-helpers-netstacktest).
 
 ### Changed
 
