@@ -1,7 +1,9 @@
 package netstack
 
 import (
+	"bytes"
 	"encoding/binary"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -152,5 +154,242 @@ func TestPseudoHeaderSumLayout(t *testing.T) {
 	want := uint32(0x1434)
 	if got != want {
 		t.Fatalf("pseudoHeaderSum(10.8.0.1, 10.8.0.2, 17, 16) = %#x, want %#x", got, want)
+	}
+}
+
+// TestParseIPv4FragmentFields asserts the three fragment fields parseIPv4
+// now populates on EVERY parse — a complete datagram reports id 0, MF
+// clear and offset 0 (and isFragment() false), a fragment reports the id
+// and MF it carries plus an offset scaled from the on-wire 8-byte units
+// into BYTES, which is the unit every call site in this package uses.
+func TestParseIPv4FragmentFields(t *testing.T) {
+	client := mustAddr(net.IPv4(10, 8, 0, 2).To4())
+	server := mustAddr(net.IPv4(10, 8, 0, 1).To4())
+
+	whole := buildIPv4(nil, client, server, protocolUDP, make([]byte, 16))
+	hdr, err := parseIPv4(whole)
+	if err != nil {
+		t.Fatalf("parseIPv4(whole datagram): %v", err)
+	}
+	if hdr.id != 0 || hdr.moreFragments || hdr.fragOffset != 0 {
+		t.Fatalf("whole datagram parsed as id=%d mf=%v off=%d, want 0/false/0", hdr.id, hdr.moreFragments, hdr.fragOffset)
+	}
+	if hdr.isFragment() {
+		t.Fatal("isFragment() = true for a complete datagram")
+	}
+
+	// On the wire the offset field holds 1480/8 = 185; parseIPv4 must
+	// report it back in bytes.
+	frag := buildFragmentForTest(client, server, protocolUDP, 0xBEEF, 1480, true, make([]byte, 16))
+	hdr, err = parseIPv4(frag)
+	if err != nil {
+		t.Fatalf("parseIPv4(fragment): %v", err)
+	}
+	if hdr.id != 0xBEEF {
+		t.Errorf("id = %#04x, want 0xBEEF", hdr.id)
+	}
+	if !hdr.moreFragments {
+		t.Error("moreFragments = false, want true")
+	}
+	if hdr.fragOffset != 1480 {
+		t.Errorf("fragOffset = %d, want 1480 (bytes, not 8-byte units)", hdr.fragOffset)
+	}
+	if !hdr.isFragment() {
+		t.Error("isFragment() = false for a fragment")
+	}
+
+	// A final fragment (MF clear, non-zero offset) is still a fragment.
+	last := buildFragmentForTest(client, server, protocolUDP, 0xBEEF, 2960, false, make([]byte, 5))
+	hdr, err = parseIPv4(last)
+	if err != nil {
+		t.Fatalf("parseIPv4(final fragment): %v", err)
+	}
+	if hdr.moreFragments || !hdr.isFragment() || hdr.fragOffset != 2960 {
+		t.Fatalf("final fragment parsed as mf=%v off=%d isFragment=%v, want false/2960/true", hdr.moreFragments, hdr.fragOffset, hdr.isFragment())
+	}
+}
+
+// TestParseIPv4RejectsBadFragmentGeometry asserts the three geometry rules
+// parseIPv4 enforces before any fragment is ever buffered (RFC 791 §3.2):
+// a fragment carries data, a non-final fragment's data length is a
+// multiple of 8, and no fragment claims bytes past the 65535 a Total
+// Length field can address.
+func TestParseIPv4RejectsBadFragmentGeometry(t *testing.T) {
+	client := mustAddr(net.IPv4(10, 8, 0, 2).To4())
+	server := mustAddr(net.IPv4(10, 8, 0, 1).To4())
+
+	tests := []struct {
+		name        string
+		offsetBytes int
+		mf          bool
+		payloadLen  int
+	}{
+		// 65528 + 20 = 65548, past the largest datagram RFC 791's
+		// 16-bit Total Length field can express.
+		{"offset plus length past 65535", 65528, false, 20},
+		{"MF set with a payload length not a multiple of 8", 0, true, 13},
+		{"MF set with an empty payload", 0, true, 0},
+		{"non-zero offset with an empty payload", 1480, false, 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pkt := buildFragmentForTest(client, server, protocolUDP, 1, tt.offsetBytes, tt.mf, make([]byte, tt.payloadLen))
+			if _, err := parseIPv4(pkt); !errors.Is(err, errBadFragment) {
+				t.Fatalf("parseIPv4 = %v, want errBadFragment", err)
+			}
+		})
+	}
+}
+
+// TestParseIPv4FragmentWordsNeverPanic sweeps the identification and
+// flags/fragment-offset words parseIPv4 now reads — including the maximum
+// expressible offset — through the same never-panic discipline the rest of
+// the header already gets (T-03-02). Unlike mustNotPanicParse, a parse here
+// may legitimately SUCCEED (a valid fragment is no longer an error); only a
+// panic fails the test.
+func TestParseIPv4FragmentWordsNeverPanic(t *testing.T) {
+	client := mustAddr(net.IPv4(10, 8, 0, 2).To4())
+	server := mustAddr(net.IPv4(10, 8, 0, 1).To4())
+	valid := buildIPv4(nil, client, server, protocolUDP, make([]byte, 24))
+
+	for _, word := range []uint16{
+		0x0000,
+		flagMoreFragments,
+		flagDontFragment,
+		fragOffsetMask,                     // the maximum offset, 8191*8 = 65528
+		flagMoreFragments | fragOffsetMask, // MF at the maximum offset
+		0xFFFF,                             // every flag bit plus the maximum offset
+		1, 2, 5, 185,
+	} {
+		for _, id := range []uint16{0, 1, 0xFFFF} {
+			pkt := append([]byte(nil), valid...)
+			binary.BigEndian.PutUint16(pkt[4:6], id)
+			binary.BigEndian.PutUint16(pkt[6:8], word)
+			mustNotPanicParseAny(t, pkt)
+
+			// The same mutations on a truncated buffer, where a missing
+			// length check would index out of range.
+			for _, n := range []int{20, 21, 27, 33} {
+				short := append([]byte(nil), pkt[:n]...)
+				mustNotPanicParseAny(t, short)
+			}
+		}
+	}
+}
+
+func mustNotPanicParseAny(t *testing.T, pkt []byte) {
+	t.Helper()
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("parseIPv4 panicked on %d-byte input %x: %v", len(pkt), pkt, r)
+		}
+	}()
+	_, _ = parseIPv4(pkt)
+}
+
+// TestFragmentIPv4 asserts fragmentIPv4 produces RFC-791-conformant
+// fragments of a 4000-byte datagram at a 1500-byte MTU — three fragments
+// at offsets 0/1480/2960, MF set on all but the last, one shared
+// identification, none larger than the MTU, every non-final payload a
+// multiple of 8, and every header checksum self-consistent — and then
+// closes the loop by feeding all three back through a reassembler and
+// recovering the original payload byte-for-byte.
+func TestFragmentIPv4(t *testing.T) {
+	server := mustAddr(net.IPv4(10, 8, 0, 1).To4())
+	client := mustAddr(net.IPv4(10, 8, 0, 2).To4())
+
+	payload := make([]byte, 4000-minIPv4HeaderLen)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	pkt := buildIPv4(nil, server, client, protocolUDP, payload)
+	if len(pkt) != 4000 {
+		t.Fatalf("test fixture is %d bytes, want 4000", len(pkt))
+	}
+	hdr, err := parseIPv4(pkt)
+	if err != nil {
+		t.Fatalf("parseIPv4(fixture): %v", err)
+	}
+
+	const mtu = 1500
+	frags := fragmentIPv4(hdr, pkt, mtu, 0x1234)
+	if len(frags) != 3 {
+		t.Fatalf("fragmentIPv4 produced %d fragments, want 3", len(frags))
+	}
+
+	wantOffsets := []int{0, 1480, 2960}
+	wantMF := []bool{true, true, false}
+	for i, frag := range frags {
+		if len(frag) > mtu {
+			t.Errorf("fragment %d is %d bytes, larger than the %d MTU", i, len(frag), mtu)
+		}
+		fh, err := parseIPv4(frag)
+		if err != nil {
+			t.Fatalf("parseIPv4(fragment %d): %v", i, err)
+		}
+		if fh.fragOffset != wantOffsets[i] {
+			t.Errorf("fragment %d offset = %d, want %d", i, fh.fragOffset, wantOffsets[i])
+		}
+		if fh.moreFragments != wantMF[i] {
+			t.Errorf("fragment %d MF = %v, want %v", i, fh.moreFragments, wantMF[i])
+		}
+		if fh.id != 0x1234 {
+			t.Errorf("fragment %d id = %#04x, want 0x1234 (all fragments share one identification)", i, fh.id)
+		}
+		if fh.totalLen != len(frag) {
+			t.Errorf("fragment %d Total Length = %d, want %d", i, fh.totalLen, len(frag))
+		}
+		if cs := internetChecksum(frag[:fh.ihl]); cs != 0 {
+			t.Errorf("fragment %d header checksum does not fold to zero (got %#04x)", i, cs)
+		}
+		if data := fh.totalLen - fh.ihl; wantMF[i] && data%8 != 0 {
+			t.Errorf("non-final fragment %d carries %d payload bytes, not a multiple of 8", i, data)
+		}
+	}
+
+	// Round trip: the fragments this stack emits must be exactly the
+	// fragments its own reassembler accepts.
+	var r reassembler
+	now := time.Unix(0, 0)
+	var got []byte
+	for i, frag := range frags {
+		fh, err := parseIPv4(frag)
+		if err != nil {
+			t.Fatalf("parseIPv4(fragment %d): %v", i, err)
+		}
+		datagram, out, _ := r.add(now, fh, frag)
+		if i < len(frags)-1 {
+			if out != reasmBuffered {
+				t.Fatalf("fragment %d outcome = %v, want reasmBuffered", i, out)
+			}
+			continue
+		}
+		if out != reasmComplete {
+			t.Fatalf("final fragment outcome = %v, want reasmComplete", out)
+		}
+		got = datagram
+	}
+	gotHdr, err := parseIPv4(got)
+	if err != nil {
+		t.Fatalf("parseIPv4(round-tripped datagram): %v", err)
+	}
+	if gotHdr.isFragment() {
+		t.Error("round-tripped datagram still parses as a fragment")
+	}
+	if gotHdr.totalLen != len(pkt) {
+		t.Errorf("round-tripped Total Length = %d, want %d", gotHdr.totalLen, len(pkt))
+	}
+	if gotHdr.src != server || gotHdr.dst != client || gotHdr.protocol != protocolUDP {
+		t.Errorf("round-tripped addressing = %v -> %v proto %d, want %v -> %v proto %d", gotHdr.src, gotHdr.dst, gotHdr.protocol, server, client, protocolUDP)
+	}
+	if cs := internetChecksum(got[:gotHdr.ihl]); cs != 0 {
+		t.Errorf("round-tripped header checksum does not fold to zero (got %#04x)", cs)
+	}
+	// The identification deliberately survives reassembly (it is the
+	// fragments' own, not the original's 0) — the PAYLOAD is what must
+	// come back untouched.
+	if !bytes.Equal(got[gotHdr.payloadOff:gotHdr.totalLen], payload) {
+		t.Fatal("round-tripped payload is not byte-identical to the original")
 	}
 }

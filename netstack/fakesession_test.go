@@ -190,3 +190,27 @@ func buildICMPEchoRequest(src, dst netip.Addr, id, seq uint16, payload []byte) [
 
 	return buildIPv4(nil, src, dst, protocolICMP, icmp)
 }
+
+// buildFragmentForTest builds one IPv4 fragment carrying payload: a normal
+// packet from buildIPv4, with the Identification field set to id, the
+// flags/fragment-offset word set from offsetBytes (in BYTES — divided by 8
+// here so no test ever has to do that arithmetic itself) and mf, and the
+// header checksum recomputed over the patched header. Every fragment test
+// in this package builds its fragments through this one helper, so a test
+// reads as intent (which datagram, which offset, more-to-come or not)
+// rather than as hand-assembled byte arithmetic.
+func buildFragmentForTest(src, dst netip.Addr, proto uint8, id uint16, offsetBytes int, mf bool, payload []byte) []byte {
+	pkt := buildIPv4(nil, src, dst, proto, payload)
+
+	binary.BigEndian.PutUint16(pkt[4:6], id)
+
+	flagsFragOffset := uint16(offsetBytes / 8)
+	if mf {
+		flagsFragOffset |= flagMoreFragments
+	}
+	binary.BigEndian.PutUint16(pkt[6:8], flagsFragOffset)
+
+	pkt[10], pkt[11] = 0, 0
+	binary.BigEndian.PutUint16(pkt[10:12], internetChecksum(pkt[:minIPv4HeaderLen]))
+	return pkt
+}

@@ -424,11 +424,7 @@ func (s *Stack) deliver(a *attachment, pkt []byte) {
 
 	hdr, err := parseIPv4(pkt)
 	if err != nil {
-		if errors.Is(err, errFragmented) {
-			s.stats.fragmentsDropped.Add(1)
-		} else {
-			s.stats.malformedDropped.Add(1)
-		}
+		s.stats.malformedDropped.Add(1)
 		return
 	}
 
@@ -438,6 +434,11 @@ func (s *Stack) deliver(a *attachment, pkt []byte) {
 	}
 	if hdr.dst != s.serverIP {
 		s.stats.wrongDestinationDropped.Add(1)
+		return
+	}
+
+	if hdr.isFragment() {
+		s.stats.fragmentsDropped.Add(1)
 		return
 	}
 

@@ -50,6 +50,19 @@ const (
 	// fragOffsetMask isolates the 13-bit Fragment Offset from the
 	// combined Flags+Fragment-Offset word (RFC 791 §3.1).
 	fragOffsetMask = 0x1FFF
+
+	// flagDontFragment is the DF bit of the same 3-bit Flags field,
+	// sharing the 16-bit word with MF and the 13-bit Fragment Offset
+	// (RFC 791 §3.1). This stack never sets it on a packet it builds:
+	// writePacket fragments anything larger than the configured MTU
+	// itself rather than asking a peer to shrink, and it generates no
+	// ICMP fragmentation-needed error either.
+	flagDontFragment = 0x4000
+
+	// maxIPv4Datagram is the largest datagram RFC 791 §3.1's 16-bit
+	// Total Length field can express, and therefore the largest
+	// reassembled datagram this stack can ever produce.
+	maxIPv4Datagram = 65535
 )
 
 // Sentinel parse errors, in the style of internal/wire's own ErrTooShort
@@ -59,7 +72,7 @@ var (
 	errNotIPv4        = errors.New("netstack: version nibble is not 4")
 	errBadIHL         = errors.New("netstack: IHL is out of range for this buffer")
 	errBadTotalLength = errors.New("netstack: total length field is out of range for this buffer")
-	errFragmented     = errors.New("netstack: fragmented IPv4 packet (MF set or non-zero fragment offset)")
+	errBadFragment    = errors.New("netstack: IPv4 fragment geometry is invalid")
 )
 
 // ipv4Header is a parsed IPv4 header: the fields deliver and writePacket
@@ -72,7 +85,26 @@ type ipv4Header struct {
 	src        netip.Addr
 	dst        netip.Addr
 	payloadOff int
+
+	// id is RFC 791 §3.1's 16-bit Identification field: together with
+	// (src, dst, protocol) it names the datagram a fragment belongs to.
+	id uint16
+
+	// moreFragments is the MF bit: more fragments of this datagram
+	// follow (RFC 791 §3.1).
+	moreFragments bool
+
+	// fragOffset is this fragment's offset within its datagram in
+	// BYTES — the on-wire 13-bit field value multiplied by 8, since RFC
+	// 791 §3.1 counts the offset in 8-byte units. Scaling here, once,
+	// means no call site ever has to remember to do it.
+	fragOffset int
 }
+
+// isFragment reports whether h describes a fragment of a larger datagram:
+// either more fragments follow it, or it is not the first one (RFC 791
+// §3.1 — a complete datagram carries MF clear AND a zero offset).
+func (h ipv4Header) isFragment() bool { return h.moreFragments || h.fragOffset != 0 }
 
 // parseIPv4 parses pkt's IPv4 header. Validation proceeds in this exact
 // order, each step strictly before the next dereference it depends on, so
@@ -84,9 +116,16 @@ type ipv4Header struct {
 //  3. ihl := (IHL nibble)*4, with minIPv4HeaderLen <= ihl <= len(pkt)
 //  4. totalLen := the 16-bit Total Length field, with ihl <= totalLen <=
 //     len(pkt)
-//  5. the fragment check: MF set or a non-zero Fragment Offset ->
-//     errFragmented (RESEARCH.md Anti-Patterns: fragments are dropped
-//     silently, with no reassembly attempt — reassembly is out of scope)
+//  5. the fragment fields — Identification, MF and the byte-scaled
+//     Fragment Offset — are read and, if and only if the packet IS a
+//     fragment, its geometry is validated: a non-empty payload, a
+//     payload length that is a multiple of 8 whenever MF is set (RFC 791
+//     §3.2 requires every non-final fragment's data length to be an
+//     8-byte multiple, since the offset field counts in 8-byte units),
+//     and fragOffset+payloadLen no greater than maxIPv4Datagram.
+//     Anything else is errBadFragment. Because writePacket re-parses
+//     every packet it is about to send, this same check also guarantees
+//     this stack can never EMIT a geometrically invalid fragment.
 //
 // IP options are skipped past, not rejected (RESEARCH.md Anti-Patterns,
 // Assumption A3): payloadOff is set to ihl, correctly computed, so an
@@ -117,9 +156,22 @@ func parseIPv4(pkt []byte) (ipv4Header, error) {
 		return ipv4Header{}, errBadTotalLength
 	}
 
+	id := binary.BigEndian.Uint16(pkt[4:6])
 	flagsFragOffset := binary.BigEndian.Uint16(pkt[6:8])
-	if flagsFragOffset&flagMoreFragments != 0 || flagsFragOffset&fragOffsetMask != 0 {
-		return ipv4Header{}, errFragmented
+	moreFragments := flagsFragOffset&flagMoreFragments != 0
+	fragOffset := int(flagsFragOffset&fragOffsetMask) * 8
+
+	if moreFragments || fragOffset != 0 {
+		payloadLen := totalLen - ihl
+		if payloadLen == 0 {
+			return ipv4Header{}, errBadFragment
+		}
+		if moreFragments && payloadLen%8 != 0 {
+			return ipv4Header{}, errBadFragment
+		}
+		if fragOffset+payloadLen > maxIPv4Datagram {
+			return ipv4Header{}, errBadFragment
+		}
 	}
 
 	protocol := pkt[9]
@@ -127,20 +179,26 @@ func parseIPv4(pkt []byte) (ipv4Header, error) {
 	dst := netip.AddrFrom4([4]byte(pkt[16:20]))
 
 	return ipv4Header{
-		ihl:        ihl,
-		totalLen:   totalLen,
-		protocol:   protocol,
-		src:        src,
-		dst:        dst,
-		payloadOff: ihl,
+		ihl:           ihl,
+		totalLen:      totalLen,
+		protocol:      protocol,
+		src:           src,
+		dst:           dst,
+		payloadOff:    ihl,
+		id:            id,
+		moreFragments: moreFragments,
+		fragOffset:    fragOffset,
 	}, nil
 }
 
 // buildIPv4 appends a 20-byte, options-free IPv4 header (IHL 5, DSCP/ECN
 // 0, identification 0, flags/fragment-offset 0, TTL defaultTTL) followed by
-// payload to dst, and returns the result. Emitting identification 0 with DF
-// clear is correct here because this stack never fragments outbound
-// packets and never relies on reassembly identity.
+// payload to dst, and returns the result. Emitting identification 0 with a
+// zero flags/fragment-offset word is correct here because RFC 6864 §4 only
+// requires the Identification field to be unique per (source, destination,
+// protocol) within one reassembly window, and an unfragmented datagram is
+// never reassembled: an identification is assigned only when writePacket
+// actually fragments (see fragmentIPv4), and only to the fragments it emits.
 func buildIPv4(dst []byte, src, dstAddr netip.Addr, protocol uint8, payload []byte) []byte {
 	totalLen := minIPv4HeaderLen + len(payload)
 
@@ -166,6 +224,64 @@ func buildIPv4(dst []byte, src, dstAddr netip.Addr, protocol uint8, payload []by
 
 	dst = append(dst, payload...)
 	return dst
+}
+
+// fragmentIPv4 splits an already-parsed, already-valid datagram into
+// RFC 791 §3.2 fragments no larger than mtu, all carrying identification
+// id, and returns them in ascending-offset order. Each fragment is a
+// freshly allocated slice: callers hand these straight to Session.Write,
+// so none of them may alias pkt or each other.
+//
+// The input's own header checksum is irrelevant here — every fragment's
+// header is rewritten (Total Length, Identification, flags/offset) and
+// gets a freshly computed checksum of its own.
+//
+// The full hdr.ihl header bytes are copied rather than a hardcoded 20, so
+// IP options (which this stack never generates, but may one day) ride along
+// on every fragment instead of being silently truncated away.
+func fragmentIPv4(hdr ipv4Header, pkt []byte, mtu int, id uint16) [][]byte {
+	// The largest payload chunk that still fits the MTU, rounded DOWN to
+	// a multiple of 8 so every non-final fragment's data length is
+	// 8-aligned as RFC 791 §3.2 requires (the Fragment Offset field
+	// counts in 8-byte units, so a non-final fragment of any other length
+	// could not be addressed at all).
+	maxData := (mtu - hdr.ihl) &^ 7
+	if maxData <= 0 {
+		// Unreachable given minMTU (576) and maxIPv4HeaderLen (60): the
+		// worst case is 576-60 = 516, floored to 512. Defensive only —
+		// returning nil rather than looping forever or panicking.
+		return nil
+	}
+
+	payload := pkt[hdr.payloadOff:hdr.totalLen]
+
+	var frags [][]byte
+	for off := 0; off < len(payload); off += maxData {
+		end := off + maxData
+		if end > len(payload) {
+			end = len(payload)
+		}
+		chunk := payload[off:end]
+
+		frag := make([]byte, hdr.ihl+len(chunk))
+		copy(frag, pkt[:hdr.ihl])
+		copy(frag[hdr.ihl:], chunk)
+
+		binary.BigEndian.PutUint16(frag[2:4], uint16(hdr.ihl+len(chunk)))
+		binary.BigEndian.PutUint16(frag[4:6], id)
+
+		flagsFragOffset := uint16(off / 8)
+		if end < len(payload) {
+			flagsFragOffset |= flagMoreFragments
+		}
+		binary.BigEndian.PutUint16(frag[6:8], flagsFragOffset)
+
+		frag[10], frag[11] = 0, 0
+		binary.BigEndian.PutUint16(frag[10:12], internetChecksum(frag[:hdr.ihl]))
+
+		frags = append(frags, frag)
+	}
+	return frags
 }
 
 // internetChecksum computes the RFC 1071 Internet checksum over b: the
