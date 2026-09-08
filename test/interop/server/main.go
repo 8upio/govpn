@@ -29,6 +29,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"math/rand"
 	"net"
 	"net/http"
@@ -105,6 +106,20 @@ func newHardenedHTTPServer(handler http.Handler) *http.Server {
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
+}
+
+// interopLogger builds this harness's own ovpn.Config.Logger (quick
+// 260908-na1): plain text to stderr at Info by default, or Debug when
+// GOVPN_DEBUG=1 is set in the environment. Debug is per-packet — every
+// datagram the library's dispatch drops — so it is only useful when a
+// specific scenario is actually being debugged, never left on by default
+// (it would otherwise mix into every scenario's own log.Printf output).
+func interopLogger() *slog.Logger {
+	level := slog.LevelInfo
+	if os.Getenv("GOVPN_DEBUG") == "1" {
+		level = slog.LevelDebug
+	}
+	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 }
 
 func main() {
@@ -278,6 +293,7 @@ func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorder
 		// given — required by ovpn.Server.Serve's own D-07 guard whenever
 		// -no-client-cert leaves ClientAuth below RequireAnyClientCert.
 		AuthUserPass: authUserPassHook,
+		Logger:       interopLogger(),
 		OnSession: func(sess *ovpn.Session) {
 			// D-02: the embedder attaches; nothing in ovpn.Config knows
 			// the netstack exists. AssignedIP() is guaranteed non-nil
@@ -683,6 +699,7 @@ func runSoak(pkiDir, listenAddr string, deadline time.Duration, httpPort, udpPor
 		TLSCryptKey: tlsCryptKey,
 		Network:     tunnelNetwork,
 		Cipher:      "AES-256-GCM",
+		Logger:      interopLogger(),
 		OnSession: func(sess *ovpn.Session) {
 			cycleNum := tracker.opened()
 			log.Printf("soak cycle %d/%d: session established assigned_ip=%s peer_id=%d", cycleNum, cycles, sess.AssignedIP(), sess.PeerID())

@@ -34,6 +34,7 @@ type Config struct {
     ReapWindow          time.Duration
     SessionInboundQueue int
     AuthUserPass        func(username, password string, cs tls.ConnectionState) error
+    Logger              *slog.Logger
 }
 ```
 
@@ -51,6 +52,7 @@ type Config struct {
 | `ReapWindow` | `time.Duration` | No | `60 * time.Second` — must be at least twice the resolved `PingInterval`, or `Serve` returns an error |
 | `SessionInboundQueue` | `int` | No | `32` |
 | `AuthUserPass` | `func(username, password string, cs tls.ConnectionState) error` | No, unless `TLSConfig.ClientAuth` does not mandate a client certificate — then `Serve` returns an error if nil | credentials are parsed off the wire and ignored |
+| `Logger` | `*slog.Logger` | No | no-op logger — the library emits nothing |
 
 ### `TLSConfig`
 
@@ -413,6 +415,58 @@ embedder (e.g. RTP/SIP media) that can occasionally fall behind `Read`.
 ```go
 cfg := ovpn.Config{SessionInboundQueue: 256}
 ```
+
+### Logger
+
+An optional `*slog.Logger` (standard library `log/slog`) that receives
+structured records for handshake progress and failure, session lifecycle,
+authentication decisions, renegotiation, and — at `Debug` — every datagram
+the dispatch silently drops today. `nil` (the default) is a no-op logger:
+nothing is emitted and nothing is allocated for it — resolved once into a
+discard handler whose `Enabled()` reports `false` for every level, so an
+unconfigured `Logger` costs exactly what today's silence costs.
+
+```go
+cfg := ovpn.Config{
+    Logger: slog.New(slog.NewTextHandler(os.Stderr, nil)),
+}
+```
+
+| Level | What it carries | Volume |
+|---|---|---|
+| Info | server listening/closing, session established/closed (with `reason`), renegotiation started/completed, auth rejected | one record per lifecycle event |
+| Warn | handshake failures, handshake/renegotiation window timeouts, idle reaps, tunnel-IP pool exhaustion, recovered callback panics | rare; each one is worth investigating |
+| Debug | every dropped datagram (`reason` token), renegotiation refusals, keepalive failures | **per packet** — an unauthenticated peer can drive this without limit; never enable it as a default in production |
+
+**Message strings** (the closed set — lowercase, no punctuation, stable
+across releases; grep for these rather than matching on attribute values):
+
+`server listening`, `server closing`, `read loop stopped`, `datagram
+dropped`, `control packet dropped`, `data packet dropped`, `control channel
+opened`, `session established`, `session closed`, `session closed during
+bring-up`, `handshake failed`, `handshake window expired`, `tunnel ip pool
+exhausted`, `tls-crypt wrapper init failed`, `session id generation
+failed`, `auth rejected`, `auth accepted`, `auth failed sent to client`,
+`callback panicked`, `renegotiation started`, `renegotiation refused`,
+`renegotiation completed`, `renegotiation failed`, `renegotiation
+abandoned`, `renegotiation window expired`, `session reaped`, `lame-duck
+key expired`, `keepalive ping failed`.
+
+**Attribute vocabulary** (use `reason`/`stage` to distinguish *why*, never
+the message string): `addr`, `remote`, `session_id`, `client_session_id`,
+`peer_cn`, `peer_id`, `ip`, `key_id`, `opcode`, `reason`, `stage`, `err`,
+`username`, `bytes`, `network`, `cipher`, `ping`, `reap`, `reneg_sec`,
+`window`, `idle`, `duration`, `sessions`, `dropped`, `callback`, `panic`,
+`initiator`, `renegotiations`, `has_client_reason`, `published`,
+`auth_user_pass`. Session IDs are rendered as hex.
+
+**Never logged, ever:** passwords, the `TLSCryptKey` bytes, derived
+data-channel key material, packet payload bytes, or panic stack traces (a
+recovered callback panic's stack still goes to `Config.OnSessionPanic`; the
+log line carries only the recovered value's string form). Only the
+*username* half of a rejected credential pair is ever logged — an
+over-long credential field is never logged at all, since the over-long
+field may itself be the username.
 
 ## What is not configurable
 

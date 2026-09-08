@@ -27,6 +27,16 @@ version numbers below still increase monotonically with each release.
   OpenVPN client's `auth-user-pass` directive with no `cert`/`key`. Proven
   against a real, unmodified OpenVPN 2.6 client via the new
   `auth-user-pass` interop scenario.
+- `Config.Logger *slog.Logger` — optional structured (`log/slog`) logging
+  for handshake progress and failure, session lifecycle, authentication
+  decisions, renegotiation, and every datagram the dispatch silently drops.
+  `nil` (the default) is bit-for-bit today's previous silent behaviour: no
+  output, no allocation. Every per-datagram drop is logged at Debug, never
+  Info — an unauthenticated peer can trigger these without limit, so this
+  keeps a forged-datagram flood from becoming a log-volume amplifier at
+  the default level. Credentials, tls-crypt/data-channel key material, and
+  packet payload bytes are never logged. See
+  [docs/CONFIGURATION.md#logger](docs/CONFIGURATION.md#logger).
 
 ### Changed
 

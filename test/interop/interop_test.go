@@ -1116,7 +1116,17 @@ func assertServerStaysUnprivileged(t *testing.T, res scenarioResult) {
 // modeled directly on the pre-existing udpRxTxRe/pingRxTxRe parsers above —
 // a new PASS-line field needs a new regexp+assertion pair here, not a
 // change to any existing one.
-var renegotiationsRe = regexp.MustCompile(`renegotiations=(\d+)`)
+//
+// Anchored on the immediately preceding http_requests= field (mirroring
+// udpRxTxRe/pingRxTxRe's own multi-field anchoring above), not a bare
+// `renegotiations=(\d+)`: quick 260908-na1's own Config.Logger emits a
+// "renegotiation completed" record whose renegotiations attr (D-04's
+// mandated key — the plan's log_sites table, not a name this test file
+// controls) ALSO matches a bare renegotiations= pattern, and since
+// FindStringSubmatch returns the FIRST match in the composed log, an
+// unanchored regexp would capture that earlier, smaller mid-run value
+// instead of the PASS line's final count.
+var renegotiationsRe = regexp.MustCompile(`http_requests=\d+ renegotiations=(\d+)`)
 
 // assertRenegotiation is 04-03-PLAN.md Task 1/2's rollover proof: the
 // server's PASS line must report at least wantMin completed soft-reset

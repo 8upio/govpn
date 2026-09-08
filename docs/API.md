@@ -65,6 +65,7 @@ type Config struct {
     ReapWindow          time.Duration
     SessionInboundQueue int
     AuthUserPass        func(username, password string, cs tls.ConnectionState) error
+    Logger              *slog.Logger
 }
 ```
 
@@ -101,6 +102,11 @@ fields most relevant to the API surface on this page:
   certificate — see [CONFIGURATION.md](CONFIGURATION.md#authuserpass) for the
   full validation order, panic-recovery contract, and the certificate-less
   operation pattern.
+- **`Logger *slog.Logger`** — optional structured logging for handshake
+  progress and failure, session lifecycle, authentication decisions,
+  renegotiation, and per-datagram drops. `nil` (the default) costs nothing.
+  See [CONFIGURATION.md#logger](CONFIGURATION.md#logger) for the level
+  table, the closed set of message strings, and the attribute vocabulary.
 
 ## `ovpn.AuthClientReason`
 

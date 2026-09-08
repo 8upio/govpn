@@ -23,6 +23,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -34,6 +35,17 @@ import (
 	"github.com/8upio/govpn/examples/tunnelweb/site"
 	"github.com/8upio/govpn/netstack"
 )
+
+// tunnelwebLogger builds this example's own ovpn.Config.Logger (quick
+// 260908-na1): plain text to stderr at Info by default, or Debug (every
+// dropped datagram) when GOVPN_DEBUG=1 is set in the environment.
+func tunnelwebLogger() *slog.Logger {
+	level := slog.LevelInfo
+	if os.Getenv("GOVPN_DEBUG") == "1" {
+		level = slog.LevelDebug
+	}
+	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+}
 
 func main() {
 	pkiDir := flag.String("pki", "", "directory containing ca.crt, server.crt, server.key, tls-crypt.key (generate one with: go run ./cmd/gentestpki -out <dir> -profile small)")
@@ -115,6 +127,11 @@ func run(pkiDir, listenAddr, networkCIDR string, httpPort uint16) error {
 		TLSCryptKey: tlsCryptKey,
 		Network:     tunnelNetwork,
 		Cipher:      "AES-256-GCM",
+		// Logger is all an embedder has to set to get library-level logs —
+		// handshake progress, session lifecycle, and every dropped
+		// datagram — alongside this example's own log.Printf output
+		// (quick 260908-na1).
+		Logger: tunnelwebLogger(),
 		OnSession: func(sess *ovpn.Session) {
 			// D-02: the embedder attaches; nothing in ovpn.Config knows
 			// the netstack exists.

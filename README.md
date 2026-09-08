@@ -45,6 +45,7 @@ srv := ovpn.NewServer(ovpn.Config{
     Cipher:      "AES-256-GCM",
     // AuthUserPass: myAuthHook, // optional: authenticate by username/password
     //                           // instead of (or in addition to) a client cert
+    Logger: slog.New(slog.NewTextHandler(os.Stderr, nil)), // optional: nil is silent
     OnSession: func(sess *ovpn.Session) {
         // sess is an io.ReadWriteCloser of raw, decrypted IP packets.
         // sess.AssignedIP() and sess.PeerID() are already populated here.
