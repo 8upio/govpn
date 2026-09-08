@@ -287,3 +287,137 @@ func TestNewIPPoolRejectsNilNetwork(t *testing.T) {
 		t.Fatal("newIPPool accepted a nil network, want an error")
 	}
 }
+
+func TestPoolReserveRejectsNonIPv4(t *testing.T) {
+	network := mustParseCIDR(t, "10.8.0.0/24")
+	pool, err := newIPPool(network)
+	if err != nil {
+		t.Fatalf("newIPPool: %v", err)
+	}
+
+	if _, err := pool.reserve(net.ParseIP("2001:db8::1")); !errors.Is(err, errAssignIPNotIPv4) {
+		t.Errorf("reserve(IPv6) error = %v, want errAssignIPNotIPv4", err)
+	}
+}
+
+func TestPoolReserveRejectsOutsideNetwork(t *testing.T) {
+	network := mustParseCIDR(t, "10.8.0.0/24")
+	pool, err := newIPPool(network)
+	if err != nil {
+		t.Fatalf("newIPPool: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		ip   net.IP
+	}{
+		{"below base", net.IPv4(10, 7, 255, 255).To4()},
+		{"above size", net.IPv4(10, 9, 0, 0).To4()},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := pool.reserve(c.ip); !errors.Is(err, errAssignIPOutsideNetwork) {
+				t.Errorf("reserve(%s) error = %v, want errAssignIPOutsideNetwork", c.ip, err)
+			}
+		})
+	}
+}
+
+func TestPoolReserveRejectsNetworkServerBroadcast(t *testing.T) {
+	network := mustParseCIDR(t, "10.8.0.0/24")
+	pool, err := newIPPool(network)
+	if err != nil {
+		t.Fatalf("newIPPool: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		ip   net.IP
+	}{
+		{"network address", net.IPv4(10, 8, 0, 0).To4()},
+		{"server address", net.IPv4(10, 8, 0, 1).To4()},
+		{"broadcast address", net.IPv4(10, 8, 0, 255).To4()},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := pool.reserve(c.ip); !errors.Is(err, errAssignIPReserved) {
+				t.Errorf("reserve(%s) error = %v, want errAssignIPReserved", c.ip, err)
+			}
+		})
+	}
+}
+
+func TestPoolReserveRejectsInUse(t *testing.T) {
+	network := mustParseCIDR(t, "10.8.0.0/24")
+	pool, err := newIPPool(network)
+	if err != nil {
+		t.Fatalf("newIPPool: %v", err)
+	}
+
+	want := net.IPv4(10, 8, 0, 42).To4()
+	if _, err := pool.reserve(want); err != nil {
+		t.Fatalf("first reserve(%s): %v", want, err)
+	}
+	if _, err := pool.reserve(want); !errors.Is(err, errAssignIPInUse) {
+		t.Errorf("second reserve(%s) error = %v, want errAssignIPInUse", want, err)
+	}
+}
+
+func TestPoolReserveThenReleaseAllowsReReserve(t *testing.T) {
+	network := mustParseCIDR(t, "10.8.0.0/24")
+	pool, err := newIPPool(network)
+	if err != nil {
+		t.Fatalf("newIPPool: %v", err)
+	}
+
+	want := net.IPv4(10, 8, 0, 42).To4()
+	peerID, err := pool.reserve(want)
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	pool.release(want, peerID)
+
+	if _, err := pool.reserve(want); err != nil {
+		t.Fatalf("reserve after release: %v", err)
+	}
+}
+
+// TestPoolReserveExhaustsPeerIDs is intentionally SKIPPED, not omitted:
+// reserve's ErrPoolExhausted branch shares nextFreePeerID's own scan
+// (id 0..maxPeerID, 16,777,216 ids) with allocate's identical peer-id
+// allocation — the same function both call. Actually filling
+// usedPeerIDs to genuinely exhaust it costs ~16.7M map writes, which is
+// slow under -race and memory-heavy for a unit test; no existing test in
+// this file (or allocate's own suite) pays that cost either, since the
+// underlying mechanism is shared and IP-address exhaustion (a far smaller,
+// caller-controlled space — TestPoolExhaustionReturnsTypedError above) is
+// what every existing exhaustion test actually exercises. Recorded here
+// rather than silently absent, so a future change to nextFreePeerID's
+// bound doesn't silently invalidate an assumption nothing checks.
+func TestPoolReserveExhaustsPeerIDs(t *testing.T) {
+	t.Skip("reserve's ErrPoolExhausted branch shares nextFreePeerID's scan (0..16,777,215) with allocate's already-exercised exhaustion mechanism; a literal full-exhaustion test is prohibitively expensive under -race")
+}
+
+func TestPoolAllocateSkipsReservedOffset(t *testing.T) {
+	network := mustParseCIDR(t, "10.8.0.0/29") // client addresses .2-.6
+	pool, err := newIPPool(network)
+	if err != nil {
+		t.Fatalf("newIPPool: %v", err)
+	}
+
+	reserved := net.IPv4(10, 8, 0, 2).To4() // the first allocate() would otherwise pick
+	if _, err := pool.reserve(reserved); err != nil {
+		t.Fatalf("reserve(%s): %v", reserved, err)
+	}
+
+	ip, _, err := pool.allocate()
+	if err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+	if ip.Equal(reserved) {
+		t.Fatalf("allocate() returned the reserved address %s, want it skipped", reserved)
+	}
+	if got, want := ip.String(), "10.8.0.3"; got != want {
+		t.Errorf("allocate() = %s, want %s (next free offset after the reserved one)", got, want)
+	}
+}

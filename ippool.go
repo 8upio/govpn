@@ -31,6 +31,29 @@ const maxPeerID = 0xFFFFFF
 // queued (T-02-08).
 var ErrPoolExhausted = errors.New("ovpn: tunnel IP pool exhausted")
 
+// reserve's own rejection sentinels. Unexported: the embedder-facing signal
+// for a Config.AssignIP rejection is the Warn log record and the
+// ServerStats.AssignIPRejected counter (see callAssignIP/assignTunnelIP in
+// ovpn.go), not a typed error — these never leave this package's boundary.
+var (
+	// errAssignIPNotIPv4 is returned when the requested address has no
+	// usable IPv4 form.
+	errAssignIPNotIPv4 = errors.New("ovpn: AssignIP address is not IPv4")
+
+	// errAssignIPOutsideNetwork is returned when the requested address
+	// falls outside the pool's own base/size arithmetic.
+	errAssignIPOutsideNetwork = errors.New("ovpn: AssignIP address is outside Config.Network")
+
+	// errAssignIPReserved is returned when the requested address is the
+	// network address (offset 0), the server's own tunnel address
+	// (offset 1), or the broadcast address (offset size-1).
+	errAssignIPReserved = errors.New("ovpn: AssignIP address is the network, server, or broadcast address")
+
+	// errAssignIPInUse is returned when the requested address is already
+	// held by a live session or a prior reservation.
+	errAssignIPInUse = errors.New("ovpn: AssignIP address is already in use")
+)
+
 // ipPool is a Server-scoped, mutex-guarded allocator for tunnel IP
 // addresses and peer-ids, drawn from a single configured IPv4 network.
 // Every method is safe for concurrent use — the same shape as
@@ -125,6 +148,57 @@ func (p *ipPool) allocate() (net.IP, uint32, error) {
 	p.usedIPs[offset] = true
 	p.usedPeerIDs[peerID] = true
 	return offsetToIP(p.base + offset), peerID, nil
+}
+
+// reserve marks ip — a caller-chosen (typically Config.AssignIP-supplied)
+// address, not the next sequentially free one — in use, and hands back a
+// peer-id for it exactly as allocate would. It sets the SAME usedIPs bit
+// nextFreeOffset already consults above, so a reserved static address is
+// skipped by every later allocate() call with no second data structure and
+// no change to release: release(ip, peerID) frees a reserved address
+// exactly as it frees an allocated one, because both are just entries in
+// the same usedIPs/usedPeerIDs maps.
+//
+// Validation runs BEFORE p.mu is taken, in this order: ip.To4() nil ->
+// errAssignIPNotIPv4; convert to a uint32 host address; v < p.base ->
+// errAssignIPOutsideNetwork (checked strictly before the subtraction below,
+// so v-p.base can never underflow); v-p.base >= p.size ->
+// errAssignIPOutsideNetwork; offset 0 (network), 1 (the server's own
+// address, see serverIP), or size-1 (broadcast) -> errAssignIPReserved.
+// Only once all of that has passed does reserve take p.mu, check
+// usedIPs[offset] (errAssignIPInUse if already set), find a free peer-id
+// (ErrPoolExhausted if none), and mark both bits.
+func (p *ipPool) reserve(ip net.IP) (uint32, error) {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return 0, errAssignIPNotIPv4
+	}
+	v := binary.BigEndian.Uint32(ip4)
+	if v < p.base {
+		return 0, errAssignIPOutsideNetwork
+	}
+	offset := v - p.base
+	if offset >= p.size {
+		return 0, errAssignIPOutsideNetwork
+	}
+	if offset == 0 || offset == 1 || offset == p.size-1 {
+		return 0, errAssignIPReserved
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.usedIPs[offset] {
+		return 0, errAssignIPInUse
+	}
+	peerID, ok := p.nextFreePeerID()
+	if !ok {
+		return 0, ErrPoolExhausted
+	}
+
+	p.usedIPs[offset] = true
+	p.usedPeerIDs[peerID] = true
+	return peerID, nil
 }
 
 // release returns ip and peerID to the pool so a future allocate call may

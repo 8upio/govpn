@@ -26,6 +26,7 @@ import (
 	"net"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/8upio/govpn/internal/ctrlconn"
@@ -180,6 +181,49 @@ type Config struct {
 	// legitimate protocol work.
 	AuthUserPass func(username, password string, cs tls.ConnectionState) error
 
+	// AssignIP, if set, chooses a client's tunnel IP instead of the default
+	// dynamic pool. It is consulted exactly once per session — on the
+	// INITIAL handshake only, never on a renegotiation — immediately before
+	// the pool would otherwise allocate an address for it.
+	//
+	// nil (the default) means today's behaviour exactly: every session's
+	// tunnel IP comes from the dynamic pool, byte-for-byte the same as
+	// before this hook existed.
+	//
+	// Returning (nil, nil) falls back to the dynamic pool for that one
+	// session only — it does not disable the hook for any other session.
+	//
+	// A non-nil returned IP must be IPv4, inside Config.Network, and must
+	// not be the network address, the server's own tunnel address
+	// (Config.Network's base+1), or the broadcast address. Any of those, a
+	// non-nil error, or a panic fails the session BEFORE PUSH_REPLY (fail
+	// closed): Config.OnSession never fires and therefore
+	// Config.OnSessionClosed never fires either. The rejection is visible
+	// as one Warn log record (a stable "reason" token identifies which
+	// check failed) and as Server.Stats().AssignIPRejected. A panic is
+	// additionally recovered and routed to Config.OnSessionPanic, exactly
+	// like a panicking OnSession or AuthUserPass — the panic case can never
+	// be mistaken for the (nil, nil) pool-fallback, because it returns a
+	// non-nil error alongside the nil IP.
+	//
+	// Replace semantics: if the returned address is currently held by
+	// another live session, that older session is closed with
+	// CloseReasonReplaced — its Config.OnSessionClosed fires with that
+	// reason — and the new session takes over the address. This mirrors
+	// the OpenVPN reference's own default no-`--duplicate-cn` behaviour
+	// (multi.c: multi_delete_dup): a second connection for an identity
+	// already on the server evicts the first rather than being refused, so
+	// a client reconnecting after a transient network flap is never locked
+	// out for a whole reap window by its own still-live prior session.
+	//
+	// The hook is never called while the library holds a session lock or
+	// Server.mu — see assignTunnelIP's own lock-ordering comment. It must
+	// be safe for concurrent use across sessions and must not block: it
+	// runs inside the session's handshake window (Server.handshakeWindow),
+	// so a slow hook only starves that one session's budget, observable via
+	// Server.Stats().HandshakesTimedOut.
+	AssignIP func(peerCN string, cs tls.ConnectionState) (net.IP, error)
+
 	// Logger, if set, receives structured (log/slog) records for handshake
 	// progress and failure, session lifecycle, authentication decisions,
 	// renegotiation, and every datagram the dispatch silently drops. nil (the
@@ -249,14 +293,14 @@ const (
 	// every still-live session.
 	CloseReasonServerClose
 
-	// CloseReasonReplaced is reserved for a future static-IP "replace the
-	// existing session for this identity" teardown path. It is never
-	// produced by this package today — declared now, ahead of that
-	// feature, so the CloseReason enum's wire/API shape is stable across
-	// the v0.1.0 -> v0.2.0 boundary rather than growing a new constant
-	// value later that could renumber nothing (iota-based enums are
-	// append-only safe) but would still be a mid-cycle behavioral surprise
-	// for anyone switching exhaustively on CloseReason today.
+	// CloseReasonReplaced is recorded when Config.AssignIP hands a live
+	// session's tunnel IP to a newly connecting client: assignTunnelIP
+	// evicts the older session for that address before the new one takes
+	// it over, mirroring the OpenVPN reference's own default
+	// no-`--duplicate-cn` eviction behaviour (multi.c: multi_delete_dup).
+	// The evicted session was already published (it had already completed
+	// its own handshake), so its Config.OnSessionClosed DOES fire with
+	// this reason.
 	CloseReasonReplaced
 
 	// CloseReasonAuthFailed is recorded when Config.AuthUserPass rejected
@@ -534,6 +578,30 @@ type Server struct {
 	// routing hint here, never a trust signal: the packet is only treated
 	// as that session's traffic once its own AEAD tag verifies (T-02-12).
 	dataSessions map[uint32]*Session
+
+	// stats holds every ServerStats counter, atomics only (no lock): see
+	// serverStats's own doc comment for which increment happens where.
+	stats serverStats
+}
+
+// serverStats holds Server's own handshake-outcome and dispatch-rejection
+// counters, each an atomic.Uint64 so every increment site (spread across
+// handleDatagram, handleDataDatagram, runHandshake,
+// enforceHandshakeWindow, and assignTunnelIP) needs no lock. All eight
+// fields are declared together here, in the plan that introduces the
+// first two increments (assignIPRejected, poolExhausted), so a later plan
+// wiring the remaining six only adds increments — it never re-shapes this
+// struct. Server.Stats() reads every field with one Load() each and
+// exposes them as the exported ServerStats snapshot.
+type serverStats struct {
+	handshakesStarted   atomic.Uint64
+	handshakesCompleted atomic.Uint64
+	handshakesFailed    atomic.Uint64
+	handshakesTimedOut  atomic.Uint64
+	authFailed          atomic.Uint64
+	assignIPRejected    atomic.Uint64
+	poolExhausted       atomic.Uint64
+	datagramsRejected   atomic.Uint64
 }
 
 // NewServer builds a Server from cfg. It does not start listening — call
@@ -1254,9 +1322,17 @@ func (s *Server) performPushExchange(sess *Session, w io.Writer) error {
 		sess.pushRequested.Store(true)
 
 		if sess.assignedIP == nil {
-			ip, peerID, err := s.pool.allocate()
+			// assignTunnelIP is the ONLY tunnel-IP source (Config.AssignIP,
+			// with the pool as its fallback, or the pool directly when the
+			// hook is nil) and this call is strictly BEFORE the sess.mu
+			// atomic-publish block below — that ordering is what keeps the
+			// replace path inside assignTunnelIP lock-free (see its own
+			// doc comment): no lock this goroutine holds here could ever
+			// be inverted against a concurrently-evicted session's own
+			// teardown.
+			ip, peerID, err := s.assignTunnelIP(sess)
 			if err != nil {
-				return fmt.Errorf("ovpn: allocate tunnel IP: %w", err)
+				return err
 			}
 
 			// The data-channel Wrapper is constructed here, before the
@@ -1467,6 +1543,153 @@ func (s *Server) callAuthUserPass(sess *Session, username, password string, cs t
 		}
 	}()
 	return s.cfg.AuthUserPass(username, password, cs)
+}
+
+// callAssignIP invokes Config.AssignIP with the same panic-recovery, fail-
+// closed shape as callAuthUserPass above: a recovered panic is routed to
+// Config.OnSessionPanic, logged, and turned into a non-nil error alongside
+// a nil IP — so a panic can never be mistaken for the hook's own (nil, nil)
+// pool-fallback return, which also has a nil IP but a nil error. Called
+// with sess.PeerCN and sess.connState, both already written by runHandshake
+// on this same goroutine before performPushExchange runs, so neither field
+// needs a lock here.
+func (s *Server) callAssignIP(sess *Session) (ip net.IP, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if s.cfg.OnSessionPanic != nil {
+				s.cfg.OnSessionPanic(sess, r, debug.Stack())
+			}
+			sess.logger().Warn("callback panicked", "callback", "AssignIP", "panic", fmt.Sprint(r))
+			ip = nil
+			err = fmt.Errorf("ovpn: Config.AssignIP panicked: %v", r)
+		}
+	}()
+	return s.cfg.AssignIP(sess.PeerCN, sess.connState)
+}
+
+// sessionByIP returns the live session currently holding tunnel address ip,
+// or nil if none does. s.sessions is snapshotted under s.mu, which is then
+// RELEASED before any session's own AssignedIP() (which takes that
+// session's own sess.mu) is consulted — this function must never hold s.mu
+// while taking a session's mu, because the established lock nesting
+// elsewhere in this package is sess.mu -> s.mu (session.go's
+// closeWithReason, performPushExchange's own atomic-publish block above):
+// taking them in the opposite order here would invert that order and risk
+// deadlock against a concurrent teardown. It is O(live sessions) and is
+// called at most twice per handshake (assignTunnelIP's initial lookup plus
+// at most one retry), never on the data path.
+func (s *Server) sessionByIP(ip net.IP) *Session {
+	s.mu.Lock()
+	candidates := make([]*Session, 0, len(s.sessions))
+	for _, sess := range s.sessions {
+		candidates = append(candidates, sess)
+	}
+	s.mu.Unlock()
+
+	for _, sess := range candidates {
+		if have := sess.AssignedIP(); have != nil && have.Equal(ip) {
+			return sess
+		}
+	}
+	return nil
+}
+
+// allocateFromPool wraps s.pool.allocate(), incrementing poolExhausted on
+// exhaustion and preserving today's error wrapping (runHandshake matches
+// ErrPoolExhausted through it via errors.Is).
+func (s *Server) allocateFromPool() (net.IP, uint32, error) {
+	ip, peerID, err := s.pool.allocate()
+	if err != nil {
+		s.stats.poolExhausted.Add(1)
+		return nil, 0, fmt.Errorf("ovpn: allocate tunnel IP: %w", err)
+	}
+	return ip, peerID, nil
+}
+
+// assignTunnelIP is the single tunnel-IP source performPushExchange calls:
+// with Config.AssignIP nil it is exactly allocateFromPool; with it set, it
+// consults the hook first and only falls back to the pool on a (nil, nil)
+// return.
+//
+// Lock-ordering and race argument for the replace path (the reason this
+// sequence is correct rather than lucky):
+//
+//   - At the moment old.closeWithReason is called below, this goroutine
+//     holds NO lock: not sess.mu (performPushExchange's own atomic-publish
+//     block is still strictly ahead of this call — assignTunnelIP is
+//     invoked before performPushExchange ever takes sess.mu), not s.mu
+//     (sessionByIP released it before returning old), and not p.mu
+//     (ipPool.reserve releases it before returning its error). The old
+//     session's own teardown takes old.mu -> s.mu -> p.mu, the
+//     package's established nesting order, and can therefore never
+//     deadlock against this goroutine, which holds none of them.
+//   - The retry below is guaranteed to see the released entry, not a stale
+//     one: ipPool.release runs INSIDE closeWithReason's stopOnce.Do body
+//     (session.go), and sync.Once.Do does not return until that body has
+//     returned — including when this call is the second, no-op-looking
+//     one racing a teardown already in flight elsewhere. So "close, then
+//     reserve exactly once more" is correct; a retry loop, a sleep, or a
+//     wait channel would add nothing here.
+//   - The one case the single retry still fails is a genuine conflict, not
+//     a spurious one: another session is concurrently between its own
+//     reserve/allocate call and its sess.mu publish, so it already holds
+//     the offset but sessionByIP cannot see it yet (AssignedIP() is still
+//     nil). Failing that handshake is the right outcome — the client
+//     reconnects — and it is reported as reason="in-use" plus
+//     AssignIPRejected, exactly like any other rejection.
+func (s *Server) assignTunnelIP(sess *Session) (net.IP, uint32, error) {
+	if s.cfg.AssignIP == nil {
+		return s.allocateFromPool()
+	}
+
+	want, err := s.callAssignIP(sess)
+	if err != nil {
+		s.stats.assignIPRejected.Add(1)
+		sess.logger().Warn("assign ip rejected", "reason", "hook-error", "peer_cn", sess.PeerCN, "err", err)
+		return nil, 0, fmt.Errorf("ovpn: Config.AssignIP: %w", err)
+	}
+	if want == nil {
+		return s.allocateFromPool()
+	}
+
+	peerID, err := s.pool.reserve(want)
+	if errors.Is(err, errAssignIPInUse) {
+		if old := s.sessionByIP(want); old != nil && old != sess {
+			sess.logger().Info("evicting session for replaced tunnel ip",
+				"peer_cn", sess.PeerCN, "ip", want.String())
+			_ = old.closeWithReason(CloseReasonReplaced)
+		}
+		peerID, err = s.pool.reserve(want)
+	}
+	if err != nil {
+		s.stats.assignIPRejected.Add(1)
+		if errors.Is(err, ErrPoolExhausted) {
+			s.stats.poolExhausted.Add(1)
+		}
+		sess.logger().Warn("assign ip rejected", "reason", assignIPRejectReason(err), "peer_cn", sess.PeerCN, "ip", want.String())
+		return nil, 0, fmt.Errorf("ovpn: Config.AssignIP: reserve %s: %w", want, err)
+	}
+
+	return want.To4(), peerID, nil
+}
+
+// assignIPRejectReason maps a reserve error to the stable "reason" log
+// token documented in docs/CONFIGURATION.md's AssignIP section.
+func assignIPRejectReason(err error) string {
+	switch {
+	case errors.Is(err, errAssignIPNotIPv4):
+		return "not-ipv4"
+	case errors.Is(err, errAssignIPOutsideNetwork):
+		return "outside-network"
+	case errors.Is(err, errAssignIPReserved):
+		return "reserved-address"
+	case errors.Is(err, errAssignIPInUse):
+		return "in-use"
+	case errors.Is(err, ErrPoolExhausted):
+		return "pool-exhausted"
+	default:
+		return "unknown"
+	}
 }
 
 // verifyUserPass authenticates opts (the client's just-parsed Key Method 2
