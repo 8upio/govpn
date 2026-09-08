@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -241,6 +243,18 @@ type Session struct {
 	// first place.
 	published atomic.Bool
 
+	// log is this session's per-session *slog.Logger, published exactly
+	// once by ovpn.go's performPushExchange (D-03), immediately after the
+	// atomic sess.mu.Unlock() that publishes assignedIP/peerID/primary and
+	// before startKeepalive — carrying remote/session_id/peer_cn/ip/peer_id
+	// so every hot-path log site pays one atomic load and builds zero attrs.
+	// Deliberately an atomic.Pointer, not a field guarded by mu: logger()
+	// below MUST be callable while sess.mu is already held (startRenegotiation
+	// logs from several early-return branches without ever releasing
+	// sess.mu first) — a logger() that took sess.mu would deadlock there.
+	// Read via logger(), never directly.
+	log atomic.Pointer[slog.Logger]
+
 	// mu guards assignedIP, peerID, primary, lameDuck, pendingReneg,
 	// pendingRenegKeyID, lastRenegAccepted, lastAuthTraffic, dataKeys, and
 	// establishedAt below (WR-03, extended by 04-01-PLAN.md Task 1 from
@@ -465,6 +479,33 @@ func (s *Session) closing() bool {
 	}
 }
 
+// logger returns this session's logger: the published per-session logger
+// (D-03, carrying remote/session_id/peer_cn/ip/peer_id) if
+// performPushExchange has already stored one, otherwise a logger built
+// on the fly carrying just remote/session_id — used only on the
+// pre-publish handshake path (runHandshake's early Warn sites), never on
+// the hot data path, so building-not-storing here is deliberate (D-02):
+// storing a logger missing peer_cn/ip/peer_id before they're known would
+// freeze an incomplete one. s.RemoteAddr and s.SessionID are set once at
+// session construction, before the session is ever published, and never
+// mutated afterward — safe to read here without s.mu. This method MUST
+// NOT take s.mu: startRenegotiation logs from inside several early-return
+// branches while already holding it, and a logger() that also took it
+// would deadlock (F7).
+func (s *Session) logger() *slog.Logger {
+	if lg := s.log.Load(); lg != nil {
+		return lg
+	}
+	base := s.srv.logger()
+	if base == discardLogger {
+		return discardLogger
+	}
+	if s.RemoteAddr == nil {
+		return base.With("session_id", hex.EncodeToString(s.SessionID[:]))
+	}
+	return base.With("remote", s.RemoteAddr.String(), "session_id", hex.EncodeToString(s.SessionID[:]))
+}
+
 // PushRequestSeen reports whether this session's client has sent its
 // PUSH_REQUEST and been answered with a PUSH_REPLY (RESEARCH Pattern 6).
 // Exists so an embedder or the interop harness can observe that the real
@@ -686,24 +727,28 @@ func (s *Session) handleDataPacket(packet []byte) {
 	s.mu.Unlock()
 
 	if primary.wrapper == nil {
+		s.logger().Debug("data packet dropped", "reason", "no-data-key")
 		return
 	}
 	plaintext, err := primary.wrapper.Open(nil, packet)
 	if err != nil {
+		primaryErr := err
 		// Includes datachan.ErrPingAbsorbed: a ping is absorbed inside
 		// Open, never delivered, and never counts as a delivered IP
 		// packet. Fall back to the lame-duck slot (D-18) ONLY if it is
 		// still live: try primary first (the common case, cheapest),
 		// lameDuck only on failure and only before its mustDie deadline
 		// (Pitfall 5) — both failing is the existing silent drop (T-02-17):
-		// no allocation, no logging, no per-attacker state, and — per
-		// T-04-07 — no touch of lastAuthTraffic: an attacker cannot keep a
-		// dead session alive with garbage that never authenticates.
+		// no allocation, no per-attacker state, and — per T-04-07 — no
+		// touch of lastAuthTraffic: an attacker cannot keep a dead session
+		// alive with garbage that never authenticates.
 		if lameDuck.wrapper == nil || !s.now().Before(lameDuck.mustDie) {
+			s.logger().Debug("data packet dropped", "reason", "data-auth-failed", "err", primaryErr)
 			return
 		}
 		plaintext, err = lameDuck.wrapper.Open(nil, packet)
 		if err != nil {
+			s.logger().Debug("data packet dropped", "reason", "data-auth-failed-lame-duck", "err", err)
 			return
 		}
 	}
@@ -736,11 +781,13 @@ func (s *Session) handleDataPacket(packet []byte) {
 	select {
 	case s.ipInbound <- plaintext:
 	case <-s.stopCh:
+		s.logger().Debug("data packet dropped", "reason", "session-closing")
 	default:
 		// Queue full: drop this decrypted packet exactly as a genuinely
 		// congested link would (D-06) — never block handleDatagram's
 		// per-datagram goroutine.
 		s.inboundQueueDropped.Add(1)
+		s.logger().Debug("data packet dropped", "reason", "ip-queue-full", "dropped", s.inboundQueueDropped.Load())
 	}
 }
 
@@ -873,6 +920,7 @@ func (s *Session) runReneg(tickCh <-chan time.Time) {
 func (s *Session) sweepLameDuck() {
 	s.mu.Lock()
 	conn := s.lameDuck.conn
+	keyID := s.lameDuck.keyID
 	expired := s.lameDuck.wrapper != nil && !s.now().Before(s.lameDuck.mustDie)
 	if expired {
 		s.lameDuck = keySlot{}
@@ -880,6 +928,7 @@ func (s *Session) sweepLameDuck() {
 	s.mu.Unlock()
 
 	if expired && conn != nil {
+		s.logger().Debug("lame-duck key expired", "key_id", int(keyID))
 		_ = conn.Close()
 	}
 }
@@ -973,6 +1022,7 @@ func (s *Session) runReap(tickCh <-chan time.Time) {
 			last := s.lastAuthTraffic
 			s.mu.Unlock()
 			if s.now().Sub(last) >= s.srv.reapWindow {
+				s.logger().Warn("session reaped", "idle", s.now().Sub(last), "reap", s.srv.reapWindow)
 				_ = s.closeWithReason(CloseReasonIdleReap)
 				return
 			}
@@ -1000,6 +1050,7 @@ func (s *Session) emitPing() {
 		// ErrPacketIDExhausted or similar — nothing more to do; the next
 		// tick tries again (and will fail the same way until Phase 4's
 		// renegotiation, out of this phase's scope).
+		s.logger().Debug("keepalive ping failed", "err", err)
 		return
 	}
 	if s.srv == nil || s.srv.pc == nil {
@@ -1032,6 +1083,10 @@ func (s *Session) ConnectionState() tls.ConnectionState {
 // Only the FIRST call's reason is ever recorded (stopOnce guarantees the
 // body — including the closeReason store below — runs exactly once).
 func (s *Session) closeWithReason(r CloseReason) error {
+	// J6: snapshotted inside the existing s.mu critical section below (no
+	// second critical section) so the final "session closed" record can
+	// report elapsed session duration.
+	var establishedAt time.Time
 	s.stopOnce.Do(func() {
 		// Recorded FIRST, before close(stopCh): any goroutine that
 		// observes stopCh closed (the only synchronizing signal this type
@@ -1065,6 +1120,7 @@ func (s *Session) closeWithReason(r CloseReason) error {
 			primaryConn := s.primary.conn
 			lameDuckConn := s.lameDuck.conn
 			pendingRenegConn := s.pendingReneg
+			establishedAt = s.establishedAt
 
 			// Remove the dataSessions routing entry BEFORE releasing
 			// peerID back to the pool (WR-04): pool.release makes peerID
@@ -1122,6 +1178,15 @@ func (s *Session) closeWithReason(r CloseReason) error {
 				defer s.srv.cbEnd()
 				s.srv.callOnSessionClosed(s, r)
 			}()
+		}
+
+		// J6: the LAST statement inside stopOnce.Do — exactly one "session
+		// closed" record per session, regardless of which teardown path won
+		// (T-na1-07).
+		if establishedAt.IsZero() {
+			s.logger().Info("session closed", "reason", r.String(), "published", s.published.Load())
+		} else {
+			s.logger().Info("session closed", "reason", r.String(), "published", s.published.Load(), "duration", s.now().Sub(establishedAt))
 		}
 	})
 	if s.conn == nil {

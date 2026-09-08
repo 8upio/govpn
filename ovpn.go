@@ -15,11 +15,14 @@ package ovpn
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"runtime/debug"
 	"sync"
@@ -32,6 +35,14 @@ import (
 	"github.com/8upio/govpn/internal/tlscrypt"
 	"github.com/8upio/govpn/internal/wire"
 )
+
+// discardLogger is the resolved logger for a Server (or Session) built with
+// no Config.Logger: slog.DiscardHandler reports Enabled(...) == false for
+// every level, so every log site behind an Enabled guard costs nothing, and
+// every unconditional Debug/Info/Warn call is dropped by the handler itself
+// without ever allocating a record. Resolved once, package-level, so no log
+// site anywhere needs to branch on nil (D-01).
+var discardLogger = slog.New(slog.DiscardHandler)
 
 // Config configures a Server.
 type Config struct {
@@ -168,6 +179,31 @@ type Config struct {
 	// (Server.handshakeWindow), so a slow hook can starve that budget for
 	// legitimate protocol work.
 	AuthUserPass func(username, password string, cs tls.ConnectionState) error
+
+	// Logger, if set, receives structured (log/slog) records for handshake
+	// progress and failure, session lifecycle, authentication decisions,
+	// renegotiation, and every datagram the dispatch silently drops. nil (the
+	// default) means a no-op logger: nothing is emitted and nothing is
+	// allocated for it — resolved once into a discard handler whose
+	// Enabled() reports false for every level, so a nil Logger costs the
+	// same as today's silence.
+	//
+	// Info carries one record per lifecycle event (server listening/
+	// closing, session established/closed, auth rejected, renegotiation
+	// started/completed). Warn carries failures worth investigating
+	// (handshake/renegotiation failures, handshake/renegotiation window
+	// timeouts, idle reaps, tunnel-IP pool exhaustion, recovered callback
+	// panics). Debug carries every per-datagram drop and renegotiation
+	// refusal — this is deliberate, not an oversight: an unauthenticated
+	// peer can trigger these without limit, so keeping them at Debug (never
+	// Info) is what keeps a forged-datagram flood from becoming a
+	// disk-filling log-volume amplifier at the library's default log level.
+	//
+	// The library never logs passwords, tls-crypt or data-channel key
+	// material, or packet payload bytes — see docs/CONFIGURATION.md's
+	// "Logger" section for the full closed set of message strings and
+	// attribute keys.
+	Logger *slog.Logger
 }
 
 // AuthClientReason is the optional interface an error returned from
@@ -480,6 +516,11 @@ type Server struct {
 	// a *Server by hand (never via NewServer/Config).
 	clock reliable.Clock
 
+	// log is Config.Logger, copied as-is (no defaulting here — logger()
+	// below is the single resolution point every log site reads through, so
+	// nothing else ever branches on nil).
+	log *slog.Logger
+
 	mu       sync.Mutex
 	pc       net.PacketConn
 	closed   bool
@@ -512,6 +553,7 @@ func NewServer(cfg Config) *Server {
 	}
 	return &Server{
 		cfg:                 cfg,
+		log:                 cfg.Logger,
 		handshakeWindow:     reliable.HandshakeWindow,
 		reapWindow:          reapWindow,
 		pingInterval:        pi,
@@ -519,6 +561,17 @@ func NewServer(cfg Config) *Server {
 		sessions:            make(map[sessionKey]*Session),
 		dataSessions:        make(map[uint32]*Session),
 	}
+}
+
+// logger returns s.log, or discardLogger when s is nil or s.log is nil
+// (F6: a hand-built *Server in a test may have no log field set at all) —
+// the single resolution point every server-side log site reads through, so
+// no call site anywhere branches on nil itself (D-01).
+func (s *Server) logger() *slog.Logger {
+	if s == nil || s.log == nil {
+		return discardLogger
+	}
+	return s.log
 }
 
 // Serve runs the server's UDP read loop over pc until pc is closed or Close
@@ -617,6 +670,24 @@ func (s *Server) Serve(pc net.PacketConn) error {
 	s.pc = pc
 	s.mu.Unlock()
 
+	networkAttr := "unset"
+	if s.cfg.Network != nil {
+		networkAttr = s.cfg.Network.String()
+	}
+	cipherAttr := s.cfg.Cipher
+	if cipherAttr == "" {
+		cipherAttr = "AES-256-GCM"
+	}
+	s.logger().Info("server listening",
+		"addr", pc.LocalAddr(),
+		"network", networkAttr,
+		"cipher", cipherAttr,
+		"ping", s.pingInterval,
+		"reap", s.reapWindow,
+		"reneg_sec", s.renegSec,
+		"auth_user_pass", s.cfg.AuthUserPass != nil,
+	)
+
 	// Sized one byte over the accepted ceiling so an oversized datagram
 	// (which the OS would otherwise silently truncate to fit the buffer)
 	// is detectable: n > maxDatagramSize means the real datagram exceeded
@@ -631,6 +702,7 @@ func (s *Server) Serve(pc net.PacketConn) error {
 			if closed || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
+			s.logger().Warn("read loop stopped", "err", err)
 			return err
 		}
 
@@ -653,6 +725,8 @@ func (s *Server) Close() error {
 		sessions = append(sessions, sess)
 	}
 	s.mu.Unlock()
+
+	s.logger().Info("server closing", "sessions", len(sessions))
 
 	for _, sess := range sessions {
 		_ = sess.closeWithReason(CloseReasonServerClose)
@@ -724,11 +798,13 @@ func (t packetConnTransport) WriteTo(p []byte, addr net.Addr) (int, error) {
 
 func (s *Server) handleDatagram(pc net.PacketConn, addr net.Addr, packet []byte) {
 	if len(packet) < 1 || len(packet) > maxDatagramSize {
+		s.logger().Debug("datagram dropped", "reason", "bad-length", "remote", addr, "bytes", len(packet))
 		return
 	}
 
 	opcode, keyID := wire.ParseHeaderByte(packet[0])
 	if !wire.ValidOpcode(opcode) {
+		s.logger().Debug("datagram dropped", "reason", "bad-opcode", "remote", addr, "opcode", int(opcode))
 		return
 	}
 
@@ -752,6 +828,7 @@ func (s *Server) handleDatagram(pc net.PacketConn, addr net.Addr, packet []byte)
 	// minDatagramSize (the tls-crypt prefix) only applies to control-channel
 	// packets, which are always tls-crypt wrapped.
 	if len(packet) < minDatagramSize {
+		s.logger().Debug("datagram dropped", "reason", "short-control", "remote", addr, "opcode", int(opcode), "bytes", len(packet))
 		return
 	}
 
@@ -771,6 +848,10 @@ func (s *Server) handleDatagram(pc net.PacketConn, addr net.Addr, packet []byte)
 		// has nowhere to be routed and is dropped, before any allocation
 		// at all.
 		if opcode != wire.OpControlHardResetClientV2 || keyID != 0 {
+			if lg := s.logger(); lg.Enabled(context.Background(), slog.LevelDebug) {
+				lg.Debug("datagram dropped", "reason", "unknown-session", "remote", addr,
+					"session_id", hex.EncodeToString(sid[:]), "opcode", int(opcode), "key_id", int(keyID))
+			}
 			return
 		}
 		// A candidate Wrapper+Session pair is constructed here because
@@ -787,10 +868,14 @@ func (s *Server) handleDatagram(pc net.PacketConn, addr net.Addr, packet []byte)
 		// grow the server's persistent session table.
 		wrapper, err := tlscrypt.NewWrapper(s.cfg.TLSCryptKey, true)
 		if err != nil {
+			// Not attacker-triggerable — Serve pre-validates the key —
+			// so Warn is safe here.
+			s.logger().Warn("tls-crypt wrapper init failed", "remote", addr, "err", err)
 			return
 		}
 		var serverSID wire.SessionID
 		if _, err := rand.Read(serverSID[:]); err != nil {
+			s.logger().Warn("session id generation failed", "remote", addr, "err", err)
 			return
 		}
 		sess = &Session{
@@ -810,11 +895,19 @@ func (s *Server) handleDatagram(pc net.PacketConn, addr net.Addr, packet []byte)
 
 	_, plaintext, err := sess.wrapper.Unwrap(nil, packet)
 	if err != nil {
+		if lg := s.logger(); lg.Enabled(context.Background(), slog.LevelDebug) {
+			lg.Debug("datagram dropped", "reason", "tls-crypt-unwrap", "remote", addr,
+				"session_id", hex.EncodeToString(sid[:]), "opcode", int(opcode), "err", err)
+		}
 		return
 	}
 	hdr := wire.Header{Opcode: opcode, KeyID: keyID, SessionID: sid}
 	cp, err := wire.ParseControlPacket(plaintext, hdr)
 	if err != nil {
+		if lg := s.logger(); lg.Enabled(context.Background(), slog.LevelDebug) {
+			lg.Debug("datagram dropped", "reason", "parse-control", "remote", addr,
+				"session_id", hex.EncodeToString(sid[:]), "opcode", int(opcode), "err", err)
+		}
 		return
 	}
 
@@ -848,6 +941,11 @@ func (s *Server) handleDatagram(pc net.PacketConn, addr net.Addr, packet []byte)
 	}
 
 	if justCreated {
+		if lg := s.logger(); lg.Enabled(context.Background(), slog.LevelDebug) {
+			lg.Debug("control channel opened", "remote", addr,
+				"session_id", hex.EncodeToString(sess.SessionID[:]),
+				"client_session_id", hex.EncodeToString(sess.clientSessionID[:]))
+		}
 		go sess.pump()
 		go s.runHandshake(sess)
 		go s.enforceHandshakeWindow(sess)
@@ -907,11 +1005,13 @@ func (s *Server) handleDatagram(pc net.PacketConn, addr net.Addr, packet []byte)
 	case <-sess.stopCh:
 		// Session is mid-teardown (Close was called): don't block trying
 		// to enqueue into a pump that has already stopped ranging.
+		s.logger().Debug("datagram dropped", "reason", "session-closing", "key_id", int(cp.KeyID))
 	default:
 		// Queue full: drop this datagram exactly as a genuinely lost UDP
 		// packet would be dropped — the reliability layer's own
 		// retransmission (on both sides) is what recovers from this, not
 		// a synchronous retry here.
+		s.logger().Debug("datagram dropped", "reason", "control-queue-full", "key_id", int(cp.KeyID))
 	}
 }
 
@@ -927,9 +1027,11 @@ func (s *Server) handleDatagram(pc net.PacketConn, addr net.Addr, packet []byte)
 // as V2.
 func (s *Server) handleDataDatagram(opcode wire.Opcode, packet []byte) {
 	if opcode != wire.OpDataV2 {
+		s.logger().Debug("datagram dropped", "reason", "data-v1-unsupported", "opcode", int(opcode))
 		return
 	}
 	if len(packet) < 4 {
+		s.logger().Debug("datagram dropped", "reason", "short-data", "bytes", len(packet))
 		return
 	}
 	peerID := uint32(packet[1])<<16 | uint32(packet[2])<<8 | uint32(packet[3])
@@ -938,6 +1040,7 @@ func (s *Server) handleDataDatagram(opcode wire.Opcode, packet []byte) {
 	sess, ok := s.dataSessions[peerID]
 	s.mu.Unlock()
 	if !ok {
+		s.logger().Debug("datagram dropped", "reason", "unknown-peer-id", "peer_id", peerID)
 		return
 	}
 
@@ -969,6 +1072,7 @@ func (sess *Session) pump() {
 			// Close's own WR-05 commentary establishes for
 			// assignedIP/peerID/dataSessions.
 			if sess.closing() {
+				sess.logger().Debug("control packet dropped", "reason", "session-closing", "key_id", int(cp.KeyID))
 				continue
 			}
 			if target := sess.routeControlPacket(cp.KeyID); target != nil {
@@ -979,6 +1083,8 @@ func (sess *Session) pump() {
 				// for (mirrors the reference resetting only AFTER
 				// tls_pre_decrypt succeeded).
 				sess.touchAuthTraffic()
+			} else {
+				sess.logger().Debug("control packet dropped", "reason", "no-route-for-key-id", "key_id", int(cp.KeyID))
 			}
 		case <-sess.stopCh:
 			return
@@ -1001,6 +1107,7 @@ func (s *Server) runHandshake(sess *Session) {
 	tlsConn := tls.Server(sess.conn, s.cfg.TLSConfig)
 	err := tlsConn.Handshake()
 	if err != nil {
+		sess.logger().Warn("handshake failed", "stage", "tls", "err", err)
 		close(sess.doneCh)
 		_ = sess.closeWithReason(CloseReasonUnknown)
 		return
@@ -1023,16 +1130,23 @@ func (s *Server) runHandshake(sess *Session) {
 			// this path, with authFailedWindow (2s) as the tighter INNER
 			// bound on the read-then-drain sequence itself.
 			s.rejectAuthAfterPushRequest(sess, tlsConn, af.clientReason)
+			sess.logger().Debug("auth failed sent to client", "has_client_reason", af.clientReason != "")
 			close(sess.doneCh)
 			_ = sess.closeWithReason(CloseReasonAuthFailed)
 			return
 		}
+		sess.logger().Warn("handshake failed", "stage", "key-method-2", "err", err)
 		close(sess.doneCh)
 		_ = sess.closeWithReason(CloseReasonUnknown)
 		return
 	}
 
 	if err := s.performPushExchange(sess, tlsConn); err != nil {
+		if errors.Is(err, ErrPoolExhausted) {
+			sess.logger().Warn("tunnel ip pool exhausted", "err", err)
+		} else {
+			sess.logger().Warn("handshake failed", "stage", "push", "err", err)
+		}
 		close(sess.doneCh)
 		_ = sess.closeWithReason(CloseReasonUnknown)
 		return
@@ -1056,9 +1170,17 @@ func (s *Server) runHandshake(sess *Session) {
 	// bring-up (Close is idempotent via stopOnce, so this second call is a
 	// no-op) rather than handed to the embedder.
 	if sess.closing() {
+		sess.logger().Debug("session closed during bring-up")
 		_ = sess.closeWithReason(CloseReasonUnknown)
 		return
 	}
+
+	// E6: fires before Config.OnSession is ever invoked, so a nil or
+	// blocking OnSession can never suppress this record (T-na1-07).
+	sess.logger().Info("session established",
+		"tls_version", state.Version,
+		"tls_cipher", tls.CipherSuiteName(state.CipherSuite),
+	)
 
 	// D-08: OnSession fires only here — after Key Method 2 and the
 	// PUSH_REQUEST/PUSH_REPLY exchange have both completed and
@@ -1223,6 +1345,26 @@ func (s *Server) performPushExchange(sess *Session, w io.Writer) error {
 			s.mu.Unlock()
 			sess.mu.Unlock()
 
+			// D-03: build and publish this session's enriched logger here,
+			// immediately after the atomic publish above committed —
+			// remote/session_id/peer_cn/ip/peer_id are all known at this
+			// point, so this is the ONE place a per-session logger with the
+			// full attribute set is ever constructed. Every hot-path log
+			// site downstream (Session.logger()) then pays one atomic load
+			// and builds zero attrs of its own.
+			// sess.RemoteAddr is passed directly, never via .String(): some
+			// tests construct a *Session by hand with a nil RemoteAddr
+			// (F6), and RemoteAddr.String() on a nil net.Addr interface
+			// panics — slog formats a nil interface value safely as
+			// "<nil>" without ever calling its method.
+			sess.log.Store(s.logger().With(
+				"remote", sess.RemoteAddr,
+				"session_id", hex.EncodeToString(sess.SessionID[:]),
+				"peer_cn", sess.PeerCN,
+				"peer_id", peerID,
+				"ip", ip.String(),
+			))
+
 			// D-11: the keepalive goroutine starts here too — alongside
 			// the data wrapper, before PUSH_REPLY is written and well
 			// before OnSession fires — emitting on exactly the schedule
@@ -1320,6 +1462,7 @@ func (s *Server) callAuthUserPass(sess *Session, username, password string, cs t
 			if s.cfg.OnSessionPanic != nil {
 				s.cfg.OnSessionPanic(sess, r, debug.Stack())
 			}
+			sess.logger().Warn("callback panicked", "callback", "AuthUserPass", "panic", fmt.Sprint(r))
 			err = fmt.Errorf("ovpn: Config.AuthUserPass panicked: %v", r)
 		}
 	}()
@@ -1348,6 +1491,9 @@ func (s *Server) verifyUserPass(sess *Session, opts *keyderiv.ClientOptions, cs 
 	username, usernameOK := km2Credential(opts.Username)
 	password, passwordOK := km2Credential(opts.Password)
 	if !usernameOK || !passwordOK {
+		// F1: NO username attr here — the over-long field may BE the
+		// username (T-na1-02).
+		sess.logger().Info("auth rejected", "reason", "credential-too-long")
 		// ssl.c:2456-2457's own client-facing text.
 		return &authFailure{
 			clientReason: "Username or password is too long. Maximum length is 128 bytes",
@@ -1355,6 +1501,7 @@ func (s *Server) verifyUserPass(sess *Session, opts *keyderiv.ClientOptions, cs 
 		}
 	}
 	if username == "" || password == "" {
+		sess.logger().Info("auth rejected", "reason", "credential-empty")
 		// ssl.c:2465's own log line; no client reason (the reference sends
 		// none for this case either — ssl.c:2465-2469's goto error skips
 		// auth_set_client_reason).
@@ -1367,8 +1514,10 @@ func (s *Server) verifyUserPass(sess *Session, opts *keyderiv.ClientOptions, cs 
 		if errors.As(err, &ar) {
 			reason = ar.ClientReason()
 		}
+		sess.logger().Info("auth rejected", "reason", "hook", "username", username, "err", err, "has_client_reason", reason != "")
 		return &authFailure{clientReason: reason, err: err}
 	}
+	sess.logger().Debug("auth accepted", "username", username)
 	return nil
 }
 
@@ -1539,6 +1688,7 @@ func (s *Server) callOnSession(sess *Session) {
 			if s.cfg.OnSessionPanic != nil {
 				s.cfg.OnSessionPanic(sess, r, debug.Stack())
 			}
+			sess.logger().Warn("callback panicked", "callback", "OnSession", "panic", fmt.Sprint(r))
 		}
 	}()
 	s.cfg.OnSession(sess)
@@ -1556,6 +1706,7 @@ func (s *Server) callOnSessionClosed(sess *Session, r CloseReason) {
 			if s.cfg.OnSessionPanic != nil {
 				s.cfg.OnSessionPanic(sess, rec, debug.Stack())
 			}
+			sess.logger().Warn("callback panicked", "callback", "OnSessionClosed", "panic", fmt.Sprint(rec))
 		}
 	}()
 	s.cfg.OnSessionClosed(sess, r)
@@ -1583,6 +1734,7 @@ func (s *Server) startRenegotiation(sess *Session, pc net.PacketConn, addr net.A
 	defer sess.mu.Unlock()
 
 	if sess.closing() {
+		sess.logger().Debug("renegotiation refused", "reason", "closing")
 		return nil, 0, false
 	}
 	if sess.primary.conn == nil || sess.primary.established.IsZero() {
@@ -1590,12 +1742,14 @@ func (s *Server) startRenegotiation(sess *Session, pc net.PacketConn, addr net.A
 		// fully established (ssl.c:3882-3900, S_GENERATED_KEYS) — refuse
 		// rather than renegotiate a session that hasn't finished its
 		// initial handshake yet.
+		sess.logger().Debug("renegotiation refused", "reason", "primary-not-established")
 		return nil, 0, false
 	}
 	if sess.pendingReneg != nil {
 		// A renegotiation is already in flight — the in-flight one wins
 		// (D-17 "first to fire wins"); the timer tick or a second
 		// SOFT_RESET_V1 is a no-op.
+		sess.logger().Debug("renegotiation refused", "reason", "already-in-flight", "key_id", int(sess.pendingRenegKeyID))
 		return nil, 0, false
 	}
 	if !sess.lastRenegAccepted.IsZero() && sess.now().Sub(sess.lastRenegAccepted) < s.renegMinInterval {
@@ -1605,6 +1759,7 @@ func (s *Server) startRenegotiation(sess *Session, pc net.PacketConn, addr net.A
 		// reaches this code; this check instead bounds how often a
 		// legitimate-looking but abusive peer can force a full new TLS
 		// handshake with distinct, validly-signed requests.
+		sess.logger().Debug("renegotiation refused", "reason", "rate-limited")
 		return nil, 0, false
 	}
 
@@ -1616,8 +1771,10 @@ func (s *Server) startRenegotiation(sess *Session, pc net.PacketConn, addr net.A
 		// refuses anything else — drop and leave every field of the
 		// session untouched, no partial state, no counter advance, no new
 		// allocation, matching the forged-control-packet discipline
-		// handleDatagram already applies elsewhere. No per-packet log —
-		// that would be an attacker-controlled log-volume amplifier.
+		// handleDatagram already applies elsewhere. Debug only, never Info —
+		// an Info-level line here would be an attacker-controlled
+		// log-volume amplifier.
+		sess.logger().Debug("renegotiation refused", "reason", "key-id-mismatch", "key_id", int(wantKeyID))
 		return nil, 0, false
 	}
 
@@ -1626,6 +1783,11 @@ func (s *Server) startRenegotiation(sess *Session, pc net.PacketConn, addr net.A
 	sess.pendingReneg = newConn
 	sess.pendingRenegKeyID = next
 	sess.lastRenegAccepted = sess.now()
+	initiator := "server"
+	if hasWantKeyID {
+		initiator = "peer"
+	}
+	sess.logger().Info("renegotiation started", "key_id", int(next), "initiator", initiator)
 	return newConn, next, true
 }
 
@@ -1684,12 +1846,14 @@ func (s *Server) runRenegotiation(sess *Session, newConn *ctrlconn.Conn, keyID u
 
 	tlsConn := tls.Server(newConn, s.cfg.TLSConfig)
 	if err := tlsConn.Handshake(); err != nil {
+		sess.logger().Warn("renegotiation failed", "stage", "tls", "key_id", int(keyID), "err", err)
 		abandon()
 		return
 	}
 
 	_, dataKeys, _, _, clientOpts, err := s.deriveKeyMethod2(tlsConn, sess.clientSessionID, sess.SessionID)
 	if err != nil {
+		sess.logger().Warn("renegotiation failed", "stage", "key-method-2", "key_id", int(keyID), "err", err)
 		abandon()
 		return
 	}
@@ -1711,6 +1875,10 @@ func (s *Server) runRenegotiation(sess *Session, newConn *ctrlconn.Conn, keyID u
 		// WaitDrained returns false immediately once closeCh is closed, so
 		// the AUTH_FAILED delivery attempt has to happen first.
 		s.sendAuthFailed(newConn, tlsConn, clientReason)
+		// F3 (verifyUserPass) already logged the "auth rejected" record —
+		// this Warn is the renegotiation-stage failure, not a duplicate of
+		// that rejection.
+		sess.logger().Warn("renegotiation failed", "stage", "auth", "key_id", int(keyID))
 		abandon()
 		_ = sess.closeWithReason(CloseReasonAuthFailed)
 		return
@@ -1732,6 +1900,7 @@ func (s *Server) runRenegotiation(sess *Session, newConn *ctrlconn.Conn, keyID u
 	// a no-op.
 	if sess.closing() || sess.pendingReneg != newConn {
 		sess.mu.Unlock()
+		sess.logger().Debug("renegotiation abandoned", "reason", "superseded", "key_id", int(keyID))
 		_ = newConn.Close()
 		return
 	}
@@ -1747,6 +1916,7 @@ func (s *Server) runRenegotiation(sess *Session, newConn *ctrlconn.Conn, keyID u
 			sess.pendingReneg = nil
 		}
 		sess.mu.Unlock()
+		sess.logger().Warn("renegotiation failed", "stage", "data-wrapper", "key_id", int(keyID), "err", err)
 		_ = newConn.Close()
 		return
 	}
@@ -1776,10 +1946,13 @@ func (s *Server) runRenegotiation(sess *Session, newConn *ctrlconn.Conn, keyID u
 	// — a renegotiation abandoned before reaching here (failed handshake,
 	// failed Key Method 2, session closing) never increments it.
 	sess.renegotiations++
+	renegotiations := sess.renegotiations
 	if sess.pendingReneg == newConn {
 		sess.pendingReneg = nil
 	}
 	sess.mu.Unlock()
+
+	sess.logger().Info("renegotiation completed", "key_id", int(keyID), "renegotiations", renegotiations)
 
 	// dataSessions is keyed on peerID, which does not change across a
 	// renegotiation (D-16) — no routing-table write is needed here.
@@ -1793,6 +1966,7 @@ func (s *Server) enforceHandshakeWindow(sess *Session) {
 	case <-sess.doneCh:
 		return
 	case <-time.After(s.handshakeWindow):
+		sess.logger().Warn("handshake window expired", "window", s.handshakeWindow)
 		_ = sess.closeWithReason(CloseReasonUnknown)
 	}
 }
@@ -1813,10 +1987,14 @@ func (s *Server) enforceRenegotiationWindow(sess *Session, newConn *ctrlconn.Con
 	case <-time.After(s.handshakeWindow):
 		sess.mu.Lock()
 		stillPending := sess.pendingReneg == newConn
+		pendingKeyID := sess.pendingRenegKeyID
 		if stillPending {
 			sess.pendingReneg = nil
 		}
 		sess.mu.Unlock()
+		if stillPending {
+			sess.logger().Warn("renegotiation window expired", "key_id", int(pendingKeyID), "window", s.handshakeWindow)
+		}
 		// Only close newConn if this call is the one that actually cleared
 		// pendingReneg (CR-02): if the check above is false, the
 		// renegotiation already completed and swapped newConn in as
