@@ -37,10 +37,12 @@ const (
 	// payload WriteTo accepts: RFC 768's Length field is 16 bits and
 	// covers the 8-byte UDP header plus payload; carried inside a 20-byte,
 	// options-free IPv4 packet, the largest payload that still fits a
-	// 16-bit IPv4 Total Length field is 65535-20-8 = 65507. In practice
-	// the pushed `tun-mtu 1500` caps every datagram far below this, and
-	// this stack never fragments, so a WriteTo exceeding this is a caller
-	// bug, not a size this stack could ever transmit whole.
+	// 16-bit IPv4 Total Length field is 65535-20-8 = 65507. A payload up
+	// to that size IS genuinely transmittable: writePacket fragments any
+	// datagram larger than the configured MTU (WithMTU), so this bound
+	// is not about what fits on the wire. A WriteTo exceeding it is a
+	// caller bug purely because RFC 768's own Length field is 16 bits
+	// and could not describe the datagram at all.
 	maxUDPPayload = 65507
 )
 

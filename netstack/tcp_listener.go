@@ -319,8 +319,8 @@ func (l *tcpListener) handleSYN(a *attachment, remoteIP netip.Addr, seg tcpSegme
 	mss := uint16(defaultMSSWhenAbsent)
 	if seg.hasMSS {
 		mss = seg.mss
-		if mss > defaultMSS {
-			mss = defaultMSS
+		if ourMSS := d.stack.maxSegmentSize(); mss > ourMSS {
+			mss = ourMSS
 		}
 	}
 
@@ -344,7 +344,7 @@ func (l *tcpListener) handleSYN(a *attachment, remoteIP netip.Addr, seg tcpSegme
 		flags:   flagSYN | flagACK,
 		window:  c.advertisedWindowLocked(),
 		hasMSS:  true,
-		mss:     defaultMSS,
+		mss:     d.stack.maxSegmentSize(),
 	}
 	c.mu.Unlock()
 

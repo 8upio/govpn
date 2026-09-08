@@ -72,6 +72,11 @@ type protocolHandler interface {
 // can still hand this stack a larger packet. See maxReadRetryBufferSize
 // and readLoop (WR-04) for how that outcome is handled without treating it
 // as a fatal, session-wide detach.
+//
+// This buffer only ever has to hold ONE fragment as it arrives on the
+// wire, never a whole reassembled datagram: reassembly.go materializes a
+// completed datagram into its own freshly allocated slice, well downstream
+// of this read loop.
 const readBufferSize = 2048
 
 // maxReadRetryBufferSize bounds the one-off larger buffer readLoop
@@ -81,6 +86,25 @@ const readBufferSize = 2048
 // beyond it can never help — a Read that still fails at this size is
 // treated as a genuine, terminal session failure, not a sizing problem.
 const maxReadRetryBufferSize = 65535
+
+// MTU bounds for WithMTU. The MTU governs two things and only two things:
+// the size above which writePacket fragments an outbound datagram, and the
+// MSS this stack advertises in every SYN-ACK (maxSegmentSize).
+const (
+	// defaultMTU is the `tun-mtu 1500` this project pushes to clients
+	// (ovpn.go's serverKM2Options). An embedder that changes neither
+	// side keeps the two in step.
+	defaultMTU = 1500
+
+	// minMTU is RFC 1122 §3.3.3's EMTU_R — the 576 octets every IPv4
+	// host must be able to reassemble, and the floor OpenVPN itself
+	// refuses to take `tun-mtu` below.
+	minMTU = 576
+
+	// maxMTU is the largest datagram RFC 791 §3.1's Total Length field
+	// can express: above this there is nothing left to fragment for.
+	maxMTU = maxIPv4Datagram
+)
 
 // Typed errors returned by New and Attach.
 var (
@@ -107,6 +131,11 @@ var (
 	// registerTCPHandler when a handler of that kind is already registered.
 	ErrHandlerAlreadyRegistered = errors.New("netstack: a protocol handler is already registered")
 
+	// ErrInvalidMTU is returned by New when WithMTU was given a value
+	// outside [minMTU, maxMTU]. Option has no error return, so New is
+	// the only place this range check can live.
+	ErrInvalidMTU = errors.New("netstack: MTU must be between 576 and 65535")
+
 	// ErrOutboundSourceMismatch is returned by writePacket when the
 	// outbound packet's IPv4 source is not the server's own tunnel IP
 	// (D-04, fail-closed).
@@ -128,21 +157,57 @@ type stats struct {
 	unhandledProtocolDropped atomic.Uint64
 	outboundSourceDropped    atomic.Uint64
 	shortReadBufferGrown     atomic.Uint64
+
+	// Fragment counters, appended after the fields above so Stats stays
+	// additively compatible (no existing name or position moves).
+	fragmentsReassembled    atomic.Uint64
+	reassemblyTimeouts      atomic.Uint64
+	reassemblyBoundExceeded atomic.Uint64
+	outboundFragmented      atomic.Uint64
 }
 
 // Stats is a point-in-time snapshot of Stack's drop/delivery counters,
 // returned by Stack.Stats().
 type Stats struct {
-	ICMPEchoRequests         uint64
-	ICMPEchoReplies          uint64
-	PacketsReceived          uint64
-	MalformedDropped         uint64
+	ICMPEchoRequests uint64
+	ICMPEchoReplies  uint64
+
+	// PacketsReceived counts FRAGMENTS, not datagrams: every packet
+	// handed to deliver is counted once, so a datagram that arrives as
+	// three fragments contributes three here and one to
+	// FragmentsReassembled.
+	PacketsReceived  uint64
+	MalformedDropped uint64
+
+	// FragmentsDropped counts fragments discarded by the reassembler:
+	// duplicates, fragments contradicting what is already known about
+	// their datagram, and fragments arriving after the attachment was
+	// torn down. A fragment with invalid GEOMETRY never reaches the
+	// reassembler at all — parseIPv4 rejects it and it lands in
+	// MalformedDropped.
 	FragmentsDropped         uint64
 	SpoofedSourceDropped     uint64
 	WrongDestinationDropped  uint64
 	UnhandledProtocolDropped uint64
 	OutboundSourceDropped    uint64
 	ShortReadBufferGrown     uint64
+
+	// FragmentsReassembled counts DATAGRAMS successfully reassembled
+	// from inbound fragments.
+	FragmentsReassembled uint64
+
+	// ReassemblyTimeouts counts DATAGRAMS discarded because they were
+	// still incomplete reassemblyTimeout after their first fragment.
+	ReassemblyTimeouts uint64
+
+	// ReassemblyBoundExceeded counts fragments refused because
+	// accepting them would have exceeded this session's buffer or byte
+	// budget.
+	ReassemblyBoundExceeded uint64
+
+	// OutboundFragmented counts DATAGRAMS this stack fragmented on the
+	// way out — not the number of fragments emitted.
+	OutboundFragmented uint64
 }
 
 // attachment is one Attach-ed session's routing state: the session itself,
@@ -154,12 +219,25 @@ type attachment struct {
 
 	stopCh   chan struct{}
 	stopOnce sync.Once
+
+	// reasm is this session's own IPv4 reassembly state — per session,
+	// never shared, so one client's fragments can neither poison nor
+	// starve another's. Its zero value is ready to use and allocates
+	// nothing until the first fragment arrives.
+	reasm reassembler
 }
 
-// stop closes a's stopCh exactly once. Safe to call more than once or
-// concurrently.
+// stop closes a's stopCh exactly once and discards a's reassembly state.
+// Safe to call more than once or concurrently. This is the single teardown
+// seam Detach, Close and detachAttachment all funnel through, so no
+// half-reassembled datagram can outlive the session that was building it.
+// It deliberately bumps no counter: discarding buffers because the session
+// went away is not a drop worth alerting on.
 func (a *attachment) stop() {
-	a.stopOnce.Do(func() { close(a.stopCh) })
+	a.stopOnce.Do(func() {
+		close(a.stopCh)
+		a.reasm.discardAll()
+	})
 }
 
 // Stack is a userspace IPv4 stack terminating exactly one server tunnel
@@ -169,6 +247,18 @@ func (a *attachment) stop() {
 type Stack struct {
 	serverIP netip.Addr
 	clock    Clock
+
+	// mtu is the largest datagram this stack emits unfragmented, and the
+	// value maxSegmentSize derives the advertised TCP MSS from. Set once
+	// in New (validated there, since Option cannot return an error) and
+	// never mutated afterwards, so it needs no lock.
+	mtu int
+
+	// ipID hands out the Identification values fragmentIPv4 stamps on
+	// outbound fragments. It starts at 1 and wraps naturally: RFC 6864
+	// §4 only requires uniqueness per (source, destination, protocol)
+	// within one reassembly window.
+	ipID atomic.Uint32
 
 	mu     sync.RWMutex
 	routes map[netip.Addr]*attachment
@@ -195,6 +285,20 @@ func WithClock(c Clock) Option {
 	return func(s *Stack) { s.clock = c }
 }
 
+// WithMTU overrides the Stack's MTU (default defaultMTU, 1500). It governs
+// exactly two things: the size above which an outbound datagram is
+// fragmented by writePacket, and the MSS advertised in every SYN-ACK
+// (maxSegmentSize), which is what keeps TCP unfragmented by construction.
+// mtu must be within [minMTU, maxMTU]; New returns ErrInvalidMTU otherwise,
+// since an Option cannot return an error itself.
+//
+// This is the embedder's choice for what this stack EMITS. It is
+// independent of the `tun-mtu 1500` the server pushes to clients, which is
+// fixed and advisory.
+func WithMTU(mtu int) Option {
+	return func(s *Stack) { s.mtu = mtu }
+}
+
 // New builds a Stack terminating serverIP (the server's own tunnel
 // address). serverIP must be a non-nil IPv4 address (D-17: IPv6 is
 // rejected, matching Config.Network and the 10.8.0.0/24 harness network).
@@ -210,11 +314,17 @@ func New(serverIP net.IP, opts ...Option) (*Stack, error) {
 	s := &Stack{
 		serverIP: netip.AddrFrom4([4]byte(ip4)),
 		clock:    SystemClock{},
+		mtu:      defaultMTU,
 		routes:   make(map[netip.Addr]*attachment),
 		stopCh:   make(chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(s)
+	}
+	// After the option loop, not inside WithMTU: Option has no error
+	// return, so this is the only place the range can be enforced.
+	if s.mtu < minMTU || s.mtu > maxMTU {
+		return nil, ErrInvalidMTU
 	}
 	return s, nil
 }
@@ -223,6 +333,26 @@ func New(serverIP net.IP, opts ...Option) (*Stack, error) {
 func (s *Stack) ServerIP() net.IP {
 	b := s.serverIP.As4()
 	return net.IPv4(b[0], b[1], b[2], b[3]).To4()
+}
+
+// MTU returns the stack's configured MTU (see WithMTU): the largest
+// datagram it emits without fragmenting, and the basis of the TCP MSS it
+// advertises.
+func (s *Stack) MTU() int { return s.mtu }
+
+// maxSegmentSize is the MSS this stack advertises in every SYN-ACK,
+// derived from the configured MTU: the MTU minus a 20-byte IPv4 header and
+// a 20-byte, options-free TCP header. minMTU (576) guarantees the result is
+// at least 536, RFC 9293's own floor.
+//
+// Deriving MSS from the MTU rather than fixing it is what keeps TCP
+// unfragmented BY CONSTRUCTION. At an MTU below 1500 a fixed 1460-byte
+// segment would split into two fragments on every full-sized send — and a
+// path that silently drops fragments would then black-hole the connection
+// entirely while small segments kept flowing, exactly the failure mode RFC
+// 8900 warns about.
+func (s *Stack) maxSegmentSize() uint16 {
+	return uint16(s.mtu - minIPv4HeaderLen - tcpHeaderMinLen)
 }
 
 // toIPv4Addr converts ip to a netip.Addr, rejecting nil and non-IPv4
@@ -415,15 +545,25 @@ func (s *Stack) readLoop(a *attachment) {
 //  2. the packet's IPv4 destination must equal the server tunnel IP — this
 //     stack is a terminator, not a router, and forwards nothing.
 //
-// Only then does it switch on the protocol: ICMP is handled inline, UDP
-// and TCP are handed to the registered dispatch-seam handler if one
-// exists, and everything else (including a parse failure or a dropped
-// fragment) is counted in exactly one Stats() counter and dropped.
+// Only then is the packet dispatched — a complete datagram directly, a
+// fragment through this attachment's own reassembler first.
+//
+// Running both ACL checks strictly BEFORE reasm.add is the security
+// property the whole reassembly design rests on (T-FVA-02): a fragment
+// whose source is not this session's own registered IP is dropped before
+// it can allocate a single byte of buffer state, so one client can neither
+// poison nor exhaust another's reassembly buffers.
+//
+// Note that packetsReceived counts FRAGMENTS, not datagrams: a datagram
+// arriving in three fragments is counted three times here and once in
+// fragmentsReassembled.
 func (s *Stack) deliver(a *attachment, pkt []byte) {
 	s.stats.packetsReceived.Add(1)
 
 	hdr, err := parseIPv4(pkt)
 	if err != nil {
+		// Includes errBadFragment: a fragment whose geometry is invalid
+		// is malformed, not a reassembly failure.
 		s.stats.malformedDropped.Add(1)
 		return
 	}
@@ -438,10 +578,40 @@ func (s *Stack) deliver(a *attachment, pkt []byte) {
 	}
 
 	if hdr.isFragment() {
-		s.stats.fragmentsDropped.Add(1)
+		datagram, outcome, expired := a.reasm.add(s.clock.Now(), hdr, pkt)
+		if expired > 0 {
+			s.stats.reassemblyTimeouts.Add(uint64(expired))
+		}
+		switch outcome {
+		case reasmComplete:
+			// Re-parse what the reassembler built rather than trusting
+			// it: dispatch below indexes with the header's own offsets,
+			// so those offsets must describe THIS buffer.
+			whole, err := parseIPv4(datagram)
+			if err != nil {
+				s.stats.malformedDropped.Add(1)
+				return
+			}
+			s.stats.fragmentsReassembled.Add(1)
+			s.dispatch(a, whole, datagram)
+		case reasmBoundExceeded:
+			s.stats.reassemblyBoundExceeded.Add(1)
+		case reasmDuplicate, reasmConflict, reasmClosed:
+			s.stats.fragmentsDropped.Add(1)
+		case reasmBuffered:
+			// Nothing to count: the fragment is held, not dropped.
+		}
 		return
 	}
 
+	s.dispatch(a, hdr, pkt)
+}
+
+// dispatch switches on a COMPLETE datagram's protocol: ICMP is handled
+// inline, UDP and TCP are handed to the registered dispatch-seam handler
+// if one exists, and everything else is counted in exactly one Stats()
+// counter and dropped. hdr must be the result of parsing pkt.
+func (s *Stack) dispatch(a *attachment, hdr ipv4Header, pkt []byte) {
 	payload := pkt[hdr.payloadOff:hdr.totalLen]
 
 	switch hdr.protocol {
@@ -477,6 +647,12 @@ func (s *Stack) deliver(a *attachment, pkt []byte) {
 // wrong source must not reach the wire. On success it calls a.sess.Write;
 // Write is documented safe to call concurrently from any goroutine (see
 // the Session doc comment above), so no lock is taken here.
+//
+// A datagram larger than the configured MTU is fragmented (fragmentIPv4)
+// and its fragments written in order. Ordering within one datagram is
+// guaranteed because they are written from this single goroutine; if a
+// Write fails partway, the fragments already sent are simply lost and time
+// out in the peer's own reassembly buffer, exactly as with any IP stack.
 func (s *Stack) writePacket(a *attachment, pkt []byte) error {
 	hdr, err := parseIPv4(pkt)
 	if err != nil {
@@ -486,8 +662,24 @@ func (s *Stack) writePacket(a *attachment, pkt []byte) error {
 		s.stats.outboundSourceDropped.Add(1)
 		return ErrOutboundSourceMismatch
 	}
-	_, err = a.sess.Write(pkt)
-	return err
+
+	if hdr.totalLen <= s.mtu {
+		_, err = a.sess.Write(pkt)
+		return err
+	}
+
+	id := uint16(s.ipID.Add(1))
+	frags := fragmentIPv4(hdr, pkt, s.mtu, id)
+	if len(frags) == 0 {
+		return errBadFragment
+	}
+	s.stats.outboundFragmented.Add(1)
+	for _, frag := range frags {
+		if _, err := a.sess.Write(frag); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Stats returns a point-in-time snapshot of the stack's drop/delivery
@@ -504,6 +696,10 @@ func (s *Stack) Stats() Stats {
 		UnhandledProtocolDropped: s.stats.unhandledProtocolDropped.Load(),
 		OutboundSourceDropped:    s.stats.outboundSourceDropped.Load(),
 		ShortReadBufferGrown:     s.stats.shortReadBufferGrown.Load(),
+		FragmentsReassembled:     s.stats.fragmentsReassembled.Load(),
+		ReassemblyTimeouts:       s.stats.reassemblyTimeouts.Load(),
+		ReassemblyBoundExceeded:  s.stats.reassemblyBoundExceeded.Load(),
+		OutboundFragmented:       s.stats.outboundFragmented.Load(),
 	}
 }
 

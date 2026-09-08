@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"net"
+	"net/netip"
 	"sync"
 	"testing"
 	"time"
@@ -316,36 +317,516 @@ func TestNonServerDestinationDropped(t *testing.T) {
 	}
 }
 
-func TestFragmentDropped(t *testing.T) {
+// waitForStat polls stack.Stats() until pred is satisfied or the timeout
+// expires, then returns the final snapshot. The stack processes inbound
+// packets on its own read-loop goroutine, so a test that asserts a counter
+// immediately after feeding a packet would race the loop; this is the
+// barrier every fragment test below crosses before reading state.
+func waitForStat(t *testing.T, stack *Stack, pred func(Stats) bool, timeout time.Duration) Stats {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		st := stack.Stats()
+		if pred(st) {
+			return st
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for a Stats condition; last snapshot: %+v", st)
+			return st
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// icmpEchoFragments splits a complete ICMP echo request into n 8-aligned
+// fragments of one datagram, in ascending offset order, and returns the
+// original ICMP message alongside them.
+func icmpEchoFragments(t *testing.T, src, dst netip.Addr, id uint16, chunk int, payload []byte) (icmpMsg []byte, frags [][]byte) {
+	t.Helper()
+	if chunk%8 != 0 {
+		t.Fatalf("icmpEchoFragments: chunk %d is not a multiple of 8", chunk)
+	}
+	req := buildICMPEchoRequest(src, dst, 1, 1, payload)
+	icmpMsg = req[minIPv4HeaderLen:]
+
+	for off := 0; off < len(icmpMsg); off += chunk {
+		end := off + chunk
+		if end > len(icmpMsg) {
+			end = len(icmpMsg)
+		}
+		frags = append(frags, buildFragmentForTest(src, dst, protocolICMP, id, off, end < len(icmpMsg), icmpMsg[off:end]))
+	}
+	return icmpMsg, frags
+}
+
+// TestFragmentedICMPEchoReassembled is the inbound end-to-end proof: an
+// echo request arriving as three fragments IN REVERSE ORDER is reassembled
+// and answered exactly once. PacketsReceived counts the three fragments;
+// FragmentsReassembled counts the one datagram they became.
+func TestFragmentedICMPEchoReassembled(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
 	fs := newFakeSession()
-	ip := net.IPv4(10, 8, 0, 2).To4()
-	if err := stack.Attach(fs, ip); err != nil {
+	clientIP := net.IPv4(10, 8, 0, 2).To4()
+	if err := stack.Attach(fs, clientIP); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
 
-	pkt1 := buildICMPEchoRequest(mustAddr(ip), mustAddr(testServerIP()), 1, 1, nil)
-	setFlagsFragOffsetForTest(pkt1, flagMoreFragments)
-	fs.inbound <- pkt1
-	assertNoOutbound(t, fs, 50*time.Millisecond)
-	if got := stack.Stats().FragmentsDropped; got != 1 {
-		t.Fatalf("Stats().FragmentsDropped = %d, want 1 after MF flag set", got)
+	client, server := mustAddr(clientIP), mustAddr(testServerIP())
+	icmpMsg, frags := icmpEchoFragments(t, client, server, 0x2222, 16, bytes.Repeat([]byte{0xAB}, 40))
+	if len(frags) != 3 {
+		t.Fatalf("test fixture produced %d fragments, want 3", len(frags))
 	}
 
-	pkt2 := buildICMPEchoRequest(mustAddr(ip), mustAddr(testServerIP()), 2, 1, nil)
-	setFlagsFragOffsetForTest(pkt2, 5)
-	fs.inbound <- pkt2
+	for i := len(frags) - 1; i >= 0; i-- {
+		fs.inbound <- frags[i]
+	}
+
+	reply := waitForOutbound(t, fs, time.Second)
+	hdr, err := parseIPv4(reply)
+	if err != nil {
+		t.Fatalf("parseIPv4(reply): %v", err)
+	}
+	replyICMP := reply[hdr.payloadOff:hdr.totalLen]
+	if replyICMP[0] != icmpTypeEchoReply {
+		t.Fatalf("reply ICMP type = %d, want %d (echo reply)", replyICMP[0], icmpTypeEchoReply)
+	}
+	if !bytes.Equal(replyICMP[4:], icmpMsg[4:]) {
+		t.Fatal("reply identifier/sequence/payload does not echo the reassembled request")
+	}
+
+	// Exactly one reply: the two buffered fragments must not each
+	// produce one of their own.
 	assertNoOutbound(t, fs, 50*time.Millisecond)
-	if got := stack.Stats().FragmentsDropped; got != 2 {
-		t.Fatalf("Stats().FragmentsDropped = %d, want 2 after a non-zero fragment offset", got)
+
+	st := stack.Stats()
+	if st.FragmentsReassembled != 1 {
+		t.Errorf("Stats().FragmentsReassembled = %d, want 1", st.FragmentsReassembled)
+	}
+	if st.PacketsReceived != 3 {
+		t.Errorf("Stats().PacketsReceived = %d, want 3 (fragments are counted individually)", st.PacketsReceived)
+	}
+	if st.FragmentsDropped != 0 {
+		t.Errorf("Stats().FragmentsDropped = %d, want 0", st.FragmentsDropped)
+	}
+	if st.ICMPEchoReplies != 1 {
+		t.Errorf("Stats().ICMPEchoReplies = %d, want 1", st.ICMPEchoReplies)
 	}
 }
 
-func setFlagsFragOffsetForTest(pkt []byte, v uint16) {
-	pkt[6] = byte(v >> 8)
-	pkt[7] = byte(v)
+// TestOversizedInboundUDPDatagramReassembled is the Voxio case this whole
+// change exists for: a SIP-sized UDP datagram larger than the MTU, sent as
+// fragments, must arrive WHOLE at the application's ReadFrom.
+func TestOversizedInboundUDPDatagramReassembled(t *testing.T) {
+	stack := newTestStack(t)
+	defer stack.Close()
+
+	conn, err := stack.ListenUDP(5060)
+	if err != nil {
+		t.Fatalf("ListenUDP: %v", err)
+	}
+	defer conn.Close()
+
+	fs := newFakeSession()
+	clientIP := net.IPv4(10, 8, 0, 2).To4()
+	if err := stack.Attach(fs, clientIP); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	client, server := mustAddr(clientIP), mustAddr(testServerIP())
+	appPayload := bytes.Repeat([]byte("INVITE sip:voxio "), 200) // 3400 bytes
+	datagram := buildUDP(nil, client, server, 40000, 5060, appPayload)
+
+	const chunk = 1480
+	var sent int
+	for off := 0; off < len(datagram); off += chunk {
+		end := off + chunk
+		if end > len(datagram) {
+			end = len(datagram)
+		}
+		fs.inbound <- buildFragmentForTest(client, server, protocolUDP, 0x3333, off, end < len(datagram), datagram[off:end])
+		sent++
+	}
+	if sent < 3 {
+		t.Fatalf("test fixture produced %d fragments, want at least 3", sent)
+	}
+
+	buf := make([]byte, 65535)
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	n, addr, err := conn.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	if !bytes.Equal(buf[:n], appPayload) {
+		t.Fatalf("ReadFrom returned %d bytes, want the %d-byte datagram back whole", n, len(appPayload))
+	}
+	udpAddr, ok := addr.(*net.UDPAddr)
+	if !ok || !udpAddr.IP.Equal(clientIP) || udpAddr.Port != 40000 {
+		t.Fatalf("ReadFrom addr = %v, want %v:40000", addr, clientIP)
+	}
+
+	st := stack.Stats()
+	if st.FragmentsReassembled != 1 {
+		t.Errorf("Stats().FragmentsReassembled = %d, want 1", st.FragmentsReassembled)
+	}
+	if st.PacketsReceived != uint64(sent) {
+		t.Errorf("Stats().PacketsReceived = %d, want %d", st.PacketsReceived, sent)
+	}
+}
+
+// TestSpoofedFragmentAllocatesNothing is T-FVA-02: the source-IP ACL runs
+// strictly BEFORE the reassembler, so a fragment claiming another
+// session's IP is dropped without allocating a single buffer.
+func TestSpoofedFragmentAllocatesNothing(t *testing.T) {
+	stack := newTestStack(t)
+	defer stack.Close()
+
+	fs := newFakeSession()
+	clientIP := net.IPv4(10, 8, 0, 2).To4()
+	if err := stack.Attach(fs, clientIP); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	stack.mu.RLock()
+	a := stack.routes[mustAddr(clientIP)]
+	stack.mu.RUnlock()
+
+	otherClient := mustAddr(net.IPv4(10, 8, 0, 3).To4())
+	fs.inbound <- buildFragmentForTest(otherClient, mustAddr(testServerIP()), protocolUDP, 1, 0, true, bytes.Repeat([]byte{0x01}, 16))
+
+	st := waitForStat(t, stack, func(s Stats) bool { return s.SpoofedSourceDropped == 1 }, time.Second)
+	if st.FragmentsDropped != 0 || st.ReassemblyBoundExceeded != 0 {
+		t.Errorf("a spoofed fragment was counted as a reassembly outcome: %+v", st)
+	}
+
+	a.reasm.mu.Lock()
+	bufs, bytesHeld := len(a.reasm.bufs), a.reasm.bytes
+	a.reasm.mu.Unlock()
+	if bufs != 0 || bytesHeld != 0 {
+		t.Fatalf("a spoofed fragment allocated reassembly state: %d buffers, %d bytes", bufs, bytesHeld)
+	}
+}
+
+// TestMisalignedFragmentIsMalformed: a non-final fragment whose payload is
+// not a multiple of 8 never reaches the reassembler — parseIPv4 rejects
+// its geometry, so it lands in MalformedDropped, not FragmentsDropped.
+func TestMisalignedFragmentIsMalformed(t *testing.T) {
+	stack := newTestStack(t)
+	defer stack.Close()
+
+	fs := newFakeSession()
+	clientIP := net.IPv4(10, 8, 0, 2).To4()
+	if err := stack.Attach(fs, clientIP); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	stack.mu.RLock()
+	a := stack.routes[mustAddr(clientIP)]
+	stack.mu.RUnlock()
+
+	client, server := mustAddr(clientIP), mustAddr(testServerIP())
+	fs.inbound <- buildFragmentForTest(client, server, protocolUDP, 1, 1480, true, make([]byte, 13))
+
+	st := waitForStat(t, stack, func(s Stats) bool { return s.MalformedDropped == 1 }, time.Second)
+	if st.FragmentsDropped != 0 {
+		t.Errorf("Stats().FragmentsDropped = %d, want 0 (bad geometry is malformed, not a reassembly drop)", st.FragmentsDropped)
+	}
+
+	a.reasm.mu.Lock()
+	bufs := len(a.reasm.bufs)
+	a.reasm.mu.Unlock()
+	if bufs != 0 {
+		t.Fatalf("a geometrically invalid fragment allocated %d buffers, want 0", bufs)
+	}
+}
+
+// TestLoneFragmentTimesOut drives the lazy expiry sweep through the stack
+// with a fake clock: a fragment nobody ever completes is discarded 30 s
+// later, counted once per DATAGRAM, by whichever fragment happens to
+// arrive next.
+func TestLoneFragmentTimesOut(t *testing.T) {
+	clock := newFakeClock(time.Unix(1000, 0))
+	stack := newTestStack(t, WithClock(clock))
+	defer stack.Close()
+
+	fs := newFakeSession()
+	clientIP := net.IPv4(10, 8, 0, 2).To4()
+	if err := stack.Attach(fs, clientIP); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	client, server := mustAddr(clientIP), mustAddr(testServerIP())
+	fs.inbound <- buildFragmentForTest(client, server, protocolUDP, 0x4444, 0, true, make([]byte, 16))
+	waitForStat(t, stack, func(s Stats) bool { return s.PacketsReceived == 1 }, time.Second)
+
+	clock.Advance(31 * time.Second)
+
+	fs.inbound <- buildFragmentForTest(client, server, protocolUDP, 0x5555, 0, true, make([]byte, 16))
+	st := waitForStat(t, stack, func(s Stats) bool { return s.ReassemblyTimeouts == 1 }, time.Second)
+	if st.FragmentsDropped != 0 {
+		t.Errorf("Stats().FragmentsDropped = %d, want 0 (a timeout is its own counter)", st.FragmentsDropped)
+	}
+}
+
+// TestOutboundFragmentation is the outbound half: a 3000-byte UDP payload
+// written at a 1500-byte MTU leaves as three correctly-offset,
+// correctly-flagged, correctly-checksummed fragments sharing one
+// identification — and a real reassembler puts them back together into the
+// datagram the caller asked for. WriteTo still reports len(p): from the
+// caller's perspective the whole datagram was accepted.
+func TestOutboundFragmentation(t *testing.T) {
+	stack := newTestStack(t, WithMTU(1500))
+	defer stack.Close()
+
+	conn, err := stack.ListenUDP(5060)
+	if err != nil {
+		t.Fatalf("ListenUDP: %v", err)
+	}
+	defer conn.Close()
+
+	fs := newFakeSession()
+	clientIP := net.IPv4(10, 8, 0, 2).To4()
+	if err := stack.Attach(fs, clientIP); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	payload := make([]byte, 3000)
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+	n, err := conn.WriteTo(payload, &net.UDPAddr{IP: clientIP, Port: 40000})
+	if err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	if n != len(payload) {
+		t.Fatalf("WriteTo = %d, want %d (the whole datagram was accepted)", n, len(payload))
+	}
+
+	var frags [][]byte
+	for i := 0; i < 3; i++ {
+		frags = append(frags, waitForOutbound(t, fs, time.Second))
+	}
+	assertNoOutbound(t, fs, 50*time.Millisecond)
+
+	wantOffsets := []int{0, 1480, 2960}
+	var sharedID uint16
+	var r reassembler
+	var datagram []byte
+	for i, frag := range frags {
+		if len(frag) > stack.MTU() {
+			t.Errorf("fragment %d is %d bytes, larger than the MTU %d", i, len(frag), stack.MTU())
+		}
+		hdr, err := parseIPv4(frag)
+		if err != nil {
+			t.Fatalf("parseIPv4(fragment %d): %v", i, err)
+		}
+		if hdr.fragOffset != wantOffsets[i] {
+			t.Errorf("fragment %d offset = %d, want %d", i, hdr.fragOffset, wantOffsets[i])
+		}
+		if wantMF := i < 2; hdr.moreFragments != wantMF {
+			t.Errorf("fragment %d MF = %v, want %v", i, hdr.moreFragments, wantMF)
+		}
+		if i == 0 {
+			sharedID = hdr.id
+			if sharedID == 0 {
+				t.Error("outbound fragments carry identification 0; an identification must be assigned when fragmenting")
+			}
+		} else if hdr.id != sharedID {
+			t.Errorf("fragment %d id = %#04x, want %#04x (all fragments of one datagram share it)", i, hdr.id, sharedID)
+		}
+		if cs := internetChecksum(frag[:hdr.ihl]); cs != 0 {
+			t.Errorf("fragment %d header checksum does not fold to zero (got %#04x)", i, cs)
+		}
+
+		out, outcome, _ := r.add(time.Unix(0, 0), hdr, frag)
+		if i < 2 && outcome != reasmBuffered {
+			t.Fatalf("fragment %d outcome = %v, want reasmBuffered", i, outcome)
+		}
+		if i == 2 {
+			if outcome != reasmComplete {
+				t.Fatalf("final fragment outcome = %v, want reasmComplete", outcome)
+			}
+			datagram = out
+		}
+	}
+
+	hdr, err := parseIPv4(datagram)
+	if err != nil {
+		t.Fatalf("parseIPv4(reassembled): %v", err)
+	}
+	srcPort, dstPort, data, err := parseUDP(datagram[hdr.payloadOff:hdr.totalLen])
+	if err != nil {
+		t.Fatalf("parseUDP(reassembled): %v", err)
+	}
+	if srcPort != 5060 || dstPort != 40000 {
+		t.Errorf("reassembled ports = %d -> %d, want 5060 -> 40000", srcPort, dstPort)
+	}
+	if !bytes.Equal(data, payload) {
+		t.Fatal("the reassembled UDP payload is not the payload WriteTo was given")
+	}
+
+	if got := stack.Stats().OutboundFragmented; got != 1 {
+		t.Fatalf("Stats().OutboundFragmented = %d, want 1 (counted per DATAGRAM, not per fragment)", got)
+	}
+}
+
+// TestMTUOption asserts WithMTU's contract: a default of 1500, both ends
+// of the valid range enforced by New (Option cannot return an error
+// itself), and MTU() reporting what was configured.
+func TestMTUOption(t *testing.T) {
+	if got := newTestStack(t).MTU(); got != defaultMTU {
+		t.Errorf("default MTU() = %d, want %d", got, defaultMTU)
+	}
+
+	s, err := New(testServerIP(), WithMTU(1000))
+	if err != nil {
+		t.Fatalf("New(WithMTU(1000)): %v", err)
+	}
+	if got := s.MTU(); got != 1000 {
+		t.Errorf("MTU() = %d, want 1000", got)
+	}
+
+	for _, mtu := range []int{minMTU - 1, maxMTU + 1, 0, -1} {
+		if _, err := New(testServerIP(), WithMTU(mtu)); !errors.Is(err, ErrInvalidMTU) {
+			t.Errorf("New(WithMTU(%d)) = %v, want ErrInvalidMTU", mtu, err)
+		}
+	}
+
+	// The boundaries themselves are valid.
+	for _, mtu := range []int{minMTU, maxMTU} {
+		if _, err := New(testServerIP(), WithMTU(mtu)); err != nil {
+			t.Errorf("New(WithMTU(%d)) = %v, want success (the bounds are inclusive)", mtu, err)
+		}
+	}
+}
+
+// TestTCPMSSFollowsMTU: the SYN-ACK's advertised MSS is derived from the
+// configured MTU (1000 - 20 IPv4 - 20 TCP = 960), which is what keeps TCP
+// unfragmented BY CONSTRUCTION — a full-sized response at a sub-1500 MTU
+// must produce no outbound fragmentation at all.
+func TestTCPMSSFollowsMTU(t *testing.T) {
+	stack := newTestStack(t, WithMTU(1000))
+	defer stack.Close()
+
+	ln, err := stack.ListenTCP(8080)
+	if err != nil {
+		t.Fatalf("ListenTCP: %v", err)
+	}
+	defer ln.Close()
+
+	fs := newFakeSession()
+	clientIP := net.IPv4(10, 8, 0, 2).To4()
+	if err := stack.Attach(fs, clientIP); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	client := newTCPTestClient(t, fs, clientIP, 34567, testServerIP(), 8080)
+	client.connect()
+
+	if want := uint16(960); client.serverMSS != want {
+		t.Fatalf("SYN-ACK MSS = %d, want %d (MTU 1000 - 20 IPv4 - 20 TCP)", client.serverMSS, want)
+	}
+	if got := stack.maxSegmentSize(); got != 960 {
+		t.Fatalf("maxSegmentSize() = %d, want 960", got)
+	}
+
+	conn, err := acceptWithTimeout(t, ln, time.Second)
+	if err != nil {
+		t.Fatalf("Accept: %v", err)
+	}
+	defer conn.Close()
+
+	response := bytes.Repeat([]byte{0x5A}, 8000)
+	go func() {
+		_, _ = conn.Write(response)
+	}()
+
+	got := client.recvData(len(response), 5*time.Second)
+	if !bytes.Equal(got, response) {
+		t.Fatal("the client did not receive the response bytes intact")
+	}
+	if n := stack.Stats().OutboundFragmented; n != 0 {
+		t.Fatalf("Stats().OutboundFragmented = %d, want 0 — TCP segmented to the MTU-derived MSS must never need fragmenting", n)
+	}
+}
+
+// TestDetachWithOpenReassemblyBuffer asserts T-FVA-05: tearing down a
+// session with a half-filled reassembly buffer frees that state, never
+// panics, and leaves a re-attach on the same IP starting clean.
+func TestDetachWithOpenReassemblyBuffer(t *testing.T) {
+	stack := newTestStack(t)
+	defer stack.Close()
+
+	fs := newFakeSession()
+	clientIP := net.IPv4(10, 8, 0, 2).To4()
+	if err := stack.Attach(fs, clientIP); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	stack.mu.RLock()
+	first := stack.routes[mustAddr(clientIP)]
+	stack.mu.RUnlock()
+
+	client, server := mustAddr(clientIP), mustAddr(testServerIP())
+	_, frags := icmpEchoFragments(t, client, server, 0x6666, 16, bytes.Repeat([]byte{0xCD}, 40))
+	fs.inbound <- frags[0]
+	waitForStat(t, stack, func(s Stats) bool { return s.PacketsReceived == 1 }, time.Second)
+
+	first.reasm.mu.Lock()
+	held := len(first.reasm.bufs)
+	first.reasm.mu.Unlock()
+	if held != 1 {
+		t.Fatalf("expected 1 half-filled reassembly buffer before detach, got %d", held)
+	}
+
+	if !stack.Detach(clientIP) {
+		t.Fatal("Detach = false, want true")
+	}
+
+	first.reasm.mu.Lock()
+	bufs, bytesHeld, closed := len(first.reasm.bufs), first.reasm.bytes, first.reasm.closed
+	first.reasm.mu.Unlock()
+	if bufs != 0 || bytesHeld != 0 || !closed {
+		t.Fatalf("after detach: %d buffers, %d bytes, closed=%v — want 0/0/true", bufs, bytesHeld, closed)
+	}
+
+	// Detach runs through the same stopOnce as Close and
+	// detachAttachment; calling it again must not panic.
+	first.stop()
+
+	// A re-attach on the same IP starts with empty reassembly state and
+	// reassembles a fresh datagram normally.
+	fs2 := newFakeSession()
+	if err := stack.Attach(fs2, clientIP); err != nil {
+		t.Fatalf("re-Attach: %v", err)
+	}
+	stack.mu.RLock()
+	second := stack.routes[mustAddr(clientIP)]
+	stack.mu.RUnlock()
+	if second == first {
+		t.Fatal("re-Attach reused the detached attachment")
+	}
+	second.reasm.mu.Lock()
+	bufs, closed = len(second.reasm.bufs), second.reasm.closed
+	second.reasm.mu.Unlock()
+	if bufs != 0 || closed {
+		t.Fatalf("a re-attached session started with %d buffers, closed=%v — want 0/false", bufs, closed)
+	}
+
+	for _, frag := range frags {
+		fs2.inbound <- frag
+	}
+	reply := waitForOutbound(t, fs2, time.Second)
+	hdr, err := parseIPv4(reply)
+	if err != nil {
+		t.Fatalf("parseIPv4(reply): %v", err)
+	}
+	if reply[hdr.payloadOff] != icmpTypeEchoReply {
+		t.Fatal("the re-attached session did not get an echo reply for a freshly fragmented request")
+	}
 }
 
 func TestOutboundSourceIPFailClosed(t *testing.T) {

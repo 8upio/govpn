@@ -23,11 +23,14 @@ import "time"
 // CONTEXT.md/RESEARCH.md decision that scoped it, in
 // internal/reliable/reliable.go's own citation-header style.
 const (
-	// defaultMSS is the MSS this stack advertises in every SYN-ACK:
-	// RESEARCH.md Pattern 3 — tun-mtu 1500 (ovpn.go's serverKM2Options)
-	// minus 20B IPv4 minus 20B TCP, with no additional VPN-specific
-	// subtraction (that overhead is already accounted for below the
-	// Session boundary).
+	// defaultMSS is this stack's DOCUMENTED default MSS — the value
+	// Stack.maxSegmentSize returns at defaultMTU: RESEARCH.md
+	// Pattern 3 — tun-mtu 1500 (ovpn.go's serverKM2Options) minus 20B
+	// IPv4 minus 20B TCP, with no additional VPN-specific subtraction
+	// (that overhead is already accounted for below the Session
+	// boundary). The MSS actually advertised is derived from the
+	// configured MTU (WithMTU), not read from here: see
+	// Stack.maxSegmentSize.
 	defaultMSS = 1460
 
 	// defaultReceiveWindow is D-07's "~64KB" advertised receive window —
@@ -268,7 +271,7 @@ func (c *tcpConn) onRTOFired() {
 			flags:   flagSYN | flagACK,
 			window:  c.advertisedWindowLocked(),
 			hasMSS:  true,
-			mss:     defaultMSS,
+			mss:     c.stack.maxSegmentSize(),
 		})
 
 	case c.sentBytes > 0:
