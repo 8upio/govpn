@@ -14,6 +14,7 @@ package ovpn
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"crypto/tls"
 	"errors"
@@ -96,9 +97,13 @@ type Config struct {
 	// distinguishing why: the embedder calling Session.Close directly
 	// (CloseReasonEmbedder), an authenticated client-side
 	// explicit-exit-notify (CloseReasonClientExitNotify), the server's own
-	// idle-session reaper (CloseReasonIdleReap), or Server.Close tearing
-	// down every live session (CloseReasonServerClose). It runs on its own
-	// goroutine, separate from whatever goroutine performed the teardown,
+	// idle-session reaper (CloseReasonIdleReap), Server.Close tearing down
+	// every live session (CloseReasonServerClose), or Config.AuthUserPass
+	// rejecting a renegotiation's credentials (CloseReasonAuthFailed —
+	// note this reason only ever appears here for a renegotiation-time
+	// rejection; an initial-handshake rejection never reaches OnSession in
+	// the first place, so it never reaches OnSessionClosed either). It runs
+	// on its own goroutine, separate from whatever goroutine performed the teardown,
 	// so a slow or blocking OnSessionClosed never delays that teardown
 	// itself — but Server.Close DOES wait for every OnSessionClosed
 	// invocation it triggered to return before Server.Close itself
@@ -135,7 +140,45 @@ type Config struct {
 	// existing drop-newest overflow policy (D-06) kicks in — useful for a
 	// bursty embedder (e.g. RTP) that can occasionally fall behind Read.
 	SessionInboundQueue int
+
+	// AuthUserPass, if set, authenticates a client's username/password
+	// credentials from its Key Method 2 message. nil means today's
+	// behaviour exactly: credentials are still parsed off the wire (they
+	// have to be, to reach peer_info behind them — ssl.c:2420-2423) but
+	// are otherwise ignored. When set, the hook runs on the INITIAL
+	// handshake and on EVERY renegotiation (ssl.c:2426-2470's
+	// verify_user_pass is reached from key_method_2_read, i.e. once per
+	// key exchange — a real client re-sends its credentials in each Key
+	// Method 2 message, so a client cannot authenticate once and then
+	// rotate keys unauthenticated).
+	//
+	// A credential field that is empty, or whose on-wire length exceeds
+	// USER_PASS_LEN (128 bytes, misc.h:65-70), is an auth failure the hook
+	// never sees — never a panic, never a silent pass (D-02). A non-nil
+	// error from the hook rejects the client: it receives the control
+	// string AUTH_FAILED (or AUTH_FAILED,<reason> if the error implements
+	// AuthClientReason) and the session is torn down with
+	// CloseReasonAuthFailed. A panicking hook is recovered, routed to
+	// Config.OnSessionPanic exactly like a panicking OnSession, and
+	// treated as a rejection (fail closed).
+	//
+	// The hook must be safe for concurrent use across sessions (it may be
+	// called from many session goroutines at once) and must not block for
+	// long: it runs inside the session's handshake window
+	// (Server.handshakeWindow), so a slow hook can starve that budget for
+	// legitimate protocol work.
+	AuthUserPass func(username, password string, cs tls.ConnectionState) error
 }
+
+// AuthClientReason is the optional interface an error returned from
+// Config.AuthUserPass may implement to supply a human-readable rejection
+// reason sent to the client as AUTH_FAILED,<reason> instead of the plain
+// AUTH_FAILED form (push.c:396-430 send_auth_failed, push.c:49-70
+// receive_auth_failed). The reason is sanitized before it reaches the wire
+// (control bytes stripped, capped at 128 bytes) so it cannot inject a NUL
+// (which would truncate the control string) or a newline (which would
+// corrupt the client's log parsing).
+type AuthClientReason interface{ ClientReason() string }
 
 // CloseReason distinguishes why a Session ended, reported to
 // Config.OnSessionClosed and readable at any time via Session.CloseReason.
@@ -179,6 +222,15 @@ const (
 	// append-only safe) but would still be a mid-cycle behavioral surprise
 	// for anyone switching exhaustively on CloseReason today.
 	CloseReasonReplaced
+
+	// CloseReasonAuthFailed is recorded when Config.AuthUserPass rejected
+	// the client's credentials (a non-nil error, an empty or over-long
+	// credential field, or a recovered hook panic). On the INITIAL
+	// handshake the session was never published (Session.published), so
+	// OnSessionClosed does NOT fire for it — same rule as any other
+	// handshake-time failure. On a RENEGOTIATION the session was already
+	// published, so OnSessionClosed DOES fire with this reason.
+	CloseReasonAuthFailed
 )
 
 // String returns a lowercase-kebab token for r, or a numeric fallback for
@@ -197,6 +249,8 @@ func (r CloseReason) String() string {
 		return "server-close"
 	case CloseReasonReplaced:
 		return "replaced"
+	case CloseReasonAuthFailed:
+		return "auth-failed"
 	default:
 		return fmt.Sprintf("CloseReason(%d)", int(r))
 	}
@@ -486,6 +540,28 @@ func (s *Server) Serve(pc net.PacketConn) error {
 	}
 	if s.cfg.TLSConfig == nil {
 		return errors.New("ovpn: Config.TLSConfig must be set")
+	}
+	// D-07: an allow-list on the two ClientAuthType values that genuinely
+	// make a client certificate mandatory — deliberately NOT a `<`
+	// comparison. tls.ClientAuthType orders as NoClientCert=0,
+	// RequestClientCert=1, RequireAnyClientCert=2,
+	// VerifyClientCertIfGiven=3, RequireAndVerifyClientCert=4, so
+	// VerifyClientCertIfGiven (3) sorts ABOVE RequireAnyClientCert (2) yet
+	// does NOT require the client to present a certificate at all — an
+	// ordering comparison (`ClientAuth < RequireAnyClientCert`) would wave
+	// through exactly that one unauthenticated configuration
+	// (T-m4e-01). Without a mandatory client certificate, TLS itself
+	// authenticates nobody, so Config.AuthUserPass becomes the only
+	// remaining authentication mechanism — Serve refuses to start rather
+	// than silently accept any client.
+	switch s.cfg.TLSConfig.ClientAuth {
+	case tls.RequireAnyClientCert, tls.RequireAndVerifyClientCert:
+		// A client certificate is mandatory, so the TLS handshake itself
+		// authenticates every client.
+	default:
+		if s.cfg.AuthUserPass == nil {
+			return errors.New("ovpn: Config.TLSConfig.ClientAuth does not require a client certificate and Config.AuthUserPass is nil: the server would accept any client without authenticating it; set Config.AuthUserPass or use tls.RequireAnyClientCert/tls.RequireAndVerifyClientCert")
+		}
 	}
 	// Validated from s.cfg directly, never from the already-resolved
 	// s.pingInterval/s.reapWindow/s.sessionInboundQueue fields NewServer
@@ -937,6 +1013,20 @@ func (s *Server) runHandshake(sess *Session) {
 	}
 
 	if err := s.performKeyMethod2Exchange(sess, tlsConn); err != nil {
+		var af *authFailure
+		if errors.As(err, &af) {
+			// close(sess.doneCh) deliberately stays AFTER
+			// rejectAuthAfterPushRequest: enforceHandshakeWindow watches
+			// doneCh to decide whether to tear a stalled session down, so
+			// keeping it open through the whole rejection sequence means
+			// the OUTER handshakeWindow bound (60s default) still covers
+			// this path, with authFailedWindow (2s) as the tighter INNER
+			// bound on the read-then-drain sequence itself.
+			s.rejectAuthAfterPushRequest(sess, tlsConn, af.clientReason)
+			close(sess.doneCh)
+			_ = sess.closeWithReason(CloseReasonAuthFailed)
+			return
+		}
 		close(sess.doneCh)
 		_ = sess.closeWithReason(CloseReasonUnknown)
 		return
@@ -982,6 +1072,28 @@ func (s *Server) runHandshake(sess *Session) {
 		sess.published.Store(true)
 		s.callOnSession(sess)
 	}
+}
+
+// rejectAuthAfterPushRequest answers a Config.AuthUserPass rejection on the
+// INITIAL handshake path: mirroring R4 (process_incoming_push_request,
+// push.c:960-971), the reference still reads the client's PUSH_REQUEST
+// before ever calling send_auth_failed — so this reads (and discards) one
+// control string off sess.tlsReader, bounded by authFailedWindow, ignoring
+// both the read error and whether the string actually was
+// pushRequestLiteral: a client that never asks still gets the rejection,
+// matching send_auth_failed's own unconditional dispatch (R5). It then
+// sends AUTH_FAILED (or AUTH_FAILED,<clientReason>) via sendAuthFailed.
+//
+// This never allocates a tunnel IP from s.pool (R4: no tunnel IP is ever
+// allocated for a failed auth) — doing so here would also trip
+// TestPhase4TeardownAlwaysFlowsThroughClose's pool.release allow-list,
+// which does not name this function.
+func (s *Server) rejectAuthAfterPushRequest(sess *Session, w io.Writer, clientReason string) {
+	_ = sess.conn.SetReadDeadline(sess.now().Add(authFailedWindow))
+	_, _ = readControlString(sess.tlsReader, maxControlStringLen)
+	_ = sess.conn.SetReadDeadline(time.Time{})
+
+	s.sendAuthFailed(sess.conn, w, clientReason)
 }
 
 // performPushExchange answers the client's PUSH_REQUEST with a byte-exact
@@ -1150,30 +1262,211 @@ func (s *Server) performPushExchange(sess *Session, w io.Writer) error {
 	}
 }
 
+// userPassLen is USER_PASS_LEN for a non-PKCS11 build (misc.h:65-70) — the
+// on-wire length of a Key Method 2 username/password field INCLUDES the
+// trailing NUL (read_string, ssl.c:1991-2007, does str[len-1] = '\0'), so
+// at most 127 bytes of actual credential text fit.
+const userPassLen = 128
+
+// km2Credential extracts a credential string from a raw Key Method 2 field
+// (opts.Username or opts.Password, keymethod2.go's ClientOptions), mirroring
+// read_string's own C-string semantics (ssl.c:1991-2007). It returns
+// ("", false) if field's on-wire length exceeds userPassLen — an
+// out-of-bounds field, checked BEFORE emptiness (R3's own ordering) — and
+// otherwise cuts at the first 0x00 byte if present (reproducing
+// str[len-1]='\0' for the normal trailing terminator, and matching C
+// string truncation for any interior NUL). A nil/empty field (the
+// "field not provided by peer" case — readLengthPrefixedString returns nil
+// for a zero-length wire field) yields ("", true): empty but in-bounds,
+// distinct from too-long.
+func km2Credential(field []byte) (string, bool) {
+	if len(field) > userPassLen {
+		return "", false
+	}
+	if cut := bytes.IndexByte(field, 0); cut >= 0 {
+		field = field[:cut]
+	}
+	return string(field), true
+}
+
+// authFailure is the typed error verifyUserPass/callAuthUserPass return for
+// any auth rejection: a too-long or empty credential, a hook error, or a
+// recovered hook panic. clientReason, if non-empty, is sent to the client
+// as AUTH_FAILED,<clientReason> (D-04); otherwise the plain AUTH_FAILED
+// form is sent. err carries the underlying (server-side-only) diagnostic.
+type authFailure struct {
+	clientReason string
+	err          error
+}
+
+func (f *authFailure) Error() string {
+	if f.err != nil {
+		return f.err.Error()
+	}
+	return "ovpn: authentication failed"
+}
+
+func (f *authFailure) Unwrap() error { return f.err }
+
+// callAuthUserPass invokes Config.AuthUserPass with the same panic-recovery
+// contract callOnSession/callOnSessionClosed already establish (ovpn.go):
+// this runs on a per-session goroutine, so an unrecovered panic in
+// caller-supplied code would otherwise crash the entire embedding process
+// (D-08). A panicking hook is treated as a rejection (fail closed) rather
+// than letting the panic escape or silently admitting the client.
+func (s *Server) callAuthUserPass(sess *Session, username, password string, cs tls.ConnectionState) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if s.cfg.OnSessionPanic != nil {
+				s.cfg.OnSessionPanic(sess, r, debug.Stack())
+			}
+			err = fmt.Errorf("ovpn: Config.AuthUserPass panicked: %v", r)
+		}
+	}()
+	return s.cfg.AuthUserPass(username, password, cs)
+}
+
+// verifyUserPass authenticates opts (the client's just-parsed Key Method 2
+// ClientOptions) against Config.AuthUserPass, mirroring
+// key_method_2_read's own validation order (ssl.c:2452-2470, R3): wire
+// length first, emptiness second, then the hook. s.cfg.AuthUserPass == nil
+// returns nil immediately without touching opts at all — today's
+// behaviour, credentials parsed and ignored. Every other path either
+// returns nil (hook accepted) or a non-nil *authFailure (T-m4e-02: no path
+// returns nil without the hook itself having returned nil).
+func (s *Server) verifyUserPass(sess *Session, opts *keyderiv.ClientOptions, cs tls.ConnectionState) error {
+	if s.cfg.AuthUserPass == nil {
+		return nil
+	}
+	if opts == nil {
+		// Defensive: deriveKeyMethod2 always returns a non-nil opts
+		// alongside a nil error, but never trust that invariant enough to
+		// risk a nil-pointer panic on this security-critical path.
+		return &authFailure{err: errors.New("ovpn: no Key Method 2 options to authenticate")}
+	}
+
+	username, usernameOK := km2Credential(opts.Username)
+	password, passwordOK := km2Credential(opts.Password)
+	if !usernameOK || !passwordOK {
+		// ssl.c:2456-2457's own client-facing text.
+		return &authFailure{
+			clientReason: "Username or password is too long. Maximum length is 128 bytes",
+			err:          errors.New("ovpn: username or password exceeds userPassLen (128) on the wire"),
+		}
+	}
+	if username == "" || password == "" {
+		// ssl.c:2465's own log line; no client reason (the reference sends
+		// none for this case either — ssl.c:2465-2469's goto error skips
+		// auth_set_client_reason).
+		return &authFailure{err: errors.New("ovpn: auth username/password was not provided by peer")}
+	}
+
+	if err := s.callAuthUserPass(sess, username, password, cs); err != nil {
+		var reason string
+		var ar AuthClientReason
+		if errors.As(err, &ar) {
+			reason = ar.ClientReason()
+		}
+		return &authFailure{clientReason: reason, err: err}
+	}
+	return nil
+}
+
+// authFailedWindow bounds both rejectAuthAfterPushRequest's read of the
+// client's PUSH_REQUEST and sendAuthFailed's own WaitDrained call — the
+// inner budget inside runHandshake's outer enforceHandshakeWindow bound.
+const authFailedWindow = 2 * time.Second
+
+// authFailedLiteral is the reference's own AUTH_FAILED control string
+// (push.c:396-430's static const char auth_failed[] = "AUTH_FAILED").
+const authFailedLiteral = "AUTH_FAILED"
+
+// maxAuthClientReasonLen caps the sanitized AuthClientReason text sent to
+// the client (D-04) — an arbitrary but generous bound, well above any
+// legitimate rejection message, that keeps a misbehaving embedder's hook
+// from inflating the AUTH_FAILED control string without limit.
+const maxAuthClientReasonLen = 128
+
+// sanitizeAuthClientReason strips control bytes (< 0x20, or 0x7f) from
+// reason — a NUL would truncate the AUTH_FAILED control string on the
+// wire (writeControlString's own NUL terminator convention), a newline
+// would corrupt the client's log parsing — and truncates the result to
+// maxAuthClientReasonLen.
+func sanitizeAuthClientReason(reason string) string {
+	b := make([]byte, 0, len(reason))
+	for i := 0; i < len(reason); i++ {
+		c := reason[i]
+		if c < 0x20 || c == 0x7f {
+			continue
+		}
+		b = append(b, c)
+	}
+	if len(b) > maxAuthClientReasonLen {
+		b = b[:maxAuthClientReasonLen]
+	}
+	return string(b)
+}
+
+// buildAuthFailed assembles the AUTH_FAILED control string body (without
+// its NUL terminator, which writeControlString appends) exactly per
+// push.c:396-430's send_auth_failed: the plain literal when clientReason
+// sanitizes to empty, or "AUTH_FAILED,<reason>" otherwise. Factored out as
+// a pure function, mirroring buildPushReply's own testable shape
+// (push.go:97), so the wire format can be asserted without a live
+// session.
+func buildAuthFailed(clientReason string) string {
+	reason := sanitizeAuthClientReason(clientReason)
+	if reason == "" {
+		return authFailedLiteral
+	}
+	return authFailedLiteral + "," + reason
+}
+
+// sendAuthFailed writes the AUTH_FAILED control string to w in
+// writeControlString's exact framing (R5: the literal or
+// "AUTH_FAILED,<reason>", plus exactly one NUL, no length prefix) and, if
+// conn is non-nil, gives the reliable layer a bounded chance
+// (authFailedWindow) to actually deliver it before the caller tears the
+// session down. Errors are deliberately ignored: this always runs on a
+// teardown path where the caller is already committed to closing the
+// session regardless of whether the client ever receives this message.
+func (s *Server) sendAuthFailed(conn *ctrlconn.Conn, w io.Writer, clientReason string) {
+	_ = writeControlString(w, buildAuthFailed(clientReason))
+	if conn != nil {
+		_ = conn.WaitDrained(authFailedWindow)
+	}
+}
+
 // deriveKeyMethod2 runs the Key Method 2 exchange over tlsConn and returns
 // the resulting bufio.Reader (wrapping tlsConn, having consumed exactly the
 // client's Key Method 2 message) and the derived key expansion, plus the
-// raw client/server seed material for diagnostics — the shared core both
-// performKeyMethod2Exchange (initial handshake) and runRenegotiation (soft
-// reset) call, so a renegotiation's key derivation can never subtly diverge
-// from the initial handshake's own (04-01-PLAN.md Task 1 action 7).
+// raw client/server seed material for diagnostics, plus the client's
+// parsed ClientOptions (opts.Username/opts.Password feed verifyUserPass) —
+// the shared core both performKeyMethod2Exchange (initial handshake) and
+// runRenegotiation (soft reset) call, so a renegotiation's key derivation
+// (and the credentials it authenticates) can never subtly diverge from the
+// initial handshake's own (04-01-PLAN.md Task 1 action 7; quick 260908-m4e
+// key_links: "the credentials must come from the SAME parse both the
+// initial handshake and the renegotiation use"). A six-value return is
+// unlovely, but keeps this a mechanical, two-call-site change rather than
+// introducing a new result struct.
 // clientSID/serverSID are the SAME control-channel session IDs for both
 // callers — they never change across a soft reset (04-RESEARCH.md
 // Pattern 3). Matches the reference server's own state-machine branch
 // (tls_process, ssl.c:3002-3031: server is "Receive Key" at S_START, "Send
 // Key" at S_GOT_KEY — the opposite order from the client, which already
 // wrote its own message immediately after its handshake completed).
-func (s *Server) deriveKeyMethod2(tlsConn *tls.Conn, clientSID, serverSID wire.SessionID) (*bufio.Reader, *keyderiv.Key2, *keyderiv.KeySource, *keyderiv.KeySource, error) {
+func (s *Server) deriveKeyMethod2(tlsConn *tls.Conn, clientSID, serverSID wire.SessionID) (*bufio.Reader, *keyderiv.Key2, *keyderiv.KeySource, *keyderiv.KeySource, *keyderiv.ClientOptions, error) {
 	tlsReader := bufio.NewReader(tlsConn)
 
-	clientKM, _, err := keyderiv.ReadClientKeyMethod2(tlsReader)
+	clientKM, clientOpts, err := keyderiv.ReadClientKeyMethod2(tlsReader)
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("ovpn: read client Key Method 2: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("ovpn: read client Key Method 2: %w", err)
 	}
 
 	serverKM, err := keyderiv.WriteServerKeyMethod2(tlsConn, serverKM2Options)
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("ovpn: write server Key Method 2: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("ovpn: write server Key Method 2: %w", err)
 	}
 
 	src := &keyderiv.KeySource2{
@@ -1188,9 +1481,9 @@ func (s *Server) deriveKeyMethod2(tlsConn *tls.Conn, clientSID, serverSID wire.S
 	// no new session-ID concept is introduced.
 	dataKeys, err := keyderiv.DeriveKeys(src, (*[8]byte)(&clientSID), (*[8]byte)(&serverSID))
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("ovpn: derive data-channel keys: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("ovpn: derive data-channel keys: %w", err)
 	}
-	return tlsReader, dataKeys, clientKM, serverKM, nil
+	return tlsReader, dataKeys, clientKM, serverKM, clientOpts, nil
 }
 
 // performKeyMethod2Exchange runs deriveKeyMethod2 for the initial handshake
@@ -1201,8 +1494,18 @@ func (s *Server) deriveKeyMethod2(tlsConn *tls.Conn, clientSID, serverSID wire.S
 // (runRenegotiation) calls deriveKeyMethod2 directly instead and never
 // touches sess.tlsReader (D-15's single-buffered-reader contract stays
 // scoped to the initial handshake).
+//
+// The existing publishes above happen UNCONDITIONALLY, before
+// verifyUserPass ever runs (quick 260908-m4e key_links): the AUTH_FAILED
+// path in runHandshake must read the client's PUSH_REQUEST off
+// sess.tlsReader (R4), so the reader has to be positioned even when
+// authentication has already failed — and the reference itself completes
+// the whole key exchange and only refuses at PUSH time (ssl.c:2414 sets
+// KS_AUTH_FALSE but parsing continues regardless). Keeping the publishes
+// unconditional also keeps this diff an appended block rather than a
+// restructure.
 func (s *Server) performKeyMethod2Exchange(sess *Session, tlsConn *tls.Conn) error {
-	tlsReader, dataKeys, clientKM, serverKM, err := s.deriveKeyMethod2(tlsConn, sess.clientSessionID, sess.SessionID)
+	tlsReader, dataKeys, clientKM, serverKM, clientOpts, err := s.deriveKeyMethod2(tlsConn, sess.clientSessionID, sess.SessionID)
 	if err != nil {
 		return err
 	}
@@ -1216,7 +1519,8 @@ func (s *Server) performKeyMethod2Exchange(sess *Session, tlsConn *tls.Conn) err
 	sess.mu.Unlock()
 	sess.clientKM = clientKM
 	sess.serverKM = serverKM
-	return nil
+
+	return s.verifyUserPass(sess, clientOpts, tlsConn.ConnectionState())
 }
 
 // callOnSession invokes Config.OnSession with panic recovery: this runs on
@@ -1384,9 +1688,31 @@ func (s *Server) runRenegotiation(sess *Session, newConn *ctrlconn.Conn, keyID u
 		return
 	}
 
-	_, dataKeys, _, _, err := s.deriveKeyMethod2(tlsConn, sess.clientSessionID, sess.SessionID)
+	_, dataKeys, _, _, clientOpts, err := s.deriveKeyMethod2(tlsConn, sess.clientSessionID, sess.SessionID)
 	if err != nil {
 		abandon()
+		return
+	}
+
+	// R3/D-01: verify_user_pass is reached from key_method_2_read, i.e. it
+	// runs on EVERY key exchange — a renegotiation re-verifies exactly
+	// like the initial handshake did, so a client cannot authenticate once
+	// and then rotate keys unauthenticated (T-m4e-03). Unlike the initial
+	// handshake there is no PUSH_REQUEST to read first (R5: "send to any
+	// active session" is unconditional on a renegotiation), so this goes
+	// straight to sendAuthFailed.
+	if authErr := s.verifyUserPass(sess, clientOpts, tlsConn.ConnectionState()); authErr != nil {
+		var af *authFailure
+		var clientReason string
+		if errors.As(authErr, &af) {
+			clientReason = af.clientReason
+		}
+		// Write and drain BEFORE abandon(), which calls newConn.Close() —
+		// WaitDrained returns false immediately once closeCh is closed, so
+		// the AUTH_FAILED delivery attempt has to happen first.
+		s.sendAuthFailed(newConn, tlsConn, clientReason)
+		abandon()
+		_ = sess.closeWithReason(CloseReasonAuthFailed)
 		return
 	}
 

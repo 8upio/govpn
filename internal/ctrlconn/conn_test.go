@@ -276,3 +276,131 @@ func TestTLSHandshakeOverCtrlConn(t *testing.T) {
 		t.Errorf("post-handshake payload = %q, want %q", got, msg)
 	}
 }
+
+// newWaitDrainedPair builds a loopback UDP pair of Conns (no TLS needed —
+// WaitDrained only cares about the send-side reliability window, not any
+// payload's content) for TestWaitDrained*'s two scenarios.
+func newWaitDrainedPair(t testing.TB) (serverConn, clientConn *Conn, serverPC, clientPC net.PacketConn) {
+	t.Helper()
+
+	key := make([]byte, 256)
+	if _, err := rand.Read(key); err != nil {
+		t.Fatalf("generate tls-crypt key: %v", err)
+	}
+	serverWrapper, err := tlscrypt.NewWrapper(key, true)
+	if err != nil {
+		t.Fatalf("server wrapper: %v", err)
+	}
+	clientWrapper, err := tlscrypt.NewWrapper(key, false)
+	if err != nil {
+		t.Fatalf("client wrapper: %v", err)
+	}
+
+	serverPC, err = net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("server listen: %v", err)
+	}
+	clientPC, err = net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("client listen: %v", err)
+	}
+
+	var serverSID, clientSID wire.SessionID
+	if _, err := rand.Read(serverSID[:]); err != nil {
+		t.Fatalf("generate server session id: %v", err)
+	}
+	if _, err := rand.Read(clientSID[:]); err != nil {
+		t.Fatalf("generate client session id: %v", err)
+	}
+
+	serverConn = New(serverSID, clientSID, serverWrapper, udpTransport{pc: serverPC}, clientPC.LocalAddr(), nil)
+	clientConn = New(clientSID, serverSID, clientWrapper, udpTransport{pc: clientPC}, serverPC.LocalAddr(), nil)
+
+	return serverConn, clientConn, serverPC, clientPC
+}
+
+// TestWaitDrainedReturnsTrueOnceAcked proves WaitDrained reports true once
+// the peer has ACKed everything this Conn transmitted: with demux running
+// on BOTH ends (so the peer's Deliver-triggered ACK — flushAckOnly,
+// conn.go:157-160 — can make its way back), a Write followed by
+// WaitDrained must observe the send window empty well within the given
+// timeout.
+func TestWaitDrainedReturnsTrueOnceAcked(t *testing.T) {
+	serverConn, clientConn, serverPC, clientPC := newWaitDrainedPair(t)
+	defer serverPC.Close()
+	defer clientPC.Close()
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	stop := make(chan struct{})
+	defer close(stop)
+	serverWrapper := serverConn.wrapper
+	clientWrapper := clientConn.wrapper
+	go demux(serverPC, serverWrapper, serverConn, stop)
+	go demux(clientPC, clientWrapper, clientConn, stop)
+
+	if _, err := serverConn.Write([]byte("AUTH_FAILED\x00")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if !serverConn.WaitDrained(5 * time.Second) {
+		t.Fatal("WaitDrained returned false; expected the peer's ACK to drain the send window")
+	}
+}
+
+// TestWaitDrainedReturnsFalseOnTimeout proves WaitDrained reports false,
+// after actually waiting out the given timeout, when the peer never ACKs:
+// with no demux running at all, the transmitted control packet is never
+// delivered anywhere, so the send window can never drain.
+func TestWaitDrainedReturnsFalseOnTimeout(t *testing.T) {
+	serverConn, clientConn, serverPC, clientPC := newWaitDrainedPair(t)
+	defer serverPC.Close()
+	defer clientPC.Close()
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	if _, err := serverConn.Write([]byte("AUTH_FAILED\x00")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	start := time.Now()
+	const timeout = 200 * time.Millisecond
+	if serverConn.WaitDrained(timeout) {
+		t.Fatal("WaitDrained returned true; expected the send window to stay non-empty with no peer ACK")
+	}
+	if elapsed := time.Since(start); elapsed < timeout {
+		t.Errorf("WaitDrained returned after %s, want at least %s (the full timeout)", elapsed, timeout)
+	}
+}
+
+// TestWaitDrainedReturnsFalseOnClose proves WaitDrained unblocks promptly
+// (not waiting out the full timeout) when the Conn is closed while a drain
+// is still pending.
+func TestWaitDrainedReturnsFalseOnClose(t *testing.T) {
+	serverConn, clientConn, serverPC, clientPC := newWaitDrainedPair(t)
+	defer serverPC.Close()
+	defer clientPC.Close()
+	defer clientConn.Close()
+
+	if _, err := serverConn.Write([]byte("AUTH_FAILED\x00")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	done := make(chan bool, 1)
+	go func() { done <- serverConn.WaitDrained(10 * time.Second) }()
+
+	// Give WaitDrained a moment to start polling, then close from another
+	// goroutine — mirroring how a real caller tears the Conn down
+	// concurrently with (or immediately after) a bounded drain attempt.
+	time.Sleep(50 * time.Millisecond)
+	_ = serverConn.Close()
+
+	select {
+	case ok := <-done:
+		if ok {
+			t.Fatal("WaitDrained returned true after Close; expected false")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("WaitDrained did not unblock within 2s of Close")
+	}
+}

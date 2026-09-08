@@ -248,10 +248,11 @@ func TestSessionStatsEstablishedAt(t *testing.T) {
 	clock := newFakeClock()
 	sessions := make(chan *Session, 1)
 	srv := NewServer(Config{
-		TLSCryptKey: key,
-		TLSConfig:   tlsCfg,
-		Network:     network,
-		OnSession:   func(sess *Session) { sessions <- sess },
+		TLSCryptKey:  key,
+		TLSConfig:    tlsCfg,
+		Network:      network,
+		AuthUserPass: testPermissiveAuthUserPass,
+		OnSession:    func(sess *Session) { sessions <- sess },
 	})
 	srv.clock = clock
 	go func() { _ = srv.Serve(serverPC) }()

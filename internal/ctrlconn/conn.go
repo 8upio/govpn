@@ -377,6 +377,41 @@ func (c *Conn) retransmitLoop() {
 	}
 }
 
+// drainPollInterval is how often WaitDrained polls sendRel.Empty() while
+// waiting for the peer to ACK every control packet this Conn has
+// transmitted. Unrelated to any reference constant, like
+// retransmitInterval above — a short, fixed poll is an adequately precise
+// Go equivalent of blocking on the reliability layer's own event.
+const drainPollInterval = 10 * time.Millisecond
+
+// WaitDrained blocks until every control packet this Conn has transmitted
+// has been acknowledged by the peer (c.sendRel.Empty(), reliable_empty,
+// reliable.c:392-405) — the strongest delivery guarantee the reliability
+// layer can offer — or until timeout elapses or the Conn is closed,
+// whichever comes first. It returns true if the send window drained,
+// false otherwise. A false return is advisory only: the caller is
+// expected to tear the Conn down regardless, exactly like a real
+// send_control_channel_string_dowork caller that doesn't itself confirm
+// delivery beyond handing the datagram to the reliability layer.
+func (c *Conn) WaitDrained(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(drainPollInterval)
+	defer ticker.Stop()
+	for {
+		if c.sendRel.Empty() {
+			return true
+		}
+		select {
+		case <-c.closeCh:
+			return false
+		case <-ticker.C:
+			if !time.Now().Before(deadline) {
+				return c.sendRel.Empty()
+			}
+		}
+	}
+}
+
 // Close is idempotent and safe to call concurrently with Read/Write from
 // another goroutine: it stops the retransmit loop and unblocks any blocked
 // Read (returning io.EOF) or Write (returning io.ErrClosedPipe).

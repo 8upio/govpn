@@ -69,6 +69,15 @@ func testTLSConfig(t testing.TB) *tls.Config {
 	}
 }
 
+// testPermissiveAuthUserPass satisfies Serve's D-07 guard (quick
+// 260908-m4e) for this package's many pre-existing tests that use a
+// certificate-less TLSConfig (testTLSConfig/testHandshakeTLSConfig both
+// leave ClientAuth at its zero value, tls.NoClientCert) without
+// themselves testing authentication — it accepts every credential
+// unconditionally, reproducing the pre-AuthUserPass behaviour these tests
+// were already written against.
+func testPermissiveAuthUserPass(_, _ string, _ tls.ConnectionState) error { return nil }
+
 // clientHardReset builds and wraps a synthetic P_CONTROL_HARD_RESET_CLIENT_V2
 // using the client tls-crypt key direction (encrypt with keys[1], decrypt
 // with keys[0]).
@@ -252,6 +261,19 @@ type testPushClient struct {
 // issues both from the same throwaway CA).
 func newTestPushClient(t testing.TB, key []byte, serverAddr net.Addr, caPool *x509.CertPool) *testPushClient {
 	t.Helper()
+	return newTestPushClientWithCerts(t, key, serverAddr, caPool, nil)
+}
+
+// newTestPushClientWithCerts is newTestPushClient's own delegate, extended
+// with an optional client certificate (quick 260908-m4e's
+// TestAuthUserPassNilHookIgnoresCredentials needs a client cert to satisfy
+// Serve's D-07 guard while still proving a nil AuthUserPass hook ignores
+// credentials — RequireAnyClientCert accepts any presented certificate
+// without verifying it against caPool, so a throwaway self-signed cert is
+// sufficient). A nil/empty certs leaves every existing call site's
+// behavior unchanged (no client certificate presented at all).
+func newTestPushClientWithCerts(t testing.TB, key []byte, serverAddr net.Addr, caPool *x509.CertPool, certs []tls.Certificate) *testPushClient {
+	t.Helper()
 
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -278,10 +300,10 @@ func newTestPushClient(t testing.TB, key []byte, serverAddr net.Addr, caPool *x5
 	conn := ctrlconn.New(clientSID, wire.SessionID{}, wrapper, packetConnTransport{pc: pc}, serverAddr, nil)
 
 	client := &testPushClient{
-		pc:        pc,
-		wrapper:   wrapper,
-		clientSID: clientSID,
-		conn:      conn,
+		pc:                   pc,
+		wrapper:              wrapper,
+		clientSID:            clientSID,
+		conn:                 conn,
 		stop:                 make(chan struct{}),
 		conns:                map[uint8]*ctrlconn.Conn{0: conn},
 		dataOut:              make(chan []byte, 8),
@@ -304,9 +326,10 @@ func newTestPushClient(t testing.TB, key []byte, serverAddr net.Addr, caPool *x5
 	}
 
 	client.tlsConn = tls.Client(conn, &tls.Config{
-		RootCAs:    caPool,
-		ServerName: testHandshakeServerCN,
-		MinVersion: tls.VersionTLS12,
+		RootCAs:      caPool,
+		ServerName:   testHandshakeServerCN,
+		MinVersion:   tls.VersionTLS12,
+		Certificates: certs,
 	})
 
 	return client
@@ -429,15 +452,18 @@ func testPushClientDemux(client *testPushClient) {
 	}
 }
 
-// writeTestClientKeyMethod2 writes a well-formed (but content-arbitrary —
-// this project doesn't validate the options/username/password/peer_info
-// strings, RESEARCH.md Pitfall 4) client Key Method 2 message matching
-// keyderiv.ReadClientKeyMethod2's expected layout: 4 reserved bytes,
-// KEY_METHOD_2, 48-byte pre_master, 32-byte random1, 32-byte random2, then
-// four empty length-prefixed strings (options/username/password/
-// peer_info).
-func writeTestClientKeyMethod2(w io.Writer) error {
-	buf := make([]byte, 0, 4+1+48+32+32+8)
+// writeTestClientKeyMethod2Raw writes a well-formed client Key Method 2
+// message matching keyderiv.ReadClientKeyMethod2's expected layout: 4
+// reserved bytes, KEY_METHOD_2, 48-byte pre_master, 32-byte random1,
+// 32-byte random2, then the four given fields, each as its own
+// 2-byte-big-endian-length-prefixed byte string (readLengthPrefixedString's
+// counterpart) — allowing a test to construct a field of any length,
+// including one deliberately over keyderiv's own 512-byte cap or this
+// package's 128-byte userPassLen. This is the single place the fixed
+// reserved/key-method/random prefix is built; writeTestClientKeyMethod2Creds
+// and the legacy writeTestClientKeyMethod2 both delegate here.
+func writeTestClientKeyMethod2Raw(w io.Writer, options, username, password, peerInfo []byte) error {
+	buf := make([]byte, 0, 4+1+48+32+32+8+len(options)+len(username)+len(password)+len(peerInfo))
 	buf = append(buf, 0, 0, 0, 0) // reserved
 	buf = append(buf, 2)          // KEY_METHOD_2
 
@@ -447,13 +473,53 @@ func writeTestClientKeyMethod2(w io.Writer) error {
 	}
 	buf = append(buf, random...)
 
-	// options, username, password, peer_info: four empty (0x0000-prefixed)
-	// strings — this server only warns, never fails, on an empty/mismatched
-	// options string (RESEARCH.md Pitfall 4).
-	buf = append(buf, 0, 0, 0, 0, 0, 0, 0, 0)
+	for _, field := range [][]byte{options, username, password, peerInfo} {
+		var lenBuf [2]byte
+		binary.BigEndian.PutUint16(lenBuf[:], uint16(len(field)))
+		buf = append(buf, lenBuf[:]...)
+		buf = append(buf, field...)
+	}
 
 	_, err := w.Write(buf)
 	return err
+}
+
+// writeTestClientKeyMethod2Creds writes a client Key Method 2 message
+// carrying username/password (options and peer_info left empty), encoding
+// each non-empty credential as append([]byte(s), 0) — write_string's own
+// convention (R2: the wire length includes the trailing NUL) — and an
+// empty string as a genuinely zero-length field (the "not provided by
+// peer" case, distinct from a present-but-empty string).
+func writeTestClientKeyMethod2Creds(w io.Writer, username, password string) error {
+	encode := func(s string) []byte {
+		if s == "" {
+			return nil
+		}
+		return append([]byte(s), 0)
+	}
+	return writeTestClientKeyMethod2Raw(w, nil, encode(username), encode(password), nil)
+}
+
+// testPlaceholderUsername/testPlaceholderPassword are content-arbitrary
+// (this project doesn't validate the username/password strings when
+// Config.AuthUserPass is nil, RESEARCH.md Pitfall 4) but deliberately
+// non-empty (quick 260908-m4e): an EMPTY credential is an auth failure
+// regardless of whether a hook is set (R3/D-02), so every one of this
+// package's many pre-existing tests that reuse a permissive
+// testPermissiveAuthUserPass hook to satisfy Serve's D-07 guard needs a
+// non-empty placeholder here, not an empty one — otherwise the emptiness
+// check would reject them before the (accepting) hook is ever reached.
+const (
+	testPlaceholderUsername = "testuser"
+	testPlaceholderPassword = "testpass"
+)
+
+// writeTestClientKeyMethod2 writes a well-formed (but content-arbitrary)
+// client Key Method 2 message carrying testPlaceholderUsername/
+// testPlaceholderPassword. Delegates to writeTestClientKeyMethod2Creds so
+// there is one prefix-building path, not two.
+func writeTestClientKeyMethod2(w io.Writer) error {
+	return writeTestClientKeyMethod2Creds(w, testPlaceholderUsername, testPlaceholderPassword)
 }
 
 // readTestServerKeyMethod2 reads and discards the server's own Key Method
@@ -480,11 +546,11 @@ func readTestServerKeyMethod2(r io.Reader) error {
 	return nil
 }
 
-// tunnelUpTestClient drives client all the way through hard reset, TLS
-// handshake, Key Method 2, and one PUSH_REQUEST, returning a reader
-// positioned to read the PUSH_REPLY response(s). It fails the test on any
-// error along the way.
-func tunnelUpTestClient(t testing.TB, key []byte, serverAddr net.Addr, caPool *x509.CertPool) (*testPushClient, *bufio.Reader) {
+// tunnelUpTestClientCreds drives client all the way through hard reset, TLS
+// handshake, and Key Method 2 (carrying username/password, quick
+// 260908-m4e), returning a reader positioned right after the server's own
+// Key Method 2 reply. It fails the test on any error along the way.
+func tunnelUpTestClientCreds(t testing.TB, key []byte, serverAddr net.Addr, caPool *x509.CertPool, username, password string) (*testPushClient, *bufio.Reader) {
 	t.Helper()
 
 	client := newTestPushClient(t, key, serverAddr, caPool)
@@ -499,7 +565,7 @@ func tunnelUpTestClient(t testing.TB, key []byte, serverAddr net.Addr, caPool *x
 	if err := client.tlsConn.Handshake(); err != nil {
 		t.Fatalf("client handshake: %v", err)
 	}
-	if err := writeTestClientKeyMethod2(client.tlsConn); err != nil {
+	if err := writeTestClientKeyMethod2Creds(client.tlsConn, username, password); err != nil {
 		t.Fatalf("write client Key Method 2: %v", err)
 	}
 	if err := readTestServerKeyMethod2(client.tlsConn); err != nil {
@@ -511,6 +577,19 @@ func tunnelUpTestClient(t testing.TB, key []byte, serverAddr net.Addr, caPool *x
 	}
 
 	return client, bufio.NewReader(client.tlsConn)
+}
+
+// tunnelUpTestClient drives client all the way through hard reset, TLS
+// handshake, and Key Method 2 carrying testPlaceholderUsername/
+// testPlaceholderPassword (quick 260908-m4e — see those constants' own
+// doc comment for why these must be non-empty, not the empty defaults this
+// function used before AuthUserPass existed), returning a reader
+// positioned right after the server's own Key Method 2 reply. It fails the
+// test on any error along the way. Delegates to tunnelUpTestClientCreds so
+// there is one bring-up path, not two.
+func tunnelUpTestClient(t testing.TB, key []byte, serverAddr net.Addr, caPool *x509.CertPool) (*testPushClient, *bufio.Reader) {
+	t.Helper()
+	return tunnelUpTestClientCreds(t, key, serverAddr, caPool, testPlaceholderUsername, testPlaceholderPassword)
 }
 
 // TestOnSessionFiresAfterPushReply is 02-02-PLAN.md Task 3's D-08 proof: a
@@ -539,9 +618,10 @@ func TestOnSessionFiresAfterPushReply(t *testing.T) {
 	allowOnSessionReturn := make(chan struct{})
 	sessions := make(chan *Session, 1)
 	srv := NewServer(Config{
-		TLSCryptKey: key,
-		TLSConfig:   tlsCfg,
-		Network:     network,
+		TLSCryptKey:  key,
+		TLSConfig:    tlsCfg,
+		Network:      network,
+		AuthUserPass: testPermissiveAuthUserPass,
 		OnSession: func(sess *Session) {
 			close(onSessionEntered)
 			<-allowOnSessionReturn
@@ -623,9 +703,10 @@ func TestOnSessionFiresExactlyOnce(t *testing.T) {
 	var onSessionCount int32
 	sessions := make(chan *Session, 2)
 	srv := NewServer(Config{
-		TLSCryptKey: key,
-		TLSConfig:   tlsCfg,
-		Network:     network,
+		TLSCryptKey:  key,
+		TLSConfig:    tlsCfg,
+		Network:      network,
+		AuthUserPass: testPermissiveAuthUserPass,
 		OnSession: func(sess *Session) {
 			atomic.AddInt32(&onSessionCount, 1)
 			sessions <- sess
@@ -840,9 +921,10 @@ func TestOnSessionDoesNotFireWhenPushNeverArrives(t *testing.T) {
 
 	var onSessionCalled int32
 	srv := NewServer(Config{
-		TLSCryptKey: key,
-		TLSConfig:   tlsCfg,
-		Network:     network,
+		TLSCryptKey:  key,
+		TLSConfig:    tlsCfg,
+		Network:      network,
+		AuthUserPass: testPermissiveAuthUserPass,
 		OnSession: func(sess *Session) {
 			atomic.AddInt32(&onSessionCalled, 1)
 		},
@@ -976,9 +1058,10 @@ func TestOnSessionPanicStillRecovered(t *testing.T) {
 	const panicValue = "boom: simulated OnSession bug in the tunnel-up path"
 	panicked := make(chan any, 1)
 	srv := NewServer(Config{
-		TLSCryptKey: key,
-		TLSConfig:   tlsCfg,
-		Network:     network,
+		TLSCryptKey:  key,
+		TLSConfig:    tlsCfg,
+		Network:      network,
+		AuthUserPass: testPermissiveAuthUserPass,
 		OnSession: func(sess *Session) {
 			panic(panicValue)
 		},
@@ -1030,9 +1113,10 @@ func TestCloseIsIdempotentAfterTunnelUp(t *testing.T) {
 
 	sessions := make(chan *Session, 1)
 	srv := NewServer(Config{
-		TLSCryptKey: key,
-		TLSConfig:   tlsCfg,
-		Network:     network,
+		TLSCryptKey:  key,
+		TLSConfig:    tlsCfg,
+		Network:      network,
+		AuthUserPass: testPermissiveAuthUserPass,
 		OnSession: func(sess *Session) {
 			sessions <- sess
 		},
@@ -1134,7 +1218,7 @@ func TestHardResetRoundTrip(t *testing.T) {
 	}
 	defer serverPC.Close()
 
-	srv := NewServer(Config{TLSCryptKey: key, TLSConfig: testTLSConfig(t)})
+	srv := NewServer(Config{TLSCryptKey: key, TLSConfig: testTLSConfig(t), AuthUserPass: testPermissiveAuthUserPass})
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(serverPC) }()
 	defer srv.Close()
@@ -1186,7 +1270,7 @@ func TestConcurrentSessions(t *testing.T) {
 	}
 	defer serverPC.Close()
 
-	srv := NewServer(Config{TLSCryptKey: key, TLSConfig: testTLSConfig(t)})
+	srv := NewServer(Config{TLSCryptKey: key, TLSConfig: testTLSConfig(t), AuthUserPass: testPermissiveAuthUserPass})
 	go func() { _ = srv.Serve(serverPC) }()
 	defer srv.Close()
 
@@ -1283,7 +1367,7 @@ func TestServeClose(t *testing.T) {
 		t.Fatalf("listen: %v", err)
 	}
 
-	srv := NewServer(Config{TLSCryptKey: key, TLSConfig: testTLSConfig(t)})
+	srv := NewServer(Config{TLSCryptKey: key, TLSConfig: testTLSConfig(t), AuthUserPass: testPermissiveAuthUserPass})
 	done := make(chan error, 1)
 	go func() { done <- srv.Serve(pc) }()
 
@@ -1318,7 +1402,7 @@ func TestSessionCloseStopsPumpAndRemovesFromSessions(t *testing.T) {
 	}
 	defer serverPC.Close()
 
-	srv := NewServer(Config{TLSCryptKey: key, TLSConfig: testTLSConfig(t)})
+	srv := NewServer(Config{TLSCryptKey: key, TLSConfig: testTLSConfig(t), AuthUserPass: testPermissiveAuthUserPass})
 	go func() { _ = srv.Serve(serverPC) }()
 	defer srv.Close()
 
@@ -1415,7 +1499,7 @@ func TestHandshakeWindowTearsDownStalledSession(t *testing.T) {
 	}
 	defer serverPC.Close()
 
-	srv := NewServer(Config{TLSCryptKey: key, TLSConfig: testTLSConfig(t)})
+	srv := NewServer(Config{TLSCryptKey: key, TLSConfig: testTLSConfig(t), AuthUserPass: testPermissiveAuthUserPass})
 	srv.handshakeWindow = 150 * time.Millisecond
 	go func() { _ = srv.Serve(serverPC) }()
 	defer srv.Close()

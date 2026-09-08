@@ -50,10 +50,11 @@ func TestEmbedderCloseRecordsReasonAndFiresCallbackOnce(t *testing.T) {
 	sessions := make(chan *Session, 1)
 	closed := make(chan CloseReason, 1)
 	srv := NewServer(Config{
-		TLSCryptKey: key,
-		TLSConfig:   tlsCfg,
-		Network:     network,
-		OnSession:   func(sess *Session) { sessions <- sess },
+		TLSCryptKey:  key,
+		TLSConfig:    tlsCfg,
+		Network:      network,
+		AuthUserPass: testPermissiveAuthUserPass,
+		OnSession:    func(sess *Session) { sessions <- sess },
 		OnSessionClosed: func(sess *Session, r CloseReason) {
 			closed <- r
 		},
@@ -131,10 +132,11 @@ func TestClientExitNotifyRecordsReasonAndFiresCallback(t *testing.T) {
 	sessions := make(chan *Session, 1)
 	closed := make(chan CloseReason, 1)
 	srv := NewServer(Config{
-		TLSCryptKey: key,
-		TLSConfig:   tlsCfg,
-		Network:     network,
-		OnSession:   func(sess *Session) { sessions <- sess },
+		TLSCryptKey:  key,
+		TLSConfig:    tlsCfg,
+		Network:      network,
+		AuthUserPass: testPermissiveAuthUserPass,
+		OnSession:    func(sess *Session) { sessions <- sess },
 		OnSessionClosed: func(sess *Session, r CloseReason) {
 			closed <- r
 		},
@@ -490,6 +492,7 @@ func TestPingIntervalAndReapWindowPushed(t *testing.T) {
 				Network:      network,
 				PingInterval: c.pingInt,
 				ReapWindow:   c.reapWindow,
+				AuthUserPass: testPermissiveAuthUserPass,
 			})
 			go func() { _ = srv.Serve(serverPC) }()
 			defer srv.Close()
@@ -591,6 +594,7 @@ func TestSessionInboundQueueSizing(t *testing.T) {
 				TLSConfig:           tlsCfg,
 				Network:             network,
 				SessionInboundQueue: c.queue,
+				AuthUserPass:        testPermissiveAuthUserPass,
 				OnSession:           func(sess *Session) { sessions <- sess },
 			})
 			go func() { _ = srv.Serve(serverPC) }()

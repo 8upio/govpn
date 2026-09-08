@@ -59,7 +59,6 @@ func (c *fakeClock) Advance(d time.Duration) {
 	c.mu.Unlock()
 }
 
-
 // mirrorDataKeys inverts encrypt/decrypt slots — the deliberate mirror
 // opposite of the server's own key-direction assignment, so a client-side
 // Wrapper decrypts what the server encrypts and vice versa (Pitfall 1),
@@ -125,9 +124,10 @@ func TestSoftResetRollover(t *testing.T) {
 	var onSessionCount int32
 	sessions := make(chan *Session, 2)
 	srv := NewServer(Config{
-		TLSCryptKey: key,
-		TLSConfig:   tlsCfg,
-		Network:     network,
+		TLSCryptKey:  key,
+		TLSConfig:    tlsCfg,
+		Network:      network,
+		AuthUserPass: testPermissiveAuthUserPass,
 		OnSession: func(sess *Session) {
 			atomic.AddInt32(&onSessionCount, 1)
 			sessions <- sess
@@ -393,10 +393,11 @@ func TestRenegTimerRearmsAfterRollover(t *testing.T) {
 	sessions := make(chan *Session, 2)
 	srv := &Server{
 		cfg: Config{
-			TLSCryptKey: key,
-			TLSConfig:   tlsCfg,
-			Network:     network,
-			RenegSec:    time.Hour,
+			TLSCryptKey:  key,
+			TLSConfig:    tlsCfg,
+			Network:      network,
+			RenegSec:     time.Hour,
+			AuthUserPass: testPermissiveAuthUserPass,
 			OnSession: func(sess *Session) {
 				sessions <- sess
 			},
@@ -542,12 +543,12 @@ func TestRenegTimerStopsOnClose(t *testing.T) {
 // authentic to beginRenegotiation. Mirrors TestServerInitiatedRenegOnRenegSec's
 // own direct-construction style.
 type renegTestFixture struct {
-	serverPC, clientPC net.PacketConn
-	serverWrapper      *tlscrypt.Wrapper
+	serverPC, clientPC   net.PacketConn
+	serverWrapper        *tlscrypt.Wrapper
 	clientSID, serverSID wire.SessionID
-	primaryConn        *ctrlconn.Conn
-	srv                *Server
-	clock              *fakeClock
+	primaryConn          *ctrlconn.Conn
+	srv                  *Server
+	clock                *fakeClock
 }
 
 func newRenegTestFixture(t testing.TB) *renegTestFixture {
