@@ -16,3 +16,8 @@ go.work.sum
 
 # Editor/OS cruft
 .DS_Store
+
+# Local planning/agent workflow state (kept out of the public repo)
+/.claude/
+/.planning/
+/.gsd/
