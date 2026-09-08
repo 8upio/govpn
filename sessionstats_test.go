@@ -78,6 +78,9 @@ func TestSessionStatsPingAbsorbedNotCounted(t *testing.T) {
 	if stats.BytesIn != 0 {
 		t.Errorf("Stats().BytesIn = %d after an absorbed ping, want 0", stats.BytesIn)
 	}
+	if stats.KeepalivesIn != 1 {
+		t.Errorf("Stats().KeepalivesIn = %d after an absorbed ping, want 1", stats.KeepalivesIn)
+	}
 }
 
 // TestSessionStatsForgedPacketIncrementsNothing asserts a packet that

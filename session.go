@@ -416,17 +416,28 @@ type Session struct {
 	// this session has delivered through Read/Write, and packets dropped
 	// because ipInbound was full. Deliberately atomic.Uint64, not fields
 	// guarded by mu: the hot data path (handleDataPacket, Write) must stay
-	// lock-free, and Stats() reading five independent atomics is exactly
+	// lock-free, and Stats() reading six independent atomics is exactly
 	// the "not a consistent instant across all fields, but cheap" contract
 	// an observability accessor needs (see Stats' own doc comment). A
 	// keepalive ping — absorbed inside Wrapper.Open/emitted via
 	// SealPing, never through handleDataPacket's plaintext-delivery path
-	// or through Write — increments none of these.
+	// or through Write — increments none of these four IP-packet counters
+	// plus inboundQueueDropped; it moves keepalivesIn instead (below).
 	bytesIn             atomic.Uint64
 	bytesOut            atomic.Uint64
 	packetsIn           atomic.Uint64
 	packetsOut          atomic.Uint64
 	inboundQueueDropped atomic.Uint64
+
+	// keepalivesIn counts inbound ping keepalives the data channel
+	// authenticated and absorbed inside Wrapper.Open (datachan.ErrPingAbsorbed,
+	// primary or lame-duck slot) — see handleDataPacket. Deliberately the
+	// one counter above that a ping DOES move: it is excluded from
+	// bytesIn/packetsIn (a ping is not tunnel payload) but it DOES refresh
+	// lastAuthTraffic, so a client sending nothing but keepalives is never
+	// idle-reaped (B1). Same atomic.Uint64 discipline as its neighbours
+	// above.
+	keepalivesIn atomic.Uint64
 
 	// establishedAt is when this session's data channel went live —
 	// stamped in ovpn.go's performPushExchange, inside the SAME sess.mu
@@ -445,11 +456,19 @@ type SessionStats struct {
 	// those bytes arrived/departed in. A keepalive ping — absorbed inside
 	// the decrypt path (Wrapper.Open) or emitted via SealPing, neither of
 	// which is handleDataPacket's plaintext-delivery path or Write —
-	// appears in none of these four counters.
+	// appears in none of these four counters; it is counted in
+	// KeepalivesIn instead (below).
 	BytesIn    uint64
 	BytesOut   uint64
 	PacketsIn  uint64
 	PacketsOut uint64
+
+	// KeepalivesIn counts inbound ping keepalives this session
+	// authenticated and absorbed. They are excluded from BytesIn/PacketsIn
+	// by design (a ping is not tunnel payload) but they DO refresh
+	// LastAuthTrafficAt, so a client sending nothing but keepalives is
+	// never idle-reaped.
+	KeepalivesIn uint64
 
 	// InboundQueueDropped counts decrypted IP packets dropped because
 	// ipInbound was full (D-06): a slow embedder falling behind Read,
@@ -466,7 +485,10 @@ type SessionStats struct {
 	// that. LastAuthTrafficAt is when this session last received
 	// AUTHENTICATED traffic (control or data, primary or lame-duck) —
 	// Session.runReap's own D-22 comparison — and never advances for
-	// traffic that failed to authenticate (T-04-07).
+	// traffic that failed to authenticate (T-04-07). An absorbed ping
+	// keepalive counts as authenticated traffic for this field: it passed
+	// both the AEAD tag check and the replay-window check before being
+	// recognized as a ping (B1).
 	EstablishedAt     time.Time
 	LastAuthTrafficAt time.Time
 }
@@ -586,8 +608,8 @@ func (s *Session) RenegotiationCount() uint32 {
 }
 
 // Stats returns a point-in-time snapshot of this session's traffic
-// counters (SessionStats). It loads the five atomic byte/packet counters
-// first, then takes mu once to read renegotiations/establishedAt/
+// counters (SessionStats). It loads the six atomic byte/packet/keepalive
+// counters first, then takes mu once to read renegotiations/establishedAt/
 // lastAuthTraffic — the snapshot is therefore NOT a consistent instant
 // across every field (a packet could be counted in BytesIn between the
 // atomic loads and the mu-guarded reads), but that is the right tradeoff
@@ -600,6 +622,7 @@ func (s *Session) Stats() SessionStats {
 		BytesOut:            s.bytesOut.Load(),
 		PacketsIn:           s.packetsIn.Load(),
 		PacketsOut:          s.packetsOut.Load(),
+		KeepalivesIn:        s.keepalivesIn.Load(),
 		InboundQueueDropped: s.inboundQueueDropped.Load(),
 	}
 	s.mu.Lock()
@@ -736,13 +759,14 @@ func (s *Session) Write(p []byte) (int, error) {
 }
 
 // handleDataPacket decrypts an inbound P_DATA_V2 payload (ovpn.go's
-// handleDataDatagram) and, unless it fails to authenticate or is a ping
-// (absorbed inside Wrapper.Open — D-11, never surfaced here), delivers it
-// into ipInbound using the same non-blocking select+default drop policy
-// inbound above already uses (D-06): a slow embedder must never block the
-// shared UDP read loop. An authentication failure is dropped silently,
-// exactly like a forged control packet — no allocation, no per-attacker
-// state (T-02-17).
+// handleDataDatagram) and, unless it fails to authenticate or is a ping,
+// delivers it into ipInbound using the same non-blocking select+default
+// drop policy inbound above already uses (D-06): a slow embedder must
+// never block the shared UDP read loop. A ping is surfaced here as
+// datachan.ErrPingAbsorbed (D-11) and absorbed here — it is never
+// delivered, but it IS authenticated traffic (B1, see below). An
+// authentication failure is dropped silently, exactly like a forged
+// control packet — no allocation, no per-attacker state (T-02-17).
 func (s *Session) handleDataPacket(packet []byte) {
 	s.mu.Lock()
 	primary := s.primary
@@ -756,21 +780,54 @@ func (s *Session) handleDataPacket(packet []byte) {
 	plaintext, err := primary.wrapper.Open(nil, packet)
 	if err != nil {
 		primaryErr := err
-		// Includes datachan.ErrPingAbsorbed: a ping is absorbed inside
-		// Open, never delivered, and never counts as a delivered IP
-		// packet. Fall back to the lame-duck slot (D-18) ONLY if it is
-		// still live: try primary first (the common case, cheapest),
-		// lameDuck only on failure and only before its mustDie deadline
-		// (Pitfall 5) — both failing is the existing silent drop (T-02-17):
-		// no allocation, no per-attacker state, and — per T-04-07 — no
-		// touch of lastAuthTraffic: an attacker cannot keep a dead session
-		// alive with garbage that never authenticates.
+		// Wrapper.Open returns datachan.ErrPingAbsorbed only AFTER the
+		// AEAD tag check (decryptAEAD.Open) AND the replay-window check
+		// (w.replay.accept) have both already succeeded
+		// (internal/datachan/datachan.go:261-271) — the sentinel is
+		// therefore proof of authentication, not a decrypt failure, and is
+		// handled here as authenticated traffic: it refreshes
+		// lastAuthTraffic exactly like a delivered IP packet does (B1),
+		// mirroring the reference, where the ping-restart timer is reset
+		// for ANY authenticated packet (forward.c:1183-1187) strictly
+		// BEFORE is_ping_msg suppresses delivery (forward.c:1197-1201).
+		// This check runs BEFORE the lame-duck fallback below: a ping that
+		// already authenticated under the primary key must never be
+		// re-offered to the lame-duck wrapper, which would fail on it and
+		// misreport it under the lame-duck auth-failure reason (B2).
+		if errors.Is(primaryErr, datachan.ErrPingAbsorbed) {
+			s.touchAuthTraffic()
+			s.keepalivesIn.Add(1)
+			s.logger().Debug("data packet dropped", "reason", "keepalive")
+			return
+		}
+		// Fall back to the lame-duck slot (D-18) ONLY if it is still live:
+		// try primary first (the common case, cheapest), lameDuck only on
+		// failure and only before its mustDie deadline (Pitfall 5) — both
+		// failing is the existing silent drop (T-02-17): no allocation, no
+		// per-attacker state, and — per T-04-07 — no touch of
+		// lastAuthTraffic: an attacker cannot keep a dead session alive
+		// with garbage that never authenticates. Only a genuine
+		// ErrAuth/ErrReplay/ErrShort return reaches this drop path; that
+		// path still leaves lastAuthTraffic untouched, so T-04-07 is
+		// unaffected by this change.
 		if lameDuck.wrapper == nil || !s.now().Before(lameDuck.mustDie) {
 			s.logger().Debug("data packet dropped", "reason", "data-auth-failed", "err", primaryErr)
 			return
 		}
 		plaintext, err = lameDuck.wrapper.Open(nil, packet)
 		if err != nil {
+			// Same sentinel-first reasoning as the primary slot above: a
+			// ping authenticated under the lame-duck key is authenticated
+			// traffic, not a failure. No "err" attribute on either
+			// keepalive record — the sentinel carries no diagnostic
+			// information, and emitting it under an err key is what made
+			// a healthy keepalive read as a failure (the exact B2 symptom).
+			if errors.Is(err, datachan.ErrPingAbsorbed) {
+				s.touchAuthTraffic()
+				s.keepalivesIn.Add(1)
+				s.logger().Debug("data packet dropped", "reason", "keepalive-lame-duck")
+				return
+			}
 			s.logger().Debug("data packet dropped", "reason", "data-auth-failed-lame-duck", "err", err)
 			return
 		}
@@ -996,10 +1053,12 @@ func (s *Session) checkReneg() {
 
 // touchAuthTraffic stamps lastAuthTraffic with s.now() (D-22, Pattern 6:
 // forward.c:1093-1103 control path, forward.c:1184 data path). Called only
-// from a delivered control-packet path (ovpn.go's pump) or after a
-// successful data-channel decrypt (handleDataPacket) — never for traffic
-// that failed to authenticate (T-04-07). Guarded by mu, the same lock
-// lastAuthTraffic itself is guarded by.
+// from a delivered control-packet path (ovpn.go's pump), after a
+// successful data-channel decrypt (handleDataPacket), or after an absorbed
+// ping keepalive on either key slot (handleDataPacket's
+// datachan.ErrPingAbsorbed branches, B1) — never for traffic that failed to
+// authenticate (T-04-07). Guarded by mu, the same lock lastAuthTraffic
+// itself is guarded by.
 func (s *Session) touchAuthTraffic() {
 	s.mu.Lock()
 	s.lastAuthTraffic = s.now()

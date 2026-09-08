@@ -6,6 +6,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project does not yet follow Semantic Versioning strictly (pre-1.0), but
 version numbers below still increase monotonically with each release.
 
+## [Unreleased]
+
+### Fixed
+
+- An authenticated ping keepalive was treated as a decrypt failure, so a
+  client that sent nothing but keepalives was idle-reaped after one
+  `ReapWindow` despite being alive. The keepalive now refreshes the
+  idle-reap timer, and it is logged with its own `keepalive`/
+  `keepalive-lame-duck` reason token instead of sharing the auth-failure
+  path.
+
+### Added
+
+- `SessionStats.KeepalivesIn` — counts inbound ping keepalives a session
+  authenticated and absorbed. Excluded from `BytesIn`/`PacketsIn` (a ping
+  is not tunnel payload) but counted here, and it refreshes
+  `LastAuthTrafficAt`.
+
 ## [0.2.0] - 2026-09-08
 
 ### Added

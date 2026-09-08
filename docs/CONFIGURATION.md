@@ -496,7 +496,10 @@ idle-session reaper closes it, AND the value pushed to the client as
 implementation's own 60-second default. Server-authoritative and
 independent of whatever the client believes. `Serve` rejects a configured
 `ReapWindow` smaller than twice the resolved `PingInterval`, with an error
-naming both values.
+naming both values. The client's own keepalives (`PingInterval`, pushed as
+`ping N`) count as authenticated traffic for this window, which is why
+`ReapWindow` must exceed twice `PingInterval` — a client sending nothing
+but its own keepalives is never idle-reaped.
 
 ```go
 cfg := ovpn.Config{PingInterval: 5 * time.Second, ReapWindow: 30 * time.Second}
@@ -557,6 +560,15 @@ failed: `not-ipv4`, `outside-network`, `reserved-address`, `in-use`,
 `"callback": "AssignIP"` (alongside the existing `"OnSession"`,
 `"OnSessionClosed"`, and `"AuthUserPass"` values) when `Config.AssignIP`
 itself panicked.
+
+`data packet dropped` carries a `reason` token distinguishing why: `no-data-key`,
+`data-auth-failed`, `data-auth-failed-lame-duck`, `keepalive`,
+`keepalive-lame-duck`, `session-closing`, `ip-queue-full`. The two
+keepalive tokens are NOT failures: the packet authenticated (it passed
+both the AEAD tag check and the replay-window check), it was absorbed
+rather than delivered because it is a ping, and it refreshed the
+idle-reap timer (`LastAuthTrafficAt`) exactly like a delivered IP packet
+would.
 
 **Attribute vocabulary** (use `reason`/`stage` to distinguish *why*, never
 the message string): `addr`, `remote`, `session_id`, `client_session_id`,

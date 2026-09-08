@@ -429,6 +429,7 @@ func (s *Session) Stats() SessionStats
 type SessionStats struct {
     BytesIn, BytesOut             uint64
     PacketsIn, PacketsOut         uint64
+    KeepalivesIn                  uint64
     InboundQueueDropped           uint64
     Renegotiations                uint32
     EstablishedAt, LastAuthTrafficAt time.Time
@@ -440,7 +441,11 @@ type SessionStats struct {
   overhead excluded). **`PacketsIn`/`PacketsOut`** count the packets those
   bytes arrived/departed in. A ping keepalive — absorbed inside the
   decrypt path or emitted via a path that bypasses `Write` — increments
-  none of these four.
+  `KeepalivesIn` instead, and still refreshes `LastAuthTrafficAt`.
+- **`KeepalivesIn`** — inbound ping keepalives this session authenticated
+  and absorbed. Excluded from `BytesIn`/`PacketsIn` (a ping is not tunnel
+  payload) but counted here, and it DOES refresh `LastAuthTrafficAt` — a
+  client sending nothing but keepalives is never idle-reaped.
 - **`InboundQueueDropped`** — decrypted IP packets dropped because the
   session's inbound queue (`Config.SessionInboundQueue`) was full: a slow
   embedder falling behind `Read`.
@@ -449,7 +454,8 @@ type SessionStats struct {
   same publish point `OnSession` fires from); zero before that.
 - **`LastAuthTrafficAt`** — when this session last received authenticated
   traffic (control or data, primary or lame-duck slot); never advances for
-  traffic that failed to authenticate.
+  traffic that failed to authenticate. An absorbed ping keepalive counts as
+  authenticated traffic for this field.
 
 Two additional methods, `DebugKeyMethod2Material` and `DebugDataKeys`,
 expose raw key-derivation material for test/interop harnesses that need to
