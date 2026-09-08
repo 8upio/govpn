@@ -53,18 +53,22 @@ if err := srv.Serve(pc); err != nil {
 
 ```go
 type Config struct {
-    TLSConfig      *tls.Config
-    TLSCryptKey    []byte
-    Network        *net.IPNet
-    Cipher         string
-    OnSession      func(*Session)
-    OnSessionPanic func(sess *Session, recovered any, stack []byte)
-    RenegSec       time.Duration
+    TLSConfig           *tls.Config
+    TLSCryptKey         []byte
+    Network             *net.IPNet
+    Cipher              string
+    OnSession           func(*Session)
+    OnSessionPanic      func(sess *Session, recovered any, stack []byte)
+    RenegSec            time.Duration
+    OnSessionClosed     func(sess *Session, reason CloseReason)
+    PingInterval        time.Duration
+    ReapWindow          time.Duration
+    SessionInboundQueue int
 }
 ```
 
 Passed by value to `NewServer`. See [CONFIGURATION.md](CONFIGURATION.md) for
-what each field controls, which are required, and their defaults. The two
+what each field controls, which are required, and their defaults. The
 fields most relevant to the API surface on this page:
 
 - **`OnSession func(*Session)`** — invoked exactly once per client, after Key
@@ -74,9 +78,19 @@ fields most relevant to the API surface on this page:
   therefore immediately usable: `Session.AssignedIP()` is already populated
   and `Session.PeerCN` is the verified client CommonName.
 - **`OnSessionPanic func(sess *Session, recovered any, stack []byte)`** — if
-  set, called when `OnSession` panics, instead of letting the panic crash
-  the embedding process. It receives the `Session`, the recovered panic
-  value, and a captured stack trace (`runtime/debug.Stack()`).
+  set, called when `OnSession` (or `OnSessionClosed`) panics, instead of
+  letting the panic crash the embedding process. It receives the `Session`,
+  the recovered panic value, and a captured stack trace
+  (`runtime/debug.Stack()`).
+- **`OnSessionClosed func(sess *Session, reason CloseReason)`** — invoked at
+  most once per session, only for a session that was actually handed to
+  `OnSession`, after that session's teardown has fully completed. See
+  [Lifecycle and `Close`](#lifecycle-and-close) and [`CloseReason`](#closereason)
+  below.
+- **`PingInterval` / `ReapWindow` / `SessionInboundQueue`** — see
+  [`Session.Stats`](#other-accessors) and CONFIGURATION.md; these make the
+  pushed `ping`/`ping-restart` schedule and the per-session inbound queue
+  depth configurable instead of fixed.
 
 ## `ovpn.ParseStaticKeyV1`
 
@@ -136,8 +150,11 @@ func (s *Server) Close() error
 
 Unblocks `Serve`'s read loop by closing the underlying `net.PacketConn`
 (making `Serve` return `nil`), and closes every in-flight session's control
-channel so their handshake goroutines and retransmit loops don't leak past
-server shutdown.
+channel (recording `CloseReasonServerClose` on each) so their handshake
+goroutines and retransmit loops don't leak past server shutdown. `Close`
+does not return until every `Config.OnSessionClosed` callback it triggered
+has itself returned, so resources an embedder tears down immediately after
+`Close` returns can never race a still-running callback.
 
 ```go
 srv := ovpn.NewServer(cfg)
@@ -213,21 +230,68 @@ goroutine at any time.
 
 ```go
 func (s *Session) Close() error
+func (s *Session) Done() <-chan struct{}
+func (s *Session) CloseReason() CloseReason
 ```
 
-A `Session` ends in exactly one of three ways, all flowing through the same
-idempotent `Close`, after which both `Read` and `Write` return `io.EOF`:
+A `Session` ends in exactly one of five ways, all flowing through the same
+single internal teardown funnel (`closeWithReason`, of which the exported
+`Close` is a thin wrapper), after which both `Read` and `Write` return
+`io.EOF`:
 
-1. The embedder calls `Close` directly.
+1. The embedder calls `Close` directly (`CloseReasonEmbedder`).
 2. The client sends an explicit-exit-notify on the authenticated data
-   channel (the client disconnected cleanly).
+   channel — the client disconnected cleanly
+   (`CloseReasonClientExitNotify`).
 3. The server's own idle-session reaper closes a session that has gone
-   silent (no authenticated traffic, control or data) for the reap window.
+   silent (no authenticated traffic, control or data) for the reap window
+   (`CloseReasonIdleReap`).
+4. `Server.Close` tears the session down along with every other live
+   session (`CloseReasonServerClose`).
+5. The session never completed its handshake (a failed TLS handshake, a
+   handshake-window timeout) and is torn down before ever reaching
+   `OnSession` (`CloseReasonUnknown` — see below; this session was never
+   published, so it never triggers `OnSessionClosed`).
 
-In every case, `Close` tears down the session's control channel and
+In every case, teardown tears down the session's control channel and
 releases its assigned tunnel IP and peer-id back to the server's pool for
 immediate reuse. `Close` is safe to call more than once and safe to call
-concurrently.
+concurrently — only the first call's reason is ever recorded.
+
+`Done()` returns a channel closed once teardown has finished, regardless of
+cause. `CloseReason()` reports why: it is `CloseReasonUnknown` before
+`Done()` has fired.
+
+If `Config.OnSessionClosed` is set, it fires once teardown has fully
+completed, but ONLY for a session that was actually handed to `OnSession` —
+see [`OnSessionClosed`](#ovpnconfig) above and `Server.Close`'s own
+wait-for-callbacks contract.
+
+### `CloseReason`
+
+```go
+type CloseReason int
+
+const (
+    CloseReasonUnknown CloseReason = iota
+    CloseReasonEmbedder
+    CloseReasonClientExitNotify
+    CloseReasonIdleReap
+    CloseReasonServerClose
+    CloseReasonReplaced // reserved; never produced by this package today
+)
+
+func (r CloseReason) String() string
+```
+
+| Constant | Produced by |
+|---|---|
+| `CloseReasonUnknown` | A still-live session, or one torn down before it was ever published to `OnSession` (never triggers `OnSessionClosed`). |
+| `CloseReasonEmbedder` | `Session.Close` called directly. |
+| `CloseReasonClientExitNotify` | An authenticated client-side explicit-exit-notify. |
+| `CloseReasonIdleReap` | The server's own idle-session reaper. |
+| `CloseReasonServerClose` | `Server.Close` tearing down every live session. |
+| `CloseReasonReplaced` | Reserved for a future static-IP "replace" teardown path — never produced today. |
 
 ### Other accessors
 
@@ -237,6 +301,8 @@ func (s *Session) PeerID() uint32
 func (s *Session) PushRequestSeen() bool
 func (s *Session) RenegotiationCount() uint32
 func (s *Session) ConnectionState() tls.ConnectionState
+func (s *Session) RemoteAddress() net.Addr
+func (s *Session) Stats() SessionStats
 ```
 
 - **`AssignedIP`** — this session's tunnel address, allocated from
@@ -256,6 +322,40 @@ func (s *Session) ConnectionState() tls.ConnectionState
   (negotiated version, cipher suite, peer certificate chain), captured once
   immediately after the handshake completes. Calling it before `OnSession`
   has fired for this session returns the zero value.
+- **`RemoteAddress`** — the client's UDP address; the same value the
+  exported `RemoteAddr` field already holds, exposed as an accessor so a
+  future storage-representation change doesn't break embedders using the
+  method form (a method named `RemoteAddr` would collide with the field).
+- **`Stats`** — a point-in-time snapshot of this session's traffic counters
+  (`SessionStats`, below). Independently-sampled, not a consistent instant
+  across every field — cheap enough to call from any goroutine at any time
+  without contending the data path's own locking.
+
+```go
+type SessionStats struct {
+    BytesIn, BytesOut             uint64
+    PacketsIn, PacketsOut         uint64
+    InboundQueueDropped           uint64
+    Renegotiations                uint32
+    EstablishedAt, LastAuthTrafficAt time.Time
+}
+```
+
+- **`BytesIn`/`BytesOut`** — decrypted IP-packet *payload* bytes seen by
+  `Read`/`Write`, never wire bytes (AEAD tag, tls-crypt/UDP framing
+  overhead excluded). **`PacketsIn`/`PacketsOut`** count the packets those
+  bytes arrived/departed in. A ping keepalive — absorbed inside the
+  decrypt path or emitted via a path that bypasses `Write` — increments
+  none of these four.
+- **`InboundQueueDropped`** — decrypted IP packets dropped because the
+  session's inbound queue (`Config.SessionInboundQueue`) was full: a slow
+  embedder falling behind `Read`.
+- **`Renegotiations`** — the same value `RenegotiationCount()` returns.
+- **`EstablishedAt`** — when this session's data channel went live (the
+  same publish point `OnSession` fires from); zero before that.
+- **`LastAuthTrafficAt`** — when this session last received authenticated
+  traffic (control or data, primary or lame-duck slot); never advances for
+  traffic that failed to authenticate.
 
 Two additional methods, `DebugKeyMethod2Material` and `DebugDataKeys`,
 expose raw key-derivation material for test/interop harnesses that need to

@@ -1082,20 +1082,30 @@ func (s *Server) performPushExchange(sess *Session, w io.Writer) error {
 				s.pool.release(ip, peerID)
 				return errors.New("ovpn: session closed during push exchange")
 			}
+			// One clock read for the whole atomic publish below (D-22's
+			// existing lastAuthTraffic requirement extended, by the
+			// Welle-1 SessionStats plan, to establishedAt too: "do not add
+			// a second critical section" — reusing a single sess.now()
+			// reading is what makes that literal, not just adjacent in
+			// time).
+			now := sess.now()
 			sess.assignedIP = ip
 			sess.peerID = peerID
 			sess.primary = keySlot{
 				keyID:       0,
 				conn:        sess.conn,
 				wrapper:     dataWrapper,
-				established: sess.now(),
+				established: now,
 			}
 			sess.ipInbound = ipInbound
 			// D-22: initialized here, at the same publish point the data
 			// wrapper goes live, so the reaper (started right below) can
 			// never observe a zero-value lastAuthTraffic and reap a
 			// session that just this moment came up.
-			sess.lastAuthTraffic = sess.now()
+			sess.lastAuthTraffic = now
+			// SessionStats.EstablishedAt: the same publish point, the
+			// same clock reading.
+			sess.establishedAt = now
 			s.mu.Lock()
 			s.dataSessions[peerID] = sess
 			s.mu.Unlock()

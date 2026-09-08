@@ -47,6 +47,12 @@ srv := ovpn.NewServer(ovpn.Config{
         // sess.AssignedIP() and sess.PeerID() are already populated here.
         go io.Copy(sess, sess) // or attach it to your own packet handling
     },
+    OnSessionClosed: func(sess *ovpn.Session, reason ovpn.CloseReason) {
+        // fires once teardown completes, only for a session that reached
+        // OnSession — reason distinguishes embedder Close, client
+        // exit-notify, idle reap, or Server.Close.
+        log.Printf("session for %s closed: %s", sess.RemoteAddress(), reason)
+    },
 })
 
 pc, _ := net.ListenPacket("udp", "0.0.0.0:1194")
@@ -55,7 +61,7 @@ if err := srv.Serve(pc); err != nil {
 }
 ```
 
-`ovpn.ParseStaticKeyV1` parses an OpenVPN "Static key V1" file into the raw bytes `Config.TLSCryptKey` expects.
+`ovpn.ParseStaticKeyV1` parses an OpenVPN "Static key V1" file into the raw bytes `Config.TLSCryptKey` expects. `sess.Stats()` returns a point-in-time snapshot of that session's traffic counters (bytes/packets in and out, inbound-queue drops, renegotiations, and established/last-authenticated-traffic timestamps) — useful for per-session observability without wrapping `Read`/`Write` yourself.
 
 For traffic that needs to terminate entirely in-process (rather than being forwarded to a TUN device elsewhere), attach each session to the bundled userspace netstack instead of handling packets yourself:
 
@@ -73,7 +79,7 @@ srv := ovpn.NewServer(ovpn.Config{
 
 The `netstack` package imports nothing from `govpn` — `*ovpn.Session` satisfies its `Session` interface (`io.ReadWriteCloser`) structurally, with no coupling in either direction. See [docs/NETSTACK.md](docs/NETSTACK.md) for the full protocol coverage (IPv4, ICMP, UDP, TCP) and design.
 
-For request/response shapes, the full `Config` surface, and `Session` methods (`AssignedIP`, `PeerID`, `ConnectionState`, `RenegotiationCount`, and more), see [docs/API.md](docs/API.md).
+For request/response shapes, the full `Config` surface, and `Session` methods (`AssignedIP`, `PeerID`, `ConnectionState`, `RenegotiationCount`, `Stats`, `CloseReason`, `Done`, and more), see [docs/API.md](docs/API.md).
 
 ## Documentation
 

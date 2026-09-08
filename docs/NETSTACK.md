@@ -94,6 +94,11 @@ it advertises.
   independent of the `tun-mtu 1500` this project pushes to connecting clients,
   which is fixed and advisory — lowering the netstack MTU does not change what
   clients are told, and clients may still send larger packets regardless.
+- `WithReassemblyLimits(l ReassemblyLimits)` — overrides the default
+  per-attachment IPv4 fragment-reassembly bounds (see
+  [Per-session bounds](#per-session-bounds) below) for every session
+  `Attach`-ed to this `Stack`. Any negative field makes `New` return
+  `ErrInvalidReassemblyLimits`.
 
 The `Clock` interface (`clock.go`) is:
 
@@ -180,19 +185,27 @@ the OpenVPN control channel's own fragmentation are separate and untouched.
 
 Reassembly state is held **per attached session**, never globally, and is
 capped three ways. One client's fragment flood therefore cannot starve
-another's, and no client can grow this stack's memory without bound:
+another's, and no client can grow this stack's memory without bound. The
+table below lists the **defaults** — override any of the three via
+`WithReassemblyLimits(ReassemblyLimits{...})` at `Stack` construction:
 
-| Bound | Value | Rationale |
-|-------|-------|-----------|
-| Buffers | 16 half-reassembled datagrams | The same order of magnitude as the existing per-session TCP caps (8 half-open, 64 live connections). Beyond it, a fragment for a *new* datagram is refused and allocates nothing. |
-| Bytes | 256 KiB (4 maximum-size datagrams) | Charged by **reached buffer length**, not by bytes actually written: an 8-byte fragment at offset 65000 costs 65 KiB, exactly what a dense 65 KiB datagram would. A sparse-fragment attacker is capped by the same number as a dense one. |
-| Time | 30 s | Linux's own `net.ipv4.ipfrag_time` default. |
+| Bound | Default | `ReassemblyLimits` field | Rationale |
+|-------|-------|------|-----------|
+| Buffers | 16 half-reassembled datagrams | `MaxDatagramsPerAttachment` | The same order of magnitude as the existing per-session TCP caps (8 half-open, 64 live connections). Beyond it, a fragment for a *new* datagram is refused and allocates nothing. |
+| Bytes | 256 KiB (4 maximum-size datagrams) | `MaxBytesPerAttachment` | Charged by **reached buffer length**, not by bytes actually written: an 8-byte fragment at offset 65000 costs 65 KiB, exactly what a dense 65 KiB datagram would. A sparse-fragment attacker is capped by the same number as a dense one. This is the field a "max datagram bytes" requirement maps onto. |
+| Time | 30 s | `Timeout` | Linux's own `net.ipv4.ipfrag_time` default. |
 
-The 30 s timeout is a deliberate deviation from RFC 1122 §3.3.2's 60–120 s
-guidance, chosen to halve the window in which state can be held. It is fixed
-when a datagram's **first** fragment arrives and is **never extended** by
-later fragments, so an attacker cannot keep a buffer alive indefinitely by
-dripping one fragment into it every 29 seconds.
+A zero `ReassemblyLimits` field means "use the built-in default" — so
+`ReassemblyLimits{MaxDatagramsPerAttachment: 4}` overrides only the buffer
+count and leaves the byte budget and timeout at their defaults. Any
+negative field makes `New` return `ErrInvalidReassemblyLimits`.
+
+The 30 s (or overridden `Timeout`) deadline is a deliberate deviation from
+RFC 1122 §3.3.2's 60–120 s guidance, chosen to halve the window in which
+state can be held. It is fixed when a datagram's **first** fragment
+arrives and is **never extended** by later fragments, so an attacker
+cannot keep a buffer alive indefinitely by dripping one fragment into it
+every 29 seconds.
 
 Expiry is **lazy**: stale buffers are swept by the next fragment to arrive on
 that session, or freed wholesale when the session detaches. There is no timer
@@ -254,10 +267,11 @@ reassembly buffer and no timer, so there is no per-attacker state to exhaust
 and no reassembly logic to attack,"* asserted by the now-deleted
 `TestFragmentDropped` — is **superseded** by this design. Its replacement is
 bounded per-session state: at most 16 buffers, 256 KiB and 30 s per
-*authenticated* session, with the source-IP ACL running before any allocation
-so a spoofed fragment allocates nothing at all. No ICMP fragmentation-needed
-error is generated on the outbound path either, so there is still no
-amplification path.
+*authenticated* session by default (configurable via
+`WithReassemblyLimits`, see [Per-session bounds](#per-session-bounds)),
+with the source-IP ACL running before any allocation so a spoofed fragment
+allocates nothing at all. No ICMP fragmentation-needed error is generated
+on the outbound path either, so there is still no amplification path.
 
 ## ICMP echo
 
@@ -270,15 +284,37 @@ with no reply and no generated ICMP error.
 
 ```go
 pc, err := stack.ListenUDP(port)
+// or, with a caller-chosen queue depth and overflow policy:
+pc, err := stack.ListenUDPOptions(port, netstack.UDPOptions{
+    QueueDepth: 256,
+    DropPolicy: netstack.UDPDropOldest,
+})
 ```
 
 `ListenUDP(port uint16) (net.PacketConn, error)` opens a UDP listener bound
 to `(serverIP, port)`. It returns the stdlib `net.PacketConn` interface, so
 unmodified socket-based code can use it directly. Listeners can be opened at
-any time after the stack is running.
+any time after the stack is running. It is equivalent to
+`ListenUDPOptions(port, UDPOptions{})`.
+
+`ListenUDPOptions(port uint16, opts UDPOptions) (net.PacketConn, error)`
+additionally accepts:
+
+- `opts.QueueDepth` — the listener's bounded inbound queue depth. `0`
+  resolves to the default, 64. A negative value returns
+  `ErrInvalidUDPQueueDepth`.
+- `opts.DropPolicy` — `UDPDropNewest` (the zero value, `ListenUDP`'s
+  existing unchanged behavior: the arriving datagram is discarded when the
+  queue is full) or `UDPDropOldest` (evicts the single oldest queued
+  datagram to make room for the arriving one, so the queue always holds the
+  freshest data — the right choice for real-time media, where a stale
+  datagram is worse than no datagram at all). An unrecognized value returns
+  `ErrInvalidUDPDropPolicy`.
+
+Common to both constructors:
 
 - `port` must not be `0` — there is no ephemeral-port allocator; the embedder
-  names the exact port it wants. `ListenUDP(0)` returns `ErrUDPPortZero`.
+  names the exact port it wants. Port `0` returns `ErrUDPPortZero`.
 - A port that already has a live listener returns `ErrUDPPortInUse`.
 
 The returned `net.PacketConn` implements the full standard contract —
@@ -292,8 +328,10 @@ number of goroutines. Notable behavior:
   currently attached at the destination IP.
 - Inbound datagrams to a port with no listener are dropped silently (no ICMP
   port-unreachable is generated).
-- Each listener's inbound queue is bounded (64 datagrams); once full, the
-  newest datagram is dropped rather than blocking the stack's read loop.
+- Each listener's inbound queue is bounded (default 64, configurable via
+  `ListenUDPOptions`); once full, the drop policy above decides which
+  datagram — arriving or already-queued — is discarded, rather than
+  blocking the stack's read loop.
 
 ## TCP
 
@@ -410,8 +448,28 @@ type TCPStats struct {
 }
 ```
 
-Both are useful for observability (logging, health checks) and for detecting
-whether a client is being throttled by one of the DoS bounds above.
+`UDPStats() UDPStats` returns a separate snapshot of UDP-specific counters
+(the zero value if `ListenUDP`/`ListenUDPOptions` has never been called —
+this accessor never registers a UDP handler as a side effect):
+
+```go
+type UDPStats struct {
+    QueueFullDropped   uint64
+    NoListenerDropped  uint64
+    BadChecksumDropped uint64
+}
+```
+
+- `QueueFullDropped` counts datagrams lost to a listener's bounded inbound
+  queue being full, under either `UDPDropPolicy`.
+- `NoListenerDropped` counts datagrams addressed to a port with no live
+  listener.
+- `BadChecksumDropped` counts datagrams whose non-zero on-wire checksum did
+  not match a fresh computation.
+
+All three are useful for observability (logging, health checks) and for
+detecting whether a client is being throttled by one of the DoS bounds
+above.
 
 ## Composing with `ovpn.Session`
 

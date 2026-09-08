@@ -242,24 +242,28 @@ type Session struct {
 	published atomic.Bool
 
 	// mu guards assignedIP, peerID, primary, lameDuck, pendingReneg,
-	// pendingRenegKeyID, lastRenegAccepted, lastAuthTraffic, and dataKeys
-	// below (WR-03, extended by 04-01-PLAN.md Task 1 from the single
-	// dataWrapper field it originally guarded to this phase's two-slot key
-	// state, by 04-02-PLAN.md Task 2 to lastAuthTraffic, and by 04-REVIEW.md
-	// WR-01 to dataKeys — no new mutex): ovpn.go's performPushExchange and
+	// pendingRenegKeyID, lastRenegAccepted, lastAuthTraffic, dataKeys, and
+	// establishedAt below (WR-03, extended by 04-01-PLAN.md Task 1 from
+	// the single dataWrapper field it originally guarded to this phase's
+	// two-slot key state, by 04-02-PLAN.md Task 2 to lastAuthTraffic, by
+	// 04-REVIEW.md WR-01 to dataKeys, and by the Welle-1 SessionStats plan
+	// to establishedAt — no new mutex): ovpn.go's performPushExchange and
 	// runRenegotiation (running on this session's own goroutines) write
 	// them, while Close — which enforceHandshakeWindow's timeout goroutine
 	// can invoke concurrently at any point — reads them, and the public
-	// DebugDataKeys accessor can be called from an arbitrary embedder/test
-	// goroutine at any time. Without this lock those are an unsynchronized
-	// concurrent read/write of the same memory from two goroutines,
-	// undefined under the Go memory model. Every other field in this
-	// struct has its own, already-established discipline (stopCh/
-	// stopOnce, srv.mu for dataSessions/sessions) and does not need this
-	// mutex — this notably excludes clientKM/serverKM (WR-01): those are
-	// written exactly once, unlocked, during the single-writer initial
-	// handshake before OnSession ever publishes the *Session to the
-	// embedder, and never rewritten by runRenegotiation.
+	// DebugDataKeys/Stats accessors can be called from an arbitrary
+	// embedder/test goroutine at any time. Without this lock those are an
+	// unsynchronized concurrent read/write of the same memory from two
+	// goroutines, undefined under the Go memory model. Every other field
+	// in this struct has its own, already-established discipline (stopCh/
+	// stopOnce, srv.mu for dataSessions/sessions, atomic.Uint64 for the
+	// five SessionStats byte/packet counters below — a deliberately
+	// separate discipline from mu, keeping the hot data path lock-free)
+	// and does not need this mutex — this notably excludes clientKM/
+	// serverKM (WR-01): those are written exactly once, unlocked, during
+	// the single-writer initial handshake before OnSession ever publishes
+	// the *Session to the embedder, and never rewritten by
+	// runRenegotiation.
 	mu sync.Mutex
 
 	// assignedIP is this session's tunnel address, allocated from
@@ -369,6 +373,65 @@ type Session struct {
 	// ordinarily rely on; concurrent Read calls on one Session are not
 	// supported (mirrors bufio.Reader's own contract).
 	pendingRead []byte
+
+	// bytesIn/bytesOut/packetsIn/packetsOut/inboundQueueDropped back
+	// Stats() (SessionStats): decrypted IP-packet payload bytes/packets
+	// this session has delivered through Read/Write, and packets dropped
+	// because ipInbound was full. Deliberately atomic.Uint64, not fields
+	// guarded by mu: the hot data path (handleDataPacket, Write) must stay
+	// lock-free, and Stats() reading five independent atomics is exactly
+	// the "not a consistent instant across all fields, but cheap" contract
+	// an observability accessor needs (see Stats' own doc comment). A
+	// keepalive ping — absorbed inside Wrapper.Open/emitted via
+	// SealPing, never through handleDataPacket's plaintext-delivery path
+	// or through Write — increments none of these.
+	bytesIn             atomic.Uint64
+	bytesOut            atomic.Uint64
+	packetsIn           atomic.Uint64
+	packetsOut          atomic.Uint64
+	inboundQueueDropped atomic.Uint64
+
+	// establishedAt is when this session's data channel went live —
+	// stamped in ovpn.go's performPushExchange, inside the SAME sess.mu
+	// critical section and from the SAME sess.now() reading that
+	// initializes lastAuthTraffic above (no second critical section, no
+	// second clock read). Guarded by mu.
+	establishedAt time.Time
+}
+
+// SessionStats is a point-in-time snapshot of one Session's traffic
+// counters, returned by Session.Stats().
+type SessionStats struct {
+	// BytesIn/BytesOut count decrypted IP-packet PAYLOAD bytes — what
+	// Read/Write see, never wire bytes (AEAD tag, tls-crypt/UDP framing
+	// overhead are excluded). PacketsIn/PacketsOut count the packets
+	// those bytes arrived/departed in. A keepalive ping — absorbed inside
+	// the decrypt path (Wrapper.Open) or emitted via SealPing, neither of
+	// which is handleDataPacket's plaintext-delivery path or Write —
+	// appears in none of these four counters.
+	BytesIn    uint64
+	BytesOut   uint64
+	PacketsIn  uint64
+	PacketsOut uint64
+
+	// InboundQueueDropped counts decrypted IP packets dropped because
+	// ipInbound was full (D-06): a slow embedder falling behind Read,
+	// exactly like the netstack's own per-listener drop counters.
+	InboundQueueDropped uint64
+
+	// Renegotiations is the same value RenegotiationCount() already
+	// exposes — included here so a caller that only wants Stats() doesn't
+	// need a second accessor call.
+	Renegotiations uint32
+
+	// EstablishedAt is when this session's data channel went live (the
+	// same publish point OnSession fires from), the zero value before
+	// that. LastAuthTrafficAt is when this session last received
+	// AUTHENTICATED traffic (control or data, primary or lame-duck) —
+	// Session.runReap's own D-22 comparison — and never advances for
+	// traffic that failed to authenticate (T-04-07).
+	EstablishedAt     time.Time
+	LastAuthTrafficAt time.Time
 }
 
 // now returns the current time from s.clock, or reliable.SystemClock{} if
@@ -456,6 +519,40 @@ func (s *Session) RenegotiationCount() uint32 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.renegotiations
+}
+
+// Stats returns a point-in-time snapshot of this session's traffic
+// counters (SessionStats). It loads the five atomic byte/packet counters
+// first, then takes mu once to read renegotiations/establishedAt/
+// lastAuthTraffic — the snapshot is therefore NOT a consistent instant
+// across every field (a packet could be counted in BytesIn between the
+// atomic loads and the mu-guarded reads), but that is the right tradeoff
+// for an observability accessor: independently-sampled counters, read
+// without contending the hot data path's own locking (SessionStats'
+// own doc comment).
+func (s *Session) Stats() SessionStats {
+	stats := SessionStats{
+		BytesIn:             s.bytesIn.Load(),
+		BytesOut:            s.bytesOut.Load(),
+		PacketsIn:           s.packetsIn.Load(),
+		PacketsOut:          s.packetsOut.Load(),
+		InboundQueueDropped: s.inboundQueueDropped.Load(),
+	}
+	s.mu.Lock()
+	stats.Renegotiations = s.renegotiations
+	stats.EstablishedAt = s.establishedAt
+	stats.LastAuthTrafficAt = s.lastAuthTraffic
+	s.mu.Unlock()
+	return stats
+}
+
+// RemoteAddress returns the client's UDP address — the same value the
+// exported RemoteAddr field already holds. It exists so a future change to
+// how this session stores the address does not break embedders that use
+// the accessor form; RemoteAddr itself remains and is not deprecated (a
+// method named RemoteAddr would collide with the field of the same name).
+func (s *Session) RemoteAddress() net.Addr {
+	return s.RemoteAddr
 }
 
 // DebugKeyMethod2Material returns this session's raw Key Method 2 seed
@@ -565,6 +662,12 @@ func (s *Session) Write(p []byte) (int, error) {
 	if _, err := s.srv.pc.WriteTo(sealed, s.RemoteAddr); err != nil {
 		return 0, fmt.Errorf("ovpn: write data packet: %w", err)
 	}
+	// SessionStats: counted only once the wire write has actually
+	// succeeded — a write that failed to seal or failed to send must not
+	// be counted (Stats' own doc comment). emitPing deliberately bypasses
+	// Write entirely and so is never counted here either.
+	s.packetsOut.Add(1)
+	s.bytesOut.Add(uint64(len(p)))
 	return len(p), nil
 }
 
@@ -622,6 +725,14 @@ func (s *Session) handleDataPacket(packet []byte) {
 		return
 	}
 
+	// SessionStats: counted here, after the exit-notify check (an OCC
+	// control message must not inflate the IP-packet counters) and after
+	// touchAuthTraffic (forged traffic, which returned earlier, must
+	// never reach here) — exactly the same two exclusions Stats' own doc
+	// comment promises.
+	s.packetsIn.Add(1)
+	s.bytesIn.Add(uint64(len(plaintext)))
+
 	select {
 	case s.ipInbound <- plaintext:
 	case <-s.stopCh:
@@ -629,6 +740,7 @@ func (s *Session) handleDataPacket(packet []byte) {
 		// Queue full: drop this decrypted packet exactly as a genuinely
 		// congested link would (D-06) — never block handleDatagram's
 		// per-datagram goroutine.
+		s.inboundQueueDropped.Add(1)
 	}
 }
 
