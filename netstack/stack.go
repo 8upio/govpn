@@ -23,6 +23,7 @@ import (
 	"net/netip"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Session is the interface Attach accepts: exactly io.ReadWriteCloser.
@@ -140,6 +141,12 @@ var (
 	// outbound packet's IPv4 source is not the server's own tunnel IP
 	// (D-04, fail-closed).
 	ErrOutboundSourceMismatch = errors.New("netstack: outbound packet's IPv4 source is not the server tunnel IP")
+
+	// ErrInvalidReassemblyLimits is returned by New when
+	// WithReassemblyLimits was given a negative field. Option has no
+	// error return, so New is the only place this check can live —
+	// exactly the ErrInvalidMTU precedent above.
+	ErrInvalidReassemblyLimits = errors.New("netstack: ReassemblyLimits fields must not be negative")
 )
 
 // stats holds the stack's atomic drop/delivery counters. Every silent drop
@@ -254,6 +261,13 @@ type Stack struct {
 	// never mutated afterwards, so it needs no lock.
 	mtu int
 
+	// reasmLimits overrides the default per-attachment reassembly bounds
+	// (see WithReassemblyLimits). Set once in New (validated there, since
+	// Option cannot return an error) and never mutated afterwards, so it
+	// needs no lock. Attach copies it into each new attachment's
+	// reassembler.
+	reasmLimits ReassemblyLimits
+
 	// ipID hands out the Identification values fragmentIPv4 stamps on
 	// outbound fragments. It starts at 1 and wraps naturally: RFC 6864
 	// §4 only requires uniqueness per (source, destination, protocol)
@@ -299,6 +313,39 @@ func WithMTU(mtu int) Option {
 	return func(s *Stack) { s.mtu = mtu }
 }
 
+// ReassemblyLimits overrides the per-attachment IPv4 fragment-reassembly
+// bounds (see reassembly.go's own header comment for the algorithm and
+// overlap policy). A zero field means "use the built-in default"
+// (maxReassemblyBuffersPerSession, maxReassemblyBytesPerSession,
+// reassemblyTimeout respectively), so ReassemblyLimits{} is equivalent to
+// never calling WithReassemblyLimits at all.
+//
+// MaxBytesPerAttachment is a PER-ATTACHMENT byte budget charged by reached
+// buffer length, not by bytes actually written (see reassembly.go's add
+// for why) — this is how a caller's "max datagram bytes" requirement maps
+// onto this stack's existing model.
+type ReassemblyLimits struct {
+	// MaxDatagramsPerAttachment caps how many distinct datagrams one
+	// attached session may have half-reassembled at once.
+	MaxDatagramsPerAttachment int
+
+	// MaxBytesPerAttachment caps the bytes one attached session's
+	// half-reassembled datagrams may hold in total.
+	MaxBytesPerAttachment int
+
+	// Timeout is how long a partially-reassembled datagram lives before
+	// it is discarded, fixed when its first fragment arrives.
+	Timeout time.Duration
+}
+
+// WithReassemblyLimits overrides the default per-attachment reassembly
+// bounds for every session Attach-ed to this Stack. Any negative field
+// makes New return ErrInvalidReassemblyLimits, since Option cannot return
+// an error itself — the same reason WithMTU's range check lives in New.
+func WithReassemblyLimits(l ReassemblyLimits) Option {
+	return func(s *Stack) { s.reasmLimits = l }
+}
+
 // New builds a Stack terminating serverIP (the server's own tunnel
 // address). serverIP must be a non-nil IPv4 address (D-17: IPv6 is
 // rejected, matching Config.Network and the 10.8.0.0/24 harness network).
@@ -325,6 +372,11 @@ func New(serverIP net.IP, opts ...Option) (*Stack, error) {
 	// return, so this is the only place the range can be enforced.
 	if s.mtu < minMTU || s.mtu > maxMTU {
 		return nil, ErrInvalidMTU
+	}
+	if s.reasmLimits.MaxDatagramsPerAttachment < 0 ||
+		s.reasmLimits.MaxBytesPerAttachment < 0 ||
+		s.reasmLimits.Timeout < 0 {
+		return nil, ErrInvalidReassemblyLimits
 	}
 	return s, nil
 }
@@ -422,6 +474,11 @@ func (s *Stack) Attach(sess Session, ip net.IP) error {
 		sess:   sess,
 		ip:     addr,
 		stopCh: make(chan struct{}),
+		reasm: reassembler{
+			maxBufs:  s.reasmLimits.MaxDatagramsPerAttachment,
+			maxBytes: s.reasmLimits.MaxBytesPerAttachment,
+			timeout:  s.reasmLimits.Timeout,
+		},
 	}
 	s.routes[addr] = a
 	s.mu.Unlock()

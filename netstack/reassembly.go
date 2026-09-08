@@ -118,12 +118,45 @@ type reassemblyBuffer struct {
 
 // reassembler is one attached session's whole reassembly state. The zero
 // value is ready to use: bufs is created lazily on the first add, so an
-// attachment that never sees a fragment allocates nothing at all.
+// attachment that never sees a fragment allocates nothing at all. maxBufs,
+// maxBytes and timeout are zero in that zero value, which resolveLimits
+// maps onto the three package-constant defaults below — so a
+// directly-constructed `var r reassembler` (as reassembly_test.go's own
+// tests do) behaves exactly as before WithReassemblyLimits existed.
 type reassembler struct {
 	mu     sync.Mutex
 	bufs   map[reassemblyKey]*reassemblyBuffer
 	bytes  int
 	closed bool
+
+	// maxBufs, maxBytes and timeout override maxReassemblyBuffersPerSession,
+	// maxReassemblyBytesPerSession and reassemblyTimeout respectively, when
+	// non-zero. Populated from Stack.reasmLimits by Attach; see
+	// WithReassemblyLimits.
+	maxBufs  int
+	maxBytes int
+	timeout  time.Duration
+}
+
+// resolveLimits returns the effective (buffer count, byte, timeout) limits
+// for this reassembler: each of r's three override fields when non-zero,
+// otherwise the corresponding package-constant default. Called once per
+// add so a limits change (there is none at runtime today) would apply
+// immediately rather than being cached at construction.
+func (r *reassembler) resolveLimits() (maxBufs int, maxBytes int, timeout time.Duration) {
+	maxBufs = r.maxBufs
+	if maxBufs == 0 {
+		maxBufs = maxReassemblyBuffersPerSession
+	}
+	maxBytes = r.maxBytes
+	if maxBytes == 0 {
+		maxBytes = maxReassemblyBytesPerSession
+	}
+	timeout = r.timeout
+	if timeout == 0 {
+		timeout = reassemblyTimeout
+	}
+	return maxBufs, maxBytes, timeout
 }
 
 // reasmOutcome is what add did with a fragment. deliver maps each of these
@@ -175,13 +208,14 @@ func (r *reassembler) add(now time.Time, hdr ipv4Header, pkt []byte) (datagram [
 		return nil, reasmClosed, 0
 	}
 
-	// Lazy expiry: no goroutine and no timer. With at most
-	// maxReassemblyBuffersPerSession entries an O(n) sweep on every
-	// fragment is cheaper than a timer would be to arm and cancel. The
-	// consequence, accepted deliberately: a session that sends one
-	// fragment and then goes quiet holds that buffer's bytes until its
-	// next fragment or until its attachment is torn down (discardAll).
-	// Bounded either way.
+	maxBufs, maxBytes, timeout := r.resolveLimits()
+
+	// Lazy expiry: no goroutine and no timer. With at most maxBufs entries
+	// an O(n) sweep on every fragment is cheaper than a timer would be to
+	// arm and cancel. The consequence, accepted deliberately: a session
+	// that sends one fragment and then goes quiet holds that buffer's
+	// bytes until its next fragment or until its attachment is torn down
+	// (discardAll). Bounded either way.
 	for k, b := range r.bufs {
 		if !now.Before(b.expires) {
 			r.dropLocked(k, b)
@@ -196,7 +230,7 @@ func (r *reassembler) add(now time.Time, hdr ipv4Header, pkt []byte) (datagram [
 	key := reassemblyKey{src: hdr.src, dst: hdr.dst, protocol: hdr.protocol, id: hdr.id}
 	b := r.bufs[key]
 	if b == nil {
-		if len(r.bufs) >= maxReassemblyBuffersPerSession {
+		if len(r.bufs) >= maxBufs {
 			return nil, reasmBoundExceeded, expired
 		}
 		if r.bufs == nil {
@@ -205,7 +239,7 @@ func (r *reassembler) add(now time.Time, hdr ipv4Header, pkt []byte) (datagram [
 		b = &reassemblyBuffer{
 			holes:    []hole{{first: 0, last: holeOpenEnd}},
 			totalLen: -1,
-			expires:  now.Add(reassemblyTimeout),
+			expires:  now.Add(timeout),
 		}
 		r.bufs[key] = b
 	}
@@ -236,7 +270,7 @@ func (r *reassembler) add(now time.Time, hdr ipv4Header, pkt []byte) (datagram [
 	if grow < 0 {
 		grow = 0
 	}
-	if r.bytes+grow > maxReassemblyBytesPerSession {
+	if r.bytes+grow > maxBytes {
 		return nil, reasmBoundExceeded, expired
 	}
 

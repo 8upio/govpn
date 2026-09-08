@@ -68,6 +68,15 @@ var (
 	// *net.UDPAddr, has a nil IP, or is not IPv4 (D-17: IPv4 only).
 	ErrUDPInvalidAddr = errors.New("netstack: WriteTo address must be a non-nil IPv4 *net.UDPAddr")
 
+	// ErrInvalidUDPQueueDepth is returned by ListenUDPOptions when
+	// UDPOptions.QueueDepth is negative.
+	ErrInvalidUDPQueueDepth = errors.New("netstack: UDPOptions.QueueDepth must not be negative")
+
+	// ErrInvalidUDPDropPolicy is returned by ListenUDPOptions when
+	// UDPOptions.DropPolicy is not one of the declared UDPDropPolicy
+	// constants.
+	ErrInvalidUDPDropPolicy = errors.New("netstack: UDPOptions.DropPolicy is not a valid UDPDropPolicy")
+
 	// errUDPHeaderTooShort / errUDPBadLength are parseUDP's own bounds-check
 	// sentinels, in the style of ipv4.go's errTooShort etc. Unexported:
 	// deliver's caller (handlePacket) folds a parse failure into the
@@ -137,6 +146,38 @@ func buildUDP(dst []byte, src, dstAddr netip.Addr, srcPort, dstPort uint16, payl
 	return dst
 }
 
+// UDPDropPolicy selects what a udpConn's bounded inbound queue does when a
+// new datagram arrives and the queue is already full.
+type UDPDropPolicy int
+
+const (
+	// UDPDropNewest is the zero value and ListenUDP's existing, unchanged
+	// behaviour: when the queue is full, the arriving (newest) datagram
+	// is the one discarded and every already-queued datagram is kept.
+	UDPDropNewest UDPDropPolicy = iota
+
+	// UDPDropOldest discards the single oldest queued datagram to make
+	// room for the arriving one, so the queue always holds the freshest
+	// datagrams. This is the right choice for real-time media (RTP-style
+	// traffic) where a stale datagram is worse than no datagram at all.
+	UDPDropOldest
+)
+
+// UDPOptions configures a single UDP listener opened via ListenUDPOptions.
+// The zero value reproduces ListenUDP's existing behaviour exactly:
+// QueueDepth 0 resolves to the package's udpQueueDepth default, and
+// DropPolicy's zero value is UDPDropNewest.
+type UDPOptions struct {
+	// QueueDepth is the listener's bounded inbound queue depth. Zero
+	// resolves to udpQueueDepth (64). Negative is rejected by
+	// ListenUDPOptions with ErrInvalidUDPQueueDepth.
+	QueueDepth int
+
+	// DropPolicy selects the overflow behaviour once QueueDepth is
+	// reached. See UDPDropNewest and UDPDropOldest.
+	DropPolicy UDPDropPolicy
+}
+
 // udpDatagram is one inbound datagram queued on a udpConn's inbound
 // channel: the sender's address and a private copy of its payload.
 type udpDatagram struct {
@@ -170,6 +211,13 @@ type udpDemux struct {
 	// matching every other protocol's parse-failure path in deliver.
 	noListenerDropped  atomic.Uint64
 	badChecksumDropped atomic.Uint64
+
+	// queueFullDropped counts one per datagram lost to a listener's
+	// bounded inbound queue being full, under EITHER UDPDropPolicy: the
+	// arriving datagram under UDPDropNewest, or whichever of the
+	// arriving/evicted pair was ultimately lost under UDPDropOldest. See
+	// handlePacket's enqueue logic.
+	queueFullDropped atomic.Uint64
 }
 
 var _ protocolHandler = (*udpDemux)(nil)
@@ -207,10 +255,17 @@ func (d *udpDemux) handlePacket(a *attachment, src, dst netip.Addr, payload []by
 		}
 	}
 
+	// d.mu is held (RLock) across the whole port-lookup-plus-enqueue
+	// sequence, not just the lookup: d.mu is only ever taken by
+	// handlePacket, ListenUDP*, and udpConn.Close, and none of them takes
+	// a second lock while holding it, so extending the hold here
+	// introduces no lock-order inversion. Holding it prevents a
+	// concurrent udpConn.Close from deleting conn out from under this
+	// enqueue.
 	d.mu.RLock()
 	conn := d.ports[dstPort]
-	d.mu.RUnlock()
 	if conn == nil {
+		d.mu.RUnlock()
 		// No ICMP port-unreachable is generated — Deferred Idea. The
 		// omission is deliberate, not a gap: CONTEXT.md's Deferred Ideas
 		// list holds ICMP error generation until a later phase.
@@ -222,14 +277,45 @@ func (d *udpDemux) handlePacket(a *attachment, src, dst netip.Addr, payload []by
 		addr: &net.UDPAddr{IP: net.IP(src.AsSlice()), Port: int(srcPort)},
 		data: append([]byte(nil), data...),
 	}
-	select {
-	case conn.inbound <- dgram:
-	default:
-		// Queue full: drop the newest datagram (D-14), mirroring
-		// session.go:365-384's own congested-link policy. The load-bearing
-		// property is that the stack's single read-loop goroutine is
-		// never blocked by a slow or absent ReadFrom consumer.
+
+	// Both branches below stay strictly non-blocking: the load-bearing
+	// property is that the stack's single read-loop goroutine is never
+	// blocked by a slow or absent ReadFrom consumer, and that property
+	// must survive the drop-policy split.
+	switch conn.policy {
+	case UDPDropOldest:
+		select {
+		case conn.inbound <- dgram:
+		default:
+			// Queue full: evict the oldest queued datagram to make room
+			// for the newest one, so a burst consumer always sees the
+			// freshest data (D-14's real-time-media variant).
+			select {
+			case <-conn.inbound:
+			default:
+				// Lost the race: a concurrent udpConn.ReadFrom already
+				// drained the slot we were about to evict. Fall through
+				// to the second send below regardless.
+			}
+			select {
+			case conn.inbound <- dgram:
+			default:
+				// The freed slot was taken by another concurrent
+				// handlePacket call before we could use it. Drop the
+				// new datagram rather than retrying in a loop.
+			}
+			d.queueFullDropped.Add(1)
+		}
+	default: // UDPDropNewest
+		select {
+		case conn.inbound <- dgram:
+		default:
+			// Queue full: drop the newest datagram (D-14), mirroring
+			// session.go:365-384's own congested-link policy.
+			d.queueFullDropped.Add(1)
+		}
 	}
+	d.mu.RUnlock()
 }
 
 // udpDemux (below) returns the Stack's registered UDP demux, creating and
@@ -256,19 +342,40 @@ func (s *Stack) udpDemuxFor() *udpDemux {
 }
 
 // ListenUDP opens a UDP listener bound to (the stack's server tunnel IP,
-// port) (D-01, D-03). Listeners may be opened at any time after the stack
-// is running, on any port. port 0 is rejected (ErrUDPPortZero) — there is
-// no ephemeral-port allocator here; the embedder names the port it wants.
-// A port already bound by a live listener returns ErrUDPPortInUse rather
-// than silently stealing that listener's traffic.
+// port) (D-01, D-03) with the default UDPOptions (queue depth
+// udpQueueDepth, UDPDropNewest overflow policy) — equivalent to
+// s.ListenUDPOptions(port, UDPOptions{}).
+func (s *Stack) ListenUDP(port uint16) (net.PacketConn, error) {
+	return s.ListenUDPOptions(port, UDPOptions{})
+}
+
+// ListenUDPOptions opens a UDP listener bound to (the stack's server
+// tunnel IP, port) with a caller-chosen queue depth and overflow policy
+// (see UDPOptions). Listeners may be opened at any time after the stack is
+// running, on any port. port 0 is rejected (ErrUDPPortZero) — there is no
+// ephemeral-port allocator here; the embedder names the port it wants. A
+// port already bound by a live listener returns ErrUDPPortInUse rather
+// than silently stealing that listener's traffic. A negative
+// opts.QueueDepth returns ErrInvalidUDPQueueDepth; an opts.DropPolicy
+// outside the declared constants returns ErrInvalidUDPDropPolicy.
 //
 // Returning the stdlib net.PacketConn interface type, never the concrete
 // *udpConn, is deliberate (D-01): it is what makes "usable by unmodified
 // socket-based code" a compiler-checked fact rather than an aspiration —
 // see the var _ net.PacketConn assertion on udpConn below.
-func (s *Stack) ListenUDP(port uint16) (net.PacketConn, error) {
+func (s *Stack) ListenUDPOptions(port uint16, opts UDPOptions) (net.PacketConn, error) {
 	if port == 0 {
 		return nil, ErrUDPPortZero
+	}
+	if opts.QueueDepth < 0 {
+		return nil, ErrInvalidUDPQueueDepth
+	}
+	if opts.DropPolicy != UDPDropNewest && opts.DropPolicy != UDPDropOldest {
+		return nil, ErrInvalidUDPDropPolicy
+	}
+	depth := opts.QueueDepth
+	if depth == 0 {
+		depth = udpQueueDepth
 	}
 
 	demux := s.udpDemuxFor()
@@ -278,7 +385,7 @@ func (s *Stack) ListenUDP(port uint16) (net.PacketConn, error) {
 	if _, exists := demux.ports[port]; exists {
 		return nil, ErrUDPPortInUse
 	}
-	conn := newUDPConn(demux, port)
+	conn := newUDPConn(demux, port, depth, opts.DropPolicy)
 	demux.ports[port] = conn
 	return conn, nil
 }
@@ -288,8 +395,9 @@ func (s *Stack) ListenUDP(port uint16) (net.PacketConn, error) {
 // is safe to call from any number of goroutines simultaneously, matching
 // net.PacketConn's own documented contract.
 type udpConn struct {
-	demux *udpDemux
-	port  uint16
+	demux  *udpDemux
+	port   uint16
+	policy UDPDropPolicy
 
 	inbound chan udpDatagram
 
@@ -306,11 +414,12 @@ type udpConn struct {
 
 var _ net.PacketConn = (*udpConn)(nil)
 
-func newUDPConn(demux *udpDemux, port uint16) *udpConn {
+func newUDPConn(demux *udpDemux, port uint16, depth int, policy UDPDropPolicy) *udpConn {
 	return &udpConn{
 		demux:         demux,
 		port:          port,
-		inbound:       make(chan udpDatagram, udpQueueDepth),
+		policy:        policy,
+		inbound:       make(chan udpDatagram, depth),
 		closed:        make(chan struct{}),
 		readDeadline:  newDeadlineTimer(),
 		writeDeadline: newDeadlineTimer(),
@@ -454,4 +563,39 @@ func (c *udpConn) SetReadDeadline(t time.Time) error {
 func (c *udpConn) SetWriteDeadline(t time.Time) error {
 	c.writeDeadline.set(t)
 	return nil
+}
+
+// UDPStats is a point-in-time snapshot of the stack's UDP-specific drop
+// counters, returned by Stack.UDPStats().
+type UDPStats struct {
+	// QueueFullDropped counts datagrams lost to a listener's bounded
+	// inbound queue being full, under either UDPDropPolicy.
+	QueueFullDropped uint64
+
+	// NoListenerDropped counts datagrams addressed to a port with no
+	// live listener.
+	NoListenerDropped uint64
+
+	// BadChecksumDropped counts datagrams whose non-zero on-wire
+	// checksum did not match a fresh computation.
+	BadChecksumDropped uint64
+}
+
+// UDPStats returns a point-in-time snapshot of the stack's UDP-specific
+// counters. It returns a zero-value UDPStats if ListenUDP/ListenUDPOptions
+// has never been called on this Stack — deliberately a read-only accessor
+// that does NOT call udpDemuxFor(), which registers a handler as a side
+// effect (mirrors TCPStats's own "no demux yet" precedent).
+func (s *Stack) UDPStats() UDPStats {
+	s.mu.RLock()
+	d, _ := s.udpHandler.(*udpDemux)
+	s.mu.RUnlock()
+	if d == nil {
+		return UDPStats{}
+	}
+	return UDPStats{
+		QueueFullDropped:   d.queueFullDropped.Load(),
+		NoListenerDropped:  d.noListenerDropped.Load(),
+		BadChecksumDropped: d.badChecksumDropped.Load(),
+	}
 }

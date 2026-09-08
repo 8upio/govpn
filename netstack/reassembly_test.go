@@ -353,3 +353,80 @@ func TestReassemblyDiscardAll(t *testing.T) {
 	// discardAll is idempotent — attachment.stop() may run more than once.
 	r.discardAll()
 }
+
+// TestReassemblyCustomBufferLimit asserts a reassembler constructed with a
+// non-zero maxBufs enforces THAT bound instead of
+// maxReassemblyBuffersPerSession, exercising WithReassemblyLimits'
+// MaxDatagramsPerAttachment end to end at the reassembler layer.
+func TestReassemblyCustomBufferLimit(t *testing.T) {
+	r := reassembler{maxBufs: 2}
+	now := time.Unix(1000, 0)
+
+	for i := 0; i < 2; i++ {
+		frag := buildFragmentForTest(reasmSrc, reasmDst, protocolUDP, uint16(i), 0, true, []byte("01234567"))
+		if _, outcome, _ := addFrag(t, &r, now, frag); outcome != reasmBuffered {
+			t.Fatalf("datagram %d outcome = %v, want reasmBuffered", i, outcome)
+		}
+	}
+
+	// A default-limit reassembler would accept a third and even a
+	// sixteenth concurrent half-reassembled datagram; this one, limited
+	// to 2, must refuse the third.
+	third := buildFragmentForTest(reasmSrc, reasmDst, protocolUDP, 2, 0, true, []byte("01234567"))
+	if _, outcome, _ := addFrag(t, &r, now, third); outcome != reasmBoundExceeded {
+		t.Fatalf("third datagram outcome = %v, want reasmBoundExceeded with maxBufs=2", outcome)
+	}
+
+	// The default-limit reassembler accepts up to maxReassemblyBuffersPerSession
+	// (16) — confirm the custom-limit one is strictly tighter than that
+	// default, not merely coincidentally rejecting this one fragment.
+	var defaultR reassembler
+	for i := 0; i < 16; i++ {
+		frag := buildFragmentForTest(reasmSrc, reasmDst, protocolUDP, uint16(100+i), 0, true, []byte("01234567"))
+		if _, outcome, _ := addFrag(t, &defaultR, now, frag); outcome != reasmBuffered {
+			t.Fatalf("default-limit datagram %d outcome = %v, want reasmBuffered (default accepts 16)", i, outcome)
+		}
+	}
+}
+
+// TestReassemblyCustomTimeout asserts a reassembler constructed with a
+// non-zero timeout is swept using THAT duration instead of
+// reassemblyTimeout, exercising WithReassemblyLimits' Timeout end to end.
+func TestReassemblyCustomTimeout(t *testing.T) {
+	shortTimeout := 5 * time.Second
+	r := reassembler{timeout: shortTimeout}
+	start := time.Unix(1000, 0)
+
+	first := buildFragmentForTest(reasmSrc, reasmDst, protocolUDP, 1, 0, true, []byte("01234567"))
+	if _, outcome, _ := addFrag(t, &r, start, first); outcome != reasmBuffered {
+		t.Fatalf("first fragment outcome = %v, want reasmBuffered", outcome)
+	}
+
+	// Past the CUSTOM (short) timeout but well inside the default 30s
+	// reassemblyTimeout: a fragment for a second datagram must sweep the
+	// first, proving the shortened timeout — not the package default —
+	// is what's enforced.
+	sweeper := buildFragmentForTest(reasmSrc, reasmDst, protocolUDP, 2, 0, true, []byte("SWEEPFRG"))
+	_, _, expired := addFrag(t, &r, start.Add(shortTimeout+time.Second), sweeper)
+	if expired != 1 {
+		t.Fatalf("expired = %d, want 1 — the shortened timeout was not enforced", expired)
+	}
+}
+
+// TestReassemblyZeroValueUsesDefaults asserts a zero-value reassembler
+// (reassembly_test.go's own construction pattern, used by every other test
+// in this file) resolves to the three package-constant defaults, exactly
+// as it did before maxBufs/maxBytes/timeout existed.
+func TestReassemblyZeroValueUsesDefaults(t *testing.T) {
+	var r reassembler
+	maxBufs, maxBytes, timeout := r.resolveLimits()
+	if maxBufs != maxReassemblyBuffersPerSession {
+		t.Fatalf("resolveLimits maxBufs = %d, want %d (default)", maxBufs, maxReassemblyBuffersPerSession)
+	}
+	if maxBytes != maxReassemblyBytesPerSession {
+		t.Fatalf("resolveLimits maxBytes = %d, want %d (default)", maxBytes, maxReassemblyBytesPerSession)
+	}
+	if timeout != reassemblyTimeout {
+		t.Fatalf("resolveLimits timeout = %v, want %v (default)", timeout, reassemblyTimeout)
+	}
+}

@@ -969,6 +969,92 @@ type fakeTimer struct {
 	active bool
 }
 
+// TestWithReassemblyLimitsValidation asserts New rejects any negative
+// ReassemblyLimits field with ErrInvalidReassemblyLimits (Option cannot
+// return an error itself, mirroring WithMTU's own New-time validation),
+// and accepts the zero value and legitimate positive values.
+func TestWithReassemblyLimitsValidation(t *testing.T) {
+	bad := []ReassemblyLimits{
+		{MaxDatagramsPerAttachment: -1},
+		{MaxBytesPerAttachment: -1},
+		{Timeout: -time.Second},
+	}
+	for _, l := range bad {
+		if _, err := New(testServerIP(), WithReassemblyLimits(l)); !errors.Is(err, ErrInvalidReassemblyLimits) {
+			t.Errorf("New(WithReassemblyLimits(%+v)) = %v, want ErrInvalidReassemblyLimits", l, err)
+		}
+	}
+
+	if _, err := New(testServerIP(), WithReassemblyLimits(ReassemblyLimits{})); err != nil {
+		t.Errorf("New(WithReassemblyLimits(zero value)) = %v, want success", err)
+	}
+	if _, err := New(testServerIP(), WithReassemblyLimits(ReassemblyLimits{
+		MaxDatagramsPerAttachment: 2,
+		MaxBytesPerAttachment:     1024,
+		Timeout:                   time.Second,
+	})); err != nil {
+		t.Errorf("New(WithReassemblyLimits(positive values)) = %v, want success", err)
+	}
+}
+
+// TestWithReassemblyLimitsBufferBound is a Stack-level end-to-end check of
+// WithReassemblyLimits' MaxDatagramsPerAttachment: with a limit of 2, a
+// third concurrent half-reassembled datagram on one attachment is
+// refused, counted in Stats().ReassemblyBoundExceeded, while a
+// default-limit stack accepts 16 (asserted at the reassembler layer by
+// TestReassemblyCustomBufferLimit in reassembly_test.go; this test proves
+// the option actually reaches the attachment).
+func TestWithReassemblyLimitsBufferBound(t *testing.T) {
+	stack := newTestStack(t, WithReassemblyLimits(ReassemblyLimits{MaxDatagramsPerAttachment: 2}))
+	defer stack.Close()
+
+	fs := newFakeSession()
+	clientIP := net.IPv4(10, 8, 0, 2).To4()
+	if err := stack.Attach(fs, clientIP); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	client, server := mustAddr(clientIP), mustAddr(testServerIP())
+
+	for i := 0; i < 2; i++ {
+		fs.inbound <- buildFragmentForTest(client, server, protocolUDP, uint16(i), 0, true, make([]byte, 16))
+	}
+	waitForStat(t, stack, func(s Stats) bool { return s.PacketsReceived == 2 }, time.Second)
+
+	fs.inbound <- buildFragmentForTest(client, server, protocolUDP, 2, 0, true, make([]byte, 16))
+	st := waitForStat(t, stack, func(s Stats) bool { return s.ReassemblyBoundExceeded == 1 }, time.Second)
+	if st.PacketsReceived != 3 {
+		t.Fatalf("Stats().PacketsReceived = %d, want 3", st.PacketsReceived)
+	}
+}
+
+// TestWithReassemblyLimitsTimeout is a Stack-level end-to-end check of
+// WithReassemblyLimits' Timeout: a buffer older than the configured
+// (shortened) timeout is swept by the next fragment, driven by fakeClock.
+func TestWithReassemblyLimitsTimeout(t *testing.T) {
+	clock := newFakeClock(time.Unix(1000, 0))
+	shortTimeout := 5 * time.Second
+	stack := newTestStack(t, WithClock(clock), WithReassemblyLimits(ReassemblyLimits{Timeout: shortTimeout}))
+	defer stack.Close()
+
+	fs := newFakeSession()
+	clientIP := net.IPv4(10, 8, 0, 2).To4()
+	if err := stack.Attach(fs, clientIP); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	client, server := mustAddr(clientIP), mustAddr(testServerIP())
+
+	fs.inbound <- buildFragmentForTest(client, server, protocolUDP, 0x6666, 0, true, make([]byte, 16))
+	waitForStat(t, stack, func(s Stats) bool { return s.PacketsReceived == 1 }, time.Second)
+
+	// Past the CUSTOM (short) timeout but well inside the default 30s
+	// reassemblyTimeout: proves the shortened timeout, not the package
+	// default, is what this attachment enforces.
+	clock.Advance(shortTimeout + time.Second)
+
+	fs.inbound <- buildFragmentForTest(client, server, protocolUDP, 0x7777, 0, true, make([]byte, 16))
+	waitForStat(t, stack, func(s Stats) bool { return s.ReassemblyTimeouts == 1 }, time.Second)
+}
+
 func (t *fakeTimer) C() <-chan time.Time { return t.ch }
 
 func (t *fakeTimer) Reset(d time.Duration) bool {

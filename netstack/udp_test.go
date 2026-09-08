@@ -988,3 +988,257 @@ func TestUDPConcurrentReadFromAndWriteTo(t *testing.T) {
 		t.Fatal("no datagrams were ever read concurrently")
 	}
 }
+
+// TestListenUDPOptionsValidation asserts ListenUDPOptions' own validation:
+// a negative QueueDepth is ErrInvalidUDPQueueDepth, an out-of-range
+// DropPolicy is ErrInvalidUDPDropPolicy, and port 0 is still
+// ErrUDPPortZero regardless of opts.
+func TestListenUDPOptionsValidation(t *testing.T) {
+	stack := newTestStack(t)
+	defer stack.Close()
+
+	if _, err := stack.ListenUDPOptions(9200, UDPOptions{QueueDepth: -1}); !errors.Is(err, ErrInvalidUDPQueueDepth) {
+		t.Fatalf("ListenUDPOptions(QueueDepth: -1) = %v, want ErrInvalidUDPQueueDepth", err)
+	}
+	if _, err := stack.ListenUDPOptions(9200, UDPOptions{DropPolicy: UDPDropPolicy(99)}); !errors.Is(err, ErrInvalidUDPDropPolicy) {
+		t.Fatalf("ListenUDPOptions(DropPolicy: 99) = %v, want ErrInvalidUDPDropPolicy", err)
+	}
+	if _, err := stack.ListenUDPOptions(0, UDPOptions{}); !errors.Is(err, ErrUDPPortZero) {
+		t.Fatalf("ListenUDPOptions(0, ...) = %v, want ErrUDPPortZero", err)
+	}
+
+	conn, err := stack.ListenUDPOptions(9201, UDPOptions{QueueDepth: 4, DropPolicy: UDPDropOldest})
+	if err != nil {
+		t.Fatalf("ListenUDPOptions(valid options): %v", err)
+	}
+	defer conn.Close()
+}
+
+// TestUDPDropOldestKeepsNewest asserts UDPDropOldest's ordering contract:
+// with a queue depth of 2, four datagrams sent before any ReadFrom leave
+// the two NEWEST surviving, in order.
+func TestUDPDropOldestKeepsNewest(t *testing.T) {
+	stack := newTestStack(t)
+	defer stack.Close()
+
+	fs := newFakeSession()
+	ip := net.IPv4(10, 8, 0, 2).To4()
+	if err := stack.Attach(fs, ip); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	conn, err := stack.ListenUDPOptions(9210, UDPOptions{QueueDepth: 2, DropPolicy: UDPDropOldest})
+	if err != nil {
+		t.Fatalf("ListenUDPOptions: %v", err)
+	}
+	defer conn.Close()
+
+	for i := 0; i < 4; i++ {
+		payload := []byte{byte(i)}
+		pkt := buildUDPIPv4(mustAddr(ip), mustAddr(testServerIP()), uint16(3000+i), 9210, payload)
+		fs.inbound <- pkt
+	}
+
+	// Barrier: the stack's single read loop processes fs.inbound strictly
+	// in order, so waiting for this ICMP reply proves every UDP datagram
+	// sent above has already been offered to the demux.
+	req := buildICMPEchoRequest(mustAddr(ip), mustAddr(testServerIP()), 1, 1, []byte("still alive"))
+	fs.inbound <- req
+	waitForOutbound(t, fs, time.Second)
+
+	buf := make([]byte, 2048)
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	for i, want := range []byte{2, 3} {
+		n, _, err := conn.ReadFrom(buf)
+		if err != nil {
+			t.Fatalf("ReadFrom(%d): %v", i, err)
+		}
+		if n != 1 || buf[0] != want {
+			t.Fatalf("ReadFrom(%d) = %v, want [%d] (the two newest datagrams, in order)", i, buf[:n], want)
+		}
+	}
+
+	if got := stack.UDPStats().QueueFullDropped; got != 2 {
+		t.Fatalf("UDPStats().QueueFullDropped = %d, want 2", got)
+	}
+}
+
+// TestUDPDropNewestKeepsOldestUnchanged asserts the existing default is
+// unchanged: both an explicit UDPDropNewest and the zero-value UDPOptions
+// keep the two OLDEST datagrams when a queue of depth 2 receives four.
+func TestUDPDropNewestKeepsOldestUnchanged(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts UDPOptions
+	}{
+		{"explicit UDPDropNewest", UDPOptions{QueueDepth: 2, DropPolicy: UDPDropNewest}},
+		{"zero-value UDPOptions", UDPOptions{QueueDepth: 2}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stack := newTestStack(t)
+			defer stack.Close()
+
+			fs := newFakeSession()
+			ip := net.IPv4(10, 8, 0, 2).To4()
+			if err := stack.Attach(fs, ip); err != nil {
+				t.Fatalf("Attach: %v", err)
+			}
+
+			conn, err := stack.ListenUDPOptions(9211, tc.opts)
+			if err != nil {
+				t.Fatalf("ListenUDPOptions: %v", err)
+			}
+			defer conn.Close()
+
+			for i := 0; i < 4; i++ {
+				payload := []byte{byte(i)}
+				pkt := buildUDPIPv4(mustAddr(ip), mustAddr(testServerIP()), uint16(3100+i), 9211, payload)
+				fs.inbound <- pkt
+			}
+
+			req := buildICMPEchoRequest(mustAddr(ip), mustAddr(testServerIP()), 1, 1, []byte("still alive"))
+			fs.inbound <- req
+			waitForOutbound(t, fs, time.Second)
+
+			buf := make([]byte, 2048)
+			if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+				t.Fatalf("SetReadDeadline: %v", err)
+			}
+			for i, want := range []byte{0, 1} {
+				n, _, err := conn.ReadFrom(buf)
+				if err != nil {
+					t.Fatalf("ReadFrom(%d): %v", i, err)
+				}
+				if n != 1 || buf[0] != want {
+					t.Fatalf("ReadFrom(%d) = %v, want [%d] (the two oldest datagrams, in order)", i, buf[:n], want)
+				}
+			}
+		})
+	}
+}
+
+// TestUDPStatsQueueFullCountsBothPolicies asserts QueueFullDropped counts
+// one per dropped datagram under EITHER drop policy.
+func TestUDPStatsQueueFullCountsBothPolicies(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		policy UDPDropPolicy
+	}{
+		{"UDPDropNewest", UDPDropNewest},
+		{"UDPDropOldest", UDPDropOldest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stack := newTestStack(t)
+			defer stack.Close()
+
+			fs := newFakeSession()
+			ip := net.IPv4(10, 8, 0, 2).To4()
+			if err := stack.Attach(fs, ip); err != nil {
+				t.Fatalf("Attach: %v", err)
+			}
+
+			conn, err := stack.ListenUDPOptions(9220, UDPOptions{QueueDepth: 2, DropPolicy: tc.policy})
+			if err != nil {
+				t.Fatalf("ListenUDPOptions: %v", err)
+			}
+			defer conn.Close()
+
+			for i := 0; i < 5; i++ {
+				payload := []byte{byte(i)}
+				pkt := buildUDPIPv4(mustAddr(ip), mustAddr(testServerIP()), uint16(3200+i), 9220, payload)
+				fs.inbound <- pkt
+			}
+
+			req := buildICMPEchoRequest(mustAddr(ip), mustAddr(testServerIP()), 1, 1, []byte("still alive"))
+			fs.inbound <- req
+			waitForOutbound(t, fs, time.Second)
+
+			if got := stack.UDPStats().QueueFullDropped; got != 3 {
+				t.Fatalf("UDPStats().QueueFullDropped = %d, want 3 (5 sent, queue depth 2)", got)
+			}
+		})
+	}
+}
+
+// TestUDPStatsMirrorsInternalCounters asserts UDPStats().NoListenerDropped
+// and .BadChecksumDropped reflect the demux's existing internal counters.
+func TestUDPStatsMirrorsInternalCounters(t *testing.T) {
+	stack := newTestStack(t)
+	defer stack.Close()
+
+	fs := newFakeSession()
+	ip := net.IPv4(10, 8, 0, 2).To4()
+	if err := stack.Attach(fs, ip); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	dummy, err := stack.ListenUDP(1)
+	if err != nil {
+		t.Fatalf("ListenUDP: %v", err)
+	}
+	defer dummy.Close()
+
+	// No listener on port 9.
+	pkt := buildUDPIPv4(mustAddr(ip), mustAddr(testServerIP()), 1000, 9, []byte("nobody home"))
+	fs.inbound <- pkt
+
+	// Bad checksum: build a valid datagram then corrupt its UDP checksum
+	// field in place.
+	bad := buildUDPIPv4(mustAddr(ip), mustAddr(testServerIP()), 1001, 1, []byte("corrupt"))
+	hdr, err := parseIPv4(bad)
+	if err != nil {
+		t.Fatalf("parseIPv4(test fixture): %v", err)
+	}
+	udpStart := hdr.payloadOff
+	orig0, orig1 := bad[udpStart+6], bad[udpStart+7]
+	// Flip the checksum to a value guaranteed to differ from both the
+	// original (correct) checksum and the 0x0000 "no checksum" sentinel.
+	bad[udpStart+6], bad[udpStart+7] = 0xAB, 0xCD
+	if bad[udpStart+6] == orig0 && bad[udpStart+7] == orig1 {
+		bad[udpStart+6], bad[udpStart+7] = 0x12, 0x34
+	}
+	fs.inbound <- bad
+
+	req := buildICMPEchoRequest(mustAddr(ip), mustAddr(testServerIP()), 1, 1, []byte("still alive"))
+	fs.inbound <- req
+	waitForOutbound(t, fs, time.Second)
+
+	demux := stack.udpHandler.(*udpDemux)
+	stats := stack.UDPStats()
+	if stats.NoListenerDropped != demux.noListenerDropped.Load() {
+		t.Fatalf("UDPStats().NoListenerDropped = %d, want %d (internal counter)", stats.NoListenerDropped, demux.noListenerDropped.Load())
+	}
+	if stats.NoListenerDropped == 0 {
+		t.Fatal("UDPStats().NoListenerDropped = 0, want > 0 after a no-listener datagram")
+	}
+	if stats.BadChecksumDropped != demux.badChecksumDropped.Load() {
+		t.Fatalf("UDPStats().BadChecksumDropped = %d, want %d (internal counter)", stats.BadChecksumDropped, demux.badChecksumDropped.Load())
+	}
+	if stats.BadChecksumDropped == 0 {
+		t.Fatal("UDPStats().BadChecksumDropped = 0, want > 0 after a corrupted-checksum datagram")
+	}
+}
+
+// TestUDPStatsZeroValueWithoutRegisteringHandler asserts UDPStats() on a
+// stack that never called ListenUDP/ListenUDPOptions returns the zero
+// value AND does not register a UDP handler as a side effect — unlike
+// udpDemuxFor(), which does register one. A read-only accessor that
+// mutates the stack would be a bug.
+func TestUDPStatsZeroValueWithoutRegisteringHandler(t *testing.T) {
+	stack := newTestStack(t)
+	defer stack.Close()
+
+	got := stack.UDPStats()
+	if got != (UDPStats{}) {
+		t.Fatalf("UDPStats() on an untouched stack = %+v, want the zero value", got)
+	}
+
+	stack.mu.RLock()
+	handler := stack.udpHandler
+	stack.mu.RUnlock()
+	if handler != nil {
+		t.Fatalf("Stack.udpHandler = %v after UDPStats(), want nil — UDPStats must not register a handler", handler)
+	}
+}
