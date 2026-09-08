@@ -19,11 +19,13 @@
 package main
 
 import (
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -89,7 +91,6 @@ const (
 	probeSettleDelay  = 5 * time.Second
 )
 
-
 // newHardenedHTTPServer builds the *http.Server this harness serves the
 // tunnelweb site through, with WR-02's timeouts set — see
 // examples/tunnelweb/main.go's own copy of this function for the full
@@ -119,6 +120,8 @@ func main() {
 	renegSec := flag.Duration("reneg-sec", 0, "this server's own renegotiation deadline (ovpn.Config.RenegSec); 0 means the library's own 3600s default (04-03-PLAN.md Task 1)")
 	hold := flag.Duration("hold", 0, "extra survival time the server waits AFTER waitForProbes' normal probe-driven trigger fires, before printing PASS and exiting; 0 means no extension (the pre-existing scenarios' unchanged behavior) — gives a shortened -reneg-sec's timer room to actually fire before the server tears the run down (04-03-PLAN.md Task 1)")
 	soakCycles := flag.Int("soak-cycles", 0, "number of connect/use/clean-disconnect cycles to observe from ONE long-lived server process before printing PASS and exiting; 0 keeps every pre-existing scenario's normal single-session, probe-driven behavior completely unchanged (04-04-PLAN.md Task 1)")
+	noClientCert := flag.Bool("no-client-cert", false, "use tls.NoClientCert instead of tls.RequireAndVerifyClientCert; false (default) leaves every pre-existing scenario's mandatory-client-cert posture unchanged (quick 260908-m4e)")
+	authUserPass := flag.String("auth-user-pass", "", "\"user:pass\" to authenticate clients via ovpn.Config.AuthUserPass; empty (default) leaves the hook nil, unchanged behaviour (quick 260908-m4e)")
 	flag.Parse()
 
 	// Soak mode (04-04-PLAN.md Task 1) is dispatched to its own entry point,
@@ -134,16 +137,41 @@ func main() {
 		return
 	}
 
-	if err := run(*pkiDir, *listenAddr, *deadline, *dropRate, *reorderRate, *reorderDelay, *seed, uint16(*httpPort), uint16(*udpPort), *renegSec, *hold); err != nil {
+	if err := run(*pkiDir, *listenAddr, *deadline, *dropRate, *reorderRate, *reorderDelay, *seed, uint16(*httpPort), uint16(*udpPort), *renegSec, *hold, *noClientCert, *authUserPass); err != nil {
 		fmt.Fprintln(os.Stderr, "interop-server:", err)
 		os.Exit(1)
 	}
 }
 
-func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorderRatePct float64, reorderDelay time.Duration, seed int64, httpPort, udpPort uint16, renegSec, hold time.Duration) error {
-	tlsCfg, tlsCryptKey, err := loadConfig(pkiDir)
+func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorderRatePct float64, reorderDelay time.Duration, seed int64, httpPort, udpPort uint16, renegSec, hold time.Duration, noClientCert bool, authUserPass string) error {
+	tlsCfg, tlsCryptKey, err := loadConfig(pkiDir, noClientCert)
 	if err != nil {
 		return fmt.Errorf("load PKI material: %w", err)
+	}
+
+	// authUserPassHook (quick 260908-m4e): empty (every pre-existing
+	// scenario's default flag value) means Config.AuthUserPass stays nil —
+	// unchanged behaviour, credentials parsed and ignored. When set, splits
+	// on the FIRST ':' only (a password may itself contain colons) and
+	// compares with crypto/subtle.ConstantTimeCompare on both fields; the
+	// client is never told which field was wrong.
+	var authUserPassHook func(username, password string, cs tls.ConnectionState) error
+	if authUserPass != "" {
+		idx := strings.IndexByte(authUserPass, ':')
+		if idx < 0 {
+			return fmt.Errorf("-auth-user-pass %q must be \"user:pass\" (missing ':')", authUserPass)
+		}
+		wantUser, wantPass := authUserPass[:idx], authUserPass[idx+1:]
+		authUserPassHook = func(username, password string, _ tls.ConnectionState) error {
+			userOK := subtle.ConstantTimeCompare([]byte(username), []byte(wantUser)) == 1
+			passOK := subtle.ConstantTimeCompare([]byte(password), []byte(wantPass)) == 1
+			if userOK && passOK {
+				log.Printf("auth ok user=%s", username)
+				return nil
+			}
+			log.Printf("auth rejected user=%s", username)
+			return errors.New("invalid credentials")
+		}
 	}
 
 	pc, err := net.ListenPacket("udp", listenAddr)
@@ -246,6 +274,10 @@ func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorder
 		// only shortens the server's own reneg-sec timer for the "reneg"
 		// scenario's -reneg-sec flag.
 		RenegSec: renegSec,
+		// AuthUserPass (quick 260908-m4e): nil unless -auth-user-pass was
+		// given — required by ovpn.Server.Serve's own D-07 guard whenever
+		// -no-client-cert leaves ClientAuth below RequireAnyClientCert.
+		AuthUserPass: authUserPassHook,
 		OnSession: func(sess *ovpn.Session) {
 			// D-02: the embedder attaches; nothing in ovpn.Config knows
 			// the netstack exists. AssignedIP() is guaranteed non-nil
@@ -574,7 +606,9 @@ func (s *soakTracker) watchClose(cycleNum int, obs *sessionCloseObserver) {
 // success criterion 3). run() above is left completely untouched; every
 // non-soak scenario's behavior is unaffected by this function's existence.
 func runSoak(pkiDir, listenAddr string, deadline time.Duration, httpPort, udpPort uint16, cycles int) error {
-	tlsCfg, tlsCryptKey, err := loadConfig(pkiDir)
+	// The soak scenario is not part of quick 260908-m4e's scope — always
+	// require a client certificate, exactly as before.
+	tlsCfg, tlsCryptKey, err := loadConfig(pkiDir, false)
 	if err != nil {
 		return fmt.Errorf("load PKI material: %w", err)
 	}
@@ -769,7 +803,7 @@ func runUDPEcho(conn net.PacketConn, udpRx, udpTx *atomic.Int64) {
 	}
 }
 
-func loadConfig(pkiDir string) (*tls.Config, []byte, error) {
+func loadConfig(pkiDir string, noClientCert bool) (*tls.Config, []byte, error) {
 	caPEM, err := os.ReadFile(pkiDir + "/ca.crt")
 	if err != nil {
 		return nil, nil, err
@@ -804,10 +838,18 @@ func loadConfig(pkiDir string) (*tls.Config, []byte, error) {
 		return nil, nil, err
 	}
 
+	// clientAuth (quick 260908-m4e): the one place that decides this
+	// server's client-certificate posture, so buildTLSConfig's caller never
+	// needs to mutate the returned *tls.Config afterward. ClientCAs stays
+	// populated either way — it is simply unused when noClientCert is set.
+	clientAuth := tls.RequireAndVerifyClientCert
+	if noClientCert {
+		clientAuth = tls.NoClientCert
+	}
 	tlsCfg := &tls.Config{
 		Certificates: []tls.Certificate{serverCert},
 		ClientCAs:    caPool,
-		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientAuth:   clientAuth,
 		MinVersion:   tls.VersionTLS12,
 	}
 

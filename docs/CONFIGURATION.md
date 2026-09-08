@@ -33,6 +33,7 @@ type Config struct {
     PingInterval        time.Duration
     ReapWindow          time.Duration
     SessionInboundQueue int
+    AuthUserPass        func(username, password string, cs tls.ConnectionState) error
 }
 ```
 
@@ -49,6 +50,7 @@ type Config struct {
 | `PingInterval` | `time.Duration` | No | `10 * time.Second` |
 | `ReapWindow` | `time.Duration` | No | `60 * time.Second` — must be at least twice the resolved `PingInterval`, or `Serve` returns an error |
 | `SessionInboundQueue` | `int` | No | `32` |
+| `AuthUserPass` | `func(username, password string, cs tls.ConnectionState) error` | No, unless `TLSConfig.ClientAuth` does not mandate a client certificate — then `Serve` returns an error if nil | credentials are parsed off the wire and ignored |
 
 ### `TLSConfig`
 
@@ -62,7 +64,10 @@ unmodified to `tls.Server(conn, cfg)`. `govpn` does not enforce any particular
 - `ClientAuth` — set to `tls.RequireAndVerifyClientCert` for cert-based client
   auth (matching a real OpenVPN client's `cert`/`key` directives). If this is
   left unset, no client certificate is required and `Session.PeerCN` (see
-  [API.md](API.md)) will be empty.
+  [API.md](API.md)) will be empty. **`Serve` now refuses to start** unless
+  either `ClientAuth` mandates a client certificate (`RequireAnyClientCert` or
+  `RequireAndVerifyClientCert`) or `Config.AuthUserPass` is set — see
+  [`AuthUserPass`](#authuserpass) below.
 - `MinVersion` — set explicitly to `tls.VersionTLS12` rather than relying on
   Go's own default floor, since that default has shifted upward across Go
   releases and an unannounced future bump could silently break interop with
@@ -81,6 +86,134 @@ tlsCfg := &tls.Config{
 
 The matching client-side directives in a real OpenVPN 2.6 `.conf` are `cert`,
 `key`, `ca`, and `remote-cert-tls server`.
+
+### `AuthUserPass`
+
+`func(username, password string, cs tls.ConnectionState) error` — authenticates
+a client's username/password credentials from its Key Method 2 message. `nil`
+(the zero value) means credentials are still parsed off the wire — they have
+to be, to reach the `peer_info` field that follows them — but are otherwise
+ignored, exactly as `govpn` behaved before this field existed.
+
+When set, the hook runs **on the initial handshake and on every
+renegotiation** — a real OpenVPN client re-sends its credentials in each Key
+Method 2 message, and this package re-verifies them every time, so a client
+cannot authenticate once and then rotate keys unauthenticated.
+
+Validation happens in this order, mirroring the OpenVPN reference server
+(`ssl.c:2452-2470`):
+
+1. **Wire length.** Either field longer than 128 bytes on the wire (OpenVPN's
+   `USER_PASS_LEN`, which includes the trailing NUL — so 127 usable bytes of
+   credential text) is an auth failure. The hook is never called.
+2. **Emptiness.** An empty username or password (the client sent no
+   credentials at all) is an auth failure. The hook is never called. This
+   check applies **even when the hook would accept anything** — an empty
+   credential is a protocol-level failure, not a policy decision the hook
+   gets to make.
+3. **The hook itself.** Called with the extracted username/password and the
+   session's `tls.ConnectionState`. A non-nil error rejects the client.
+
+A rejected client receives the control string `AUTH_FAILED` (or
+`AUTH_FAILED,<reason>` — see `AuthClientReason` below) on the same TLS stream
+that carried Key Method 2, and the session ends with the new
+`CloseReasonAuthFailed` (see [API.md](API.md)). On the initial handshake the
+session was never published to `OnSession`, so `OnSessionClosed` does not
+fire; on a renegotiation the session was already published, so
+`OnSessionClosed` fires with `CloseReasonAuthFailed`.
+
+**Panics are recovered.** A panicking hook is treated exactly like
+`OnSession`/`OnSessionClosed`: recovered, routed to `Config.OnSessionPanic`
+(with a nil `*Session` on the initial-handshake path, since no session has
+been published yet), and treated as a rejection — fail closed, never a
+crashed process and never a silently-admitted client.
+
+**Concurrency and blocking.** The hook may be called concurrently from many
+sessions' own goroutines and must be safe for that. It must also not block for
+long: it runs inside the session's handshake window
+(`reliable.HandshakeWindow`, 60s by default), so a slow hook can starve that
+budget for legitimate protocol work — do password/credential lookups against
+a fast local cache or a bounded-timeout remote call, not an unbounded one.
+
+Compare credentials in constant time to avoid leaking their length or content
+through timing:
+
+```go
+cfg := ovpn.Config{
+    // ...
+    AuthUserPass: func(username, password string, cs tls.ConnectionState) error {
+        wantUser, wantPass := "voxio", lookupPassword(username) // your own store
+        userOK := subtle.ConstantTimeCompare([]byte(username), []byte(wantUser)) == 1
+        passOK := subtle.ConstantTimeCompare([]byte(password), []byte(wantPass)) == 1
+        if userOK && passOK {
+            return nil
+        }
+        return errors.New("invalid credentials") // never say which field was wrong
+    },
+}
+```
+
+The matching client-side directive is `auth-user-pass <path-to-credentials-file>`
+(or the interactive prompt form) — see
+[Running without client certificates](#running-without-client-certificates)
+below for a full client-side example that skips `cert`/`key` entirely.
+
+#### `AuthClientReason`
+
+`type AuthClientReason interface{ ClientReason() string }` — an optional
+interface an error returned from `AuthUserPass` may implement to supply a
+human-readable rejection reason sent to the client as `AUTH_FAILED,<reason>`
+instead of the plain `AUTH_FAILED` form. The reason is sanitized before it
+reaches the wire (control bytes stripped, capped at 128 bytes), so it cannot
+inject a NUL (which would truncate the control string) or a newline (which
+would corrupt the client's log parsing). Prefer a generic message — do not
+reveal which field (username vs. password) was wrong.
+
+#### Running without client certificates
+
+A client certificate is not required for `AuthUserPass` to work — OpenVPN's
+own `auth-user-pass` directive is designed for exactly this. Set `ClientAuth`
+to `tls.NoClientCert` or `tls.RequestClientCert` and set `AuthUserPass`:
+
+```go
+tlsCfg := &tls.Config{
+    Certificates: []tls.Certificate{serverCert},
+    ClientAuth:   tls.NoClientCert,
+    MinVersion:   tls.VersionTLS12,
+}
+cfg := ovpn.Config{
+    TLSConfig:    tlsCfg,
+    AuthUserPass: myAuthHook,
+    // ...
+}
+```
+
+**`AuthUserPass` must then be set — `Serve` refuses to start otherwise.**
+Leaving both a non-mandatory `ClientAuth` and a nil `AuthUserPass` would mean
+the server authenticates nobody at all, so `Serve` returns this error instead
+of silently accepting every client:
+
+```
+ovpn: Config.TLSConfig.ClientAuth does not require a client certificate and Config.AuthUserPass is nil: the server would accept any client without authenticating it; set Config.AuthUserPass or use tls.RequireAnyClientCert/tls.RequireAndVerifyClientCert
+```
+
+This check is an explicit allow-list on `tls.RequireAnyClientCert` and
+`tls.RequireAndVerifyClientCert` — **not** a numeric comparison against
+`tls.ClientAuthType`'s own ordering. `tls.VerifyClientCertIfGiven` sorts
+numerically *above* `tls.RequireAnyClientCert` (`NoClientCert=0,
+RequestClientCert=1, RequireAnyClientCert=2, VerifyClientCertIfGiven=3,
+RequireAndVerifyClientCert=4`) but does **not** require the client to present
+a certificate at all, so it counts as "not required" here too, and also
+requires `AuthUserPass`.
+
+The matching client-side `.conf` omits `cert`/`key` entirely and adds:
+
+```
+auth-user-pass /path/to/credentials-file
+```
+
+where `credentials-file` contains the username on the first line and the
+password on the second, each newline-terminated.
 
 ### `TLSCryptKey`
 

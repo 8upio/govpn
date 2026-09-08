@@ -97,6 +97,7 @@ which:
 | `clean-large` | large | No | Certificate-fragmentation path (large cert forces control-channel fragmentation) |
 | `lossy-large` | large | Yes (`docker-compose.lossy.yml`, `tc`/netem) | Retransmission and reliability-layer behavior under packet loss |
 | `reneg` | small | No | `docker-compose.reneg.yml` overlay; short `reneg-sec 15` forces multiple renegotiations across 5 probe rounds, plus `explicit-exit-notify 2` graceful-disconnect verification |
+| `auth-user-pass` | small | No | `docker-compose.auth.yml` overlay; `-no-client-cert -auth-user-pass voxio:s3cr3t` proves `Config.AuthUserPass` and certificate-less operation against a real client (no `cert`/`key` directives in `client.conf`, matching `-no-client-cert`/`-credentials` flags on `cmd/gentestpki`) |
 
 A separate, non-default `TestSoak` (see below) exercises long-running connection lifecycle behavior and is not part of this table.
 

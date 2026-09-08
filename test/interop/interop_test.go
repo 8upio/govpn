@@ -76,6 +76,18 @@ type scenario struct {
 	// failure, not a pass). 0 or 1 (every pre-existing scenario) keeps the
 	// original single-round assertions unchanged.
 	probeRounds int
+
+	// noClientCert (quick 260908-m4e) passes -no-client-cert to
+	// cmd/gentestpki, omitting the cert/key directives from the generated
+	// client.conf. false (every pre-existing scenario) reproduces the
+	// original client.conf exactly.
+	noClientCert bool
+
+	// credentials (quick 260908-m4e), when non-empty, passes -credentials
+	// <value> ("user:pass") to cmd/gentestpki, which writes a credentials
+	// file and appends auth-user-pass to client.conf. Empty (every
+	// pre-existing scenario) adds no such directive.
+	credentials string
 }
 
 // scenarios covers, at minimum, the clean-small/clean-large/lossy-large
@@ -101,12 +113,12 @@ var scenarios = []scenario{
 	{name: "clean-large", profile: "large", lossy: false, largeCert: true, contextTimeout: 4 * time.Minute},
 	{name: "lossy-large", profile: "large", lossy: true, largeCert: true, contextTimeout: 10 * time.Minute, composeOverlay: "docker-compose.lossy.yml"},
 	{
-		name:              "reneg",
-		profile:           "small",
-		lossy:             false,
-		largeCert:         false,
-		contextTimeout:    4 * time.Minute,
-		composeOverlay:    "docker-compose.reneg.yml",
+		name:           "reneg",
+		profile:        "small",
+		lossy:          false,
+		largeCert:      false,
+		contextTimeout: 4 * time.Minute,
+		composeOverlay: "docker-compose.reneg.yml",
 		// explicit-exit-notify 2 (04-03-PLAN.md Task 3) is carried by this
 		// SAME scenario rather than a second one sharing the overlay: the
 		// graceful-stop step (entrypoint.sh) runs strictly after every
@@ -116,6 +128,26 @@ var scenarios = []scenario{
 		clientDirectives:  []string{"reneg-sec 15", "explicit-exit-notify 2"},
 		minRenegotiations: 2,
 		probeRounds:       5,
+	},
+	{
+		// "auth-user-pass" (quick 260908-m4e) proves a real, unmodified
+		// OpenVPN 2.6 client authenticating by username/password with NO
+		// client certificate: cmd/gentestpki -no-client-cert omits the
+		// cert/key directives, -credentials writes the credentials file
+		// and appends auth-user-pass to client.conf, and
+		// docker-compose.auth.yml's server command carries the matching
+		// -no-client-cert -auth-user-pass flags. Otherwise a plain
+		// successful connection — no renegotiation, no multi-round
+		// assertions, so the pre-existing single-round ping/HTTP/UDP
+		// probe assertions apply unmodified.
+		name:           "auth-user-pass",
+		profile:        "small",
+		lossy:          false,
+		largeCert:      false,
+		contextTimeout: 4 * time.Minute,
+		composeOverlay: "docker-compose.auth.yml",
+		noClientCert:   true,
+		credentials:    "voxio:s3cr3t",
 	},
 }
 
@@ -228,6 +260,12 @@ func runScenario(root, interopDir string, sc scenario) scenarioResult {
 	genArgs := []string{"run", "./cmd/gentestpki", "-out", filepath.Join("test", "interop", "pki"), "-profile", sc.profile}
 	for _, d := range sc.clientDirectives {
 		genArgs = append(genArgs, "-client-directive", d)
+	}
+	if sc.noClientCert {
+		genArgs = append(genArgs, "-no-client-cert")
+	}
+	if sc.credentials != "" {
+		genArgs = append(genArgs, "-credentials", sc.credentials)
 	}
 	genCmd := exec.Command("go", genArgs...)
 	genCmd.Dir = root
@@ -386,7 +424,7 @@ func TestInteropScenarios(t *testing.T) {
 			}
 			t.Log(res.composeOut)
 
-			assertHandshakeCompleted(t, res)
+			assertHandshakeCompleted(t, res, !sc.noClientCert)
 			assertKeyExchangeCompleted(t, res)
 			assertTunnelUp(t, res)
 
@@ -476,7 +514,12 @@ func TestInteropScenarios(t *testing.T) {
 // (handshake completed AND survived the post-handshake window), both sides
 // report the peer's verified CommonName, and the negotiated TLS version is
 // at least 1.2.
-func assertHandshakeCompleted(t *testing.T, res scenarioResult) {
+// expectClientCN, when false (the "auth-user-pass" scenario, quick
+// 260908-m4e — no client certificate is ever presented), skips the
+// peer_cn= assertion below rather than requiring a CommonName the client
+// structurally cannot present. Every pre-existing scenario passes true,
+// unchanged.
+func assertHandshakeCompleted(t *testing.T, res scenarioResult, expectClientCN bool) {
 	t.Helper()
 
 	if res.composeErr != nil {
@@ -487,9 +530,11 @@ func assertHandshakeCompleted(t *testing.T, res scenarioResult) {
 		t.Fatal("server did not print its PASS line (handshake completed AND survived the post-handshake window) — see log above")
 	}
 
-	const wantClientCN = "peer_cn=govpn-interop-client"
-	if !strings.Contains(res.composeOut, wantClientCN) {
-		t.Fatalf("server output does not contain %q — see log above", wantClientCN)
+	if expectClientCN {
+		const wantClientCN = "peer_cn=govpn-interop-client"
+		if !strings.Contains(res.composeOut, wantClientCN) {
+			t.Fatalf("server output does not contain %q — see log above", wantClientCN)
+		}
 	}
 
 	// The real client's own output contains the SERVER's generated

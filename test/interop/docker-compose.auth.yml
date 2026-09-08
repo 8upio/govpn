@@ -1,0 +1,25 @@
+# Overlay for the "auth-user-pass" interop scenario (quick 260908-m4e): a
+# real, unmodified OpenVPN 2.6 client authenticates by username/password
+# ONLY — no client certificate at all — proving Config.AuthUserPass and
+# certificate-less operation (D-06/D-07) against the real client, not just
+# this package's own synthetic tests.
+#
+# `docker compose -f docker-compose.yml -f docker-compose.auth.yml up`
+# mirrors docker-compose.reneg.yml's own shape and comment discipline:
+# override ONLY the server service's `command`. The server service gains
+# NO new privileges here — no cap_add, no privileged, no devices — the
+# unprivileged posture is the whole point of this harness
+# (TestPhase3ServerContainerRequestsNoPrivileges only inspects
+# docker-compose.yml itself, but this overlay must still never add any of
+# the above to stay consistent with it).
+#
+# The client's half of this credential pair lives in
+# interop_test.go's "auth-user-pass" scenario entry (credentials:
+# "voxio:s3cr3t", passed to cmd/gentestpki's -credentials flag, which
+# writes the credentials file client.conf's auth-user-pass directive
+# references) — these two literals must agree, since cmd/gentestpki
+# generates the client side and this file configures the server side
+# independently.
+services:
+  server:
+    command: ["-pki", "/pki", "-listen", "0.0.0.0:1194", "-deadline", "60s", "-no-client-cert", "-auth-user-pass", "voxio:s3cr3t"]

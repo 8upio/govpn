@@ -102,15 +102,17 @@ func main() {
 	profile := flag.String("profile", profileSmall, "certificate profile: small or large")
 	var directives clientDirectiveFlag
 	flag.Var(&directives, "client-directive", "extra client.conf directive to append verbatim (repeatable; e.g. -client-directive \"reneg-sec 15\"); default none, so the pre-existing clean-small/clean-large/lossy-large scenarios generate a byte-identical client.conf (04-03-PLAN.md Task 1)")
+	noClientCert := flag.Bool("no-client-cert", false, "omit the cert/key directives from client.conf (the client cert/key files are still generated); default false, so every pre-existing scenario's client.conf stays byte-identical (quick 260908-m4e)")
+	credentials := flag.String("credentials", "", "\"user:pass\" to write as a credentials file and reference via auth-user-pass in client.conf; default empty, so no auth-user-pass directive is added (quick 260908-m4e)")
 	flag.Parse()
 
-	if err := run(*out, *profile, directives); err != nil {
+	if err := run(*out, *profile, directives, *noClientCert, *credentials); err != nil {
 		fmt.Fprintln(os.Stderr, "gentestpki:", err)
 		os.Exit(1)
 	}
 }
 
-func run(outDir, profile string, clientDirectives []string) error {
+func run(outDir, profile string, clientDirectives []string, noClientCert bool, credentials string) error {
 	if profile != profileSmall && profile != profileLarge {
 		return fmt.Errorf("unknown -profile %q (want %q or %q)", profile, profileSmall, profileLarge)
 	}
@@ -223,7 +225,28 @@ func run(outDir, profile string, clientDirectives []string) error {
 		return fmt.Errorf("tls-crypt key self-check failed: %w", err)
 	}
 
-	if err := writeClientConf(filepath.Join(outDir, "client.conf"), clientDirectives); err != nil {
+	var credentialsFile string
+	if credentials != "" {
+		// Split on the FIRST ':' only, so a password may itself contain
+		// colons — mirroring openvpn's own auth-user-pass file convention
+		// (username on line 1, password on line 2, each newline-terminated).
+		idx := strings.IndexByte(credentials, ':')
+		if idx < 0 {
+			return fmt.Errorf("-credentials %q must be \"user:pass\" (missing ':')", credentials)
+		}
+		username, password := credentials[:idx], credentials[idx+1:]
+		credPath := filepath.Join(outDir, "credentials")
+		credBody := username + "\n" + password + "\n"
+		// Mode 0o644, matching every other file this tool writes,
+		// including private keys (writeKey below) — openvpn only warns
+		// (never errors) about a group/other-readable auth file.
+		if err := os.WriteFile(credPath, []byte(credBody), 0o644); err != nil {
+			return fmt.Errorf("write credentials file: %w", err)
+		}
+		credentialsFile = pkiMountPoint + "/credentials"
+	}
+
+	if err := writeClientConf(filepath.Join(outDir, "client.conf"), clientDirectives, !noClientCert, credentialsFile); err != nil {
 		return err
 	}
 
@@ -548,7 +571,16 @@ func verifyStaticKeyV1RoundTrip(path string, want []byte) error {
 // scenario. A nil/empty slice (every pre-existing scenario's call site)
 // appends nothing, so clean-small/clean-large/lossy-large's generated
 // client.conf stays byte-identical to before this flag existed.
-func writeClientConf(path string, extraDirectives []string) error {
+//
+// includeClientCert (quick 260908-m4e), when false, omits the `cert`/`key`
+// directives — the client cert/key files are still generated on disk, only
+// the conf lines referencing them are suppressed, for the
+// no-client-certificate auth-user-pass scenario. credentialsFile, when
+// non-empty, appends `auth-user-pass <credentialsFile>`. Both default to
+// their "no change" value (true / "") for every pre-existing call site, so
+// clean-small/clean-large/lossy-large/reneg's generated client.conf stays
+// byte-identical to before these two parameters existed.
+func writeClientConf(path string, extraDirectives []string, includeClientCert bool, credentialsFile string) error {
 	conf := fmt.Sprintf(`client
 dev tun
 proto udp
@@ -559,13 +591,22 @@ persist-key
 persist-tun
 remote-cert-tls server
 ca %s/ca.crt
-cert %s/client.crt
-key %s/client.key
-tls-crypt %s/tls-crypt.key
+`, serverAlias, serverPort, pkiMountPoint)
+
+	if includeClientCert {
+		conf += fmt.Sprintf("cert %s/client.crt\n", pkiMountPoint)
+		conf += fmt.Sprintf("key %s/client.key\n", pkiMountPoint)
+	}
+
+	conf += fmt.Sprintf(`tls-crypt %s/tls-crypt.key
 topology subnet
 cipher AES-256-GCM
 verb 4
-`, serverAlias, serverPort, pkiMountPoint, pkiMountPoint, pkiMountPoint, pkiMountPoint)
+`, pkiMountPoint)
+
+	if credentialsFile != "" {
+		conf += fmt.Sprintf("auth-user-pass %s\n", credentialsFile)
+	}
 
 	for _, d := range extraDirectives {
 		conf += d + "\n"

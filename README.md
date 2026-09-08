@@ -9,6 +9,7 @@ Per connected client, `govpn` hands your program a `Session` that behaves as an 
 - **Package:** `ovpn`
 - **Dependencies:** Go standard library only — `go.mod` declares no third-party requirements.
 - **Compatibility target:** a real, unmodified OpenVPN 2.6 client with `tls-crypt`, certificate auth, AES-256-GCM, and `topology subnet`.
+- **Client authentication:** a client certificate, username/password via `Config.AuthUserPass`, or both — see [CONFIGURATION.md](docs/CONFIGURATION.md#authuserpass).
 
 ## Installation
 
@@ -42,6 +43,8 @@ srv := ovpn.NewServer(ovpn.Config{
     TLSCryptKey: tlsCryptKey,  // from ovpn.ParseStaticKeyV1
     Network:     tunnelNetwork, // *net.IPNet, e.g. 10.8.0.0/24 (topology subnet)
     Cipher:      "AES-256-GCM",
+    // AuthUserPass: myAuthHook, // optional: authenticate by username/password
+    //                           // instead of (or in addition to) a client cert
     OnSession: func(sess *ovpn.Session) {
         // sess is an io.ReadWriteCloser of raw, decrypted IP packets.
         // sess.AssignedIP() and sess.PeerID() are already populated here.

@@ -6,6 +6,40 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project does not yet follow Semantic Versioning strictly (pre-1.0), but
 version numbers below still increase monotonically with each release.
 
+## [Unreleased]
+
+### Added
+
+- `Config.AuthUserPass` — authenticates a client's Key Method 2
+  username/password, on the initial handshake and on every renegotiation.
+  `nil` (the default) leaves credentials parsed and ignored, matching
+  every previous release's behavior exactly.
+- `AuthClientReason` — an optional interface an `AuthUserPass` error may
+  implement to send the client an `AUTH_FAILED,<reason>` rejection
+  instead of the plain `AUTH_FAILED` form.
+- `CloseReasonAuthFailed` — recorded when `Config.AuthUserPass` rejects a
+  client's credentials; fires `Config.OnSessionClosed` only for a
+  renegotiation-time rejection (an initial-handshake rejection never
+  reaches `OnSession`, so it never reaches `OnSessionClosed` either).
+- Supported certificate-less operation: a server can now authenticate
+  clients by username/password alone (`tls.NoClientCert`/
+  `tls.RequestClientCert` plus `Config.AuthUserPass`), matching a real
+  OpenVPN client's `auth-user-pass` directive with no `cert`/`key`. Proven
+  against a real, unmodified OpenVPN 2.6 client via the new
+  `auth-user-pass` interop scenario.
+
+### Changed
+
+- **`Server.Serve` now returns an error for a configuration that would
+  authenticate nobody** — `TLSConfig.ClientAuth` not mandating a client
+  certificate (`tls.NoClientCert`, `tls.RequestClientCert`, or
+  `tls.VerifyClientCertIfGiven`) AND `Config.AuthUserPass` left `nil`.
+  **If you are already running with `ClientAuth: tls.NoClientCert` (or
+  equivalent) and no `AuthUserPass`, `Serve` will now fail fast** where it
+  previously started successfully and accepted every client
+  unauthenticated — set `Config.AuthUserPass` or require a client
+  certificate to keep starting.
+
 ## [0.1.0] - 2026-09-08
 
 "Welle 1" of the Voxio requirements: observability and configuration,

@@ -64,6 +64,7 @@ type Config struct {
     PingInterval        time.Duration
     ReapWindow          time.Duration
     SessionInboundQueue int
+    AuthUserPass        func(username, password string, cs tls.ConnectionState) error
 }
 ```
 
@@ -91,6 +92,27 @@ fields most relevant to the API surface on this page:
   [`Session.Stats`](#other-accessors) and CONFIGURATION.md; these make the
   pushed `ping`/`ping-restart` schedule and the per-session inbound queue
   depth configurable instead of fixed.
+- **`AuthUserPass func(username, password string, cs tls.ConnectionState) error`**
+  — authenticates a client's Key Method 2 username/password, on the initial
+  handshake and on every renegotiation. `nil` (the default) leaves
+  credentials parsed and ignored. A non-nil error rejects the client with
+  `AUTH_FAILED` and `CloseReasonAuthFailed`. `Server.Serve` returns an error
+  if this is nil AND `TLSConfig.ClientAuth` does not mandate a client
+  certificate — see [CONFIGURATION.md](CONFIGURATION.md#authuserpass) for the
+  full validation order, panic-recovery contract, and the certificate-less
+  operation pattern.
+
+## `ovpn.AuthClientReason`
+
+```go
+type AuthClientReason interface{ ClientReason() string }
+```
+
+An optional interface an error returned from `Config.AuthUserPass` may
+implement to supply a human-readable rejection reason, sent to the client as
+`AUTH_FAILED,<reason>` (sanitized: control bytes stripped, capped at 128
+bytes) instead of the plain `AUTH_FAILED` form. See
+[CONFIGURATION.md](CONFIGURATION.md#authclientreason).
 
 ## `ovpn.ParseStaticKeyV1`
 
@@ -279,6 +301,7 @@ const (
     CloseReasonIdleReap
     CloseReasonServerClose
     CloseReasonReplaced // reserved; never produced by this package today
+    CloseReasonAuthFailed
 )
 
 func (r CloseReason) String() string
@@ -292,6 +315,7 @@ func (r CloseReason) String() string
 | `CloseReasonIdleReap` | The server's own idle-session reaper. |
 | `CloseReasonServerClose` | `Server.Close` tearing down every live session. |
 | `CloseReasonReplaced` | Reserved for a future static-IP "replace" teardown path — never produced today. |
+| `CloseReasonAuthFailed` | `Config.AuthUserPass` rejected the client's credentials. **Only fires `OnSessionClosed` for a renegotiation-time rejection** — an initial-handshake rejection never reaches `OnSession` in the first place (same rule as `CloseReasonUnknown`), so it never reaches `OnSessionClosed` either. |
 
 ### Other accessors
 
