@@ -14,13 +14,15 @@
 // it declares its own minimal Session interface below — exactly
 // io.ReadWriteCloser — so *ovpn.Session satisfies it structurally, with no
 // coupling in either direction. A fake, in-memory Session (see
-// fakesession_test.go) drives the fast test tier with no Docker (D-12).
+// netstack/netstacktest's FakeSession) drives the fast test tier with no
+// Docker (D-12).
 package netstack
 
 import (
 	"errors"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -518,6 +520,60 @@ func (s *Stack) Detach(ip net.IP) bool {
 	}
 	a.stop()
 	return true
+}
+
+// IsAttached reports whether ip currently has a route: true only for an
+// IPv4 address currently registered via Attach and not yet removed by
+// Detach or detachAttachment. It never panics on its argument — a nil,
+// IPv6, or otherwise malformed ip simply cannot be attached, so
+// toIPv4Addr's error is treated as "not attached" rather than propagated.
+// The stack's own server tunnel IP is never a routable attachment (Attach
+// rejects it with ErrAttachServerIP), so it always reports false too.
+func (s *Stack) IsAttached(ip net.IP) bool {
+	addr, err := toIPv4Addr(ip)
+	if err != nil {
+		return false
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.routes[addr]
+	return ok
+}
+
+// Routes returns a point-in-time snapshot of every currently attached IP,
+// sorted in ascending address order for deterministic output. It is safe to
+// call concurrently with Attach/Detach and with in-flight handshakes and
+// teardowns: the map is read once under a brief RLock, then released before
+// sorting and materializing the result, so Routes never holds s.mu for
+// longer than the lookup itself needs.
+//
+// Every returned net.IP is a freshly allocated 4-byte defensive copy: a
+// caller mutating an element of the returned slice cannot reach or corrupt
+// this Stack's own routing state. An empty stack returns a zero-length
+// slice, never nil-vs-empty ambiguity a caller would have to special-case.
+//
+// Routes is the inventory surface (which IPs are attached right now);
+// Stack.Stats() is the companion counter surface (how many packets flowed).
+// Use Routes when you need identity, Stats when you need a count.
+func (s *Stack) Routes() []net.IP {
+	s.mu.RLock()
+	addrs := make([]netip.Addr, 0, len(s.routes))
+	for addr := range s.routes {
+		addrs = append(addrs, addr)
+	}
+	s.mu.RUnlock()
+
+	slices.SortFunc(addrs, func(a, b netip.Addr) int { return a.Compare(b) })
+
+	out := make([]net.IP, 0, len(addrs))
+	for _, addr := range addrs {
+		b := addr.As4()
+		ip := make(net.IP, 4)
+		copy(ip, b[:])
+		out = append(out, ip)
+	}
+	return out
 }
 
 // detachAttachment is readLoop's own detach path: Session.Read returning a

@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/8upio/govpn/netstack/netstacktest"
 )
 
 func testServerIP() net.IP {
@@ -23,10 +25,10 @@ func newTestStack(t *testing.T, opts ...Option) *Stack {
 	return s
 }
 
-func waitForOutbound(t *testing.T, fs *fakeSession, timeout time.Duration) []byte {
+func waitForOutbound(t *testing.T, fs *netstacktest.FakeSession, timeout time.Duration) []byte {
 	t.Helper()
 	select {
-	case pkt := <-fs.outbound:
+	case pkt := <-fs.Outbound():
 		return pkt
 	case <-time.After(timeout):
 		t.Fatal("timed out waiting for an outbound packet")
@@ -34,10 +36,10 @@ func waitForOutbound(t *testing.T, fs *fakeSession, timeout time.Duration) []byt
 	}
 }
 
-func assertNoOutbound(t *testing.T, fs *fakeSession, wait time.Duration) {
+func assertNoOutbound(t *testing.T, fs *netstacktest.FakeSession, wait time.Duration) {
 	t.Helper()
 	select {
-	case pkt := <-fs.outbound:
+	case pkt := <-fs.Outbound():
 		t.Fatalf("expected no outbound packet, got %d bytes", len(pkt))
 	case <-time.After(wait):
 	}
@@ -52,14 +54,14 @@ func TestICMPEchoEndToEnd(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	clientIP := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, clientIP); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
 
-	req := buildICMPEchoRequest(mustAddr(clientIP), mustAddr(testServerIP()), 1, 1, []byte("hello, tunnel"))
-	fs.inbound <- req
+	req := netstacktest.BuildICMPEchoRequest(netstacktest.MustAddr(clientIP), netstacktest.MustAddr(testServerIP()), 1, 1, []byte("hello, tunnel"))
+	fs.Inject(req)
 
 	reply := waitForOutbound(t, fs, time.Second)
 
@@ -67,11 +69,11 @@ func TestICMPEchoEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseIPv4(reply): %v", err)
 	}
-	if hdr.src != mustAddr(testServerIP()) {
-		t.Errorf("reply source = %v, want server IP %v", hdr.src, mustAddr(testServerIP()))
+	if hdr.src != netstacktest.MustAddr(testServerIP()) {
+		t.Errorf("reply source = %v, want server IP %v", hdr.src, netstacktest.MustAddr(testServerIP()))
 	}
-	if hdr.dst != mustAddr(clientIP) {
-		t.Errorf("reply destination = %v, want client IP %v", hdr.dst, mustAddr(clientIP))
+	if hdr.dst != netstacktest.MustAddr(clientIP) {
+		t.Errorf("reply destination = %v, want client IP %v", hdr.dst, netstacktest.MustAddr(clientIP))
 	}
 
 	icmpMsg := reply[hdr.payloadOff:hdr.totalLen]
@@ -109,7 +111,7 @@ func TestReadLoopRecoversFromShortBuffer(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	clientIP := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, clientIP); err != nil {
 		t.Fatalf("Attach: %v", err)
@@ -119,8 +121,8 @@ func TestReadLoopRecoversFromShortBuffer(t *testing.T) {
 	// maxReadRetryBufferSize — the "non-conforming or hostile client
 	// exceeds the advisory tun-mtu" scenario WR-04 is about.
 	bigPayload := bytes.Repeat([]byte{0x7a}, readBufferSize+500)
-	req := buildICMPEchoRequest(mustAddr(clientIP), mustAddr(testServerIP()), 1, 1, bigPayload)
-	fs.inbound <- req
+	req := netstacktest.BuildICMPEchoRequest(netstacktest.MustAddr(clientIP), netstacktest.MustAddr(testServerIP()), 1, 1, bigPayload)
+	fs.Inject(req)
 
 	reply := waitForOutbound(t, fs, time.Second)
 	hdr, err := parseIPv4(reply)
@@ -139,12 +141,12 @@ func TestReadLoopRecoversFromShortBuffer(t *testing.T) {
 	// The route must still be alive: a subsequent, ordinary-sized request
 	// on the SAME attachment still gets a reply.
 	stack.mu.RLock()
-	_, exists := stack.routes[mustAddr(clientIP)]
+	_, exists := stack.routes[netstacktest.MustAddr(clientIP)]
 	stack.mu.RUnlock()
 	if !exists {
 		t.Fatal("route was removed after an oversized (but recoverable) packet — the attachment was wrongly detached")
 	}
-	fs.inbound <- buildICMPEchoRequest(mustAddr(clientIP), mustAddr(testServerIP()), 2, 1, []byte("still alive"))
+	fs.Inject(netstacktest.BuildICMPEchoRequest(netstacktest.MustAddr(clientIP), netstacktest.MustAddr(testServerIP()), 2, 1, []byte("still alive")))
 	waitForOutbound(t, fs, time.Second)
 }
 
@@ -152,8 +154,8 @@ func TestAttachDetachRouting(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
-	fsA := newFakeSession()
-	fsB := newFakeSession()
+	fsA := netstacktest.NewFakeSession()
+	fsB := netstacktest.NewFakeSession()
 	ipA := net.IPv4(10, 8, 0, 2).To4()
 	ipB := net.IPv4(10, 8, 0, 3).To4()
 
@@ -164,31 +166,31 @@ func TestAttachDetachRouting(t *testing.T) {
 		t.Fatalf("Attach B: %v", err)
 	}
 
-	fsA.inbound <- buildICMPEchoRequest(mustAddr(ipA), mustAddr(testServerIP()), 1, 1, nil)
+	fsA.Inject(netstacktest.BuildICMPEchoRequest(netstacktest.MustAddr(ipA), netstacktest.MustAddr(testServerIP()), 1, 1, nil))
 	replyA := waitForOutbound(t, fsA, time.Second)
 	hdrA, err := parseIPv4(replyA)
 	if err != nil {
 		t.Fatalf("parseIPv4(replyA): %v", err)
 	}
-	if hdrA.dst != mustAddr(ipA) {
-		t.Fatalf("session A's reply is addressed to %v, want %v", hdrA.dst, mustAddr(ipA))
+	if hdrA.dst != netstacktest.MustAddr(ipA) {
+		t.Fatalf("session A's reply is addressed to %v, want %v", hdrA.dst, netstacktest.MustAddr(ipA))
 	}
 	assertNoOutbound(t, fsB, 50*time.Millisecond)
 
-	fsB.inbound <- buildICMPEchoRequest(mustAddr(ipB), mustAddr(testServerIP()), 2, 1, nil)
+	fsB.Inject(netstacktest.BuildICMPEchoRequest(netstacktest.MustAddr(ipB), netstacktest.MustAddr(testServerIP()), 2, 1, nil))
 	replyB := waitForOutbound(t, fsB, time.Second)
 	hdrB, err := parseIPv4(replyB)
 	if err != nil {
 		t.Fatalf("parseIPv4(replyB): %v", err)
 	}
-	if hdrB.dst != mustAddr(ipB) {
-		t.Fatalf("session B's reply is addressed to %v, want %v", hdrB.dst, mustAddr(ipB))
+	if hdrB.dst != netstacktest.MustAddr(ipB) {
+		t.Fatalf("session B's reply is addressed to %v, want %v", hdrB.dst, netstacktest.MustAddr(ipB))
 	}
 
-	if err := stack.Attach(newFakeSession(), ipA); !errors.Is(err, ErrDuplicateAttach) {
+	if err := stack.Attach(netstacktest.NewFakeSession(), ipA); !errors.Is(err, ErrDuplicateAttach) {
 		t.Fatalf("Attach(duplicate ipA) = %v, want ErrDuplicateAttach", err)
 	}
-	if err := stack.Attach(newFakeSession(), testServerIP()); !errors.Is(err, ErrAttachServerIP) {
+	if err := stack.Attach(netstacktest.NewFakeSession(), testServerIP()); !errors.Is(err, ErrAttachServerIP) {
 		t.Fatalf("Attach(server IP) = %v, want ErrAttachServerIP", err)
 	}
 
@@ -199,7 +201,7 @@ func TestAttachDetachRouting(t *testing.T) {
 		t.Fatal("second Detach(ipA) = true, want false")
 	}
 
-	fsA.inbound <- buildICMPEchoRequest(mustAddr(ipA), mustAddr(testServerIP()), 3, 1, nil)
+	fsA.Inject(netstacktest.BuildICMPEchoRequest(netstacktest.MustAddr(ipA), netstacktest.MustAddr(testServerIP()), 3, 1, nil))
 	assertNoOutbound(t, fsA, 50*time.Millisecond)
 }
 
@@ -212,14 +214,14 @@ func TestDetachOnSessionReadError(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	ip := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, ip); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
 
 	stack.mu.RLock()
-	a := stack.routes[mustAddr(ip)]
+	a := stack.routes[netstacktest.MustAddr(ip)]
 	stack.mu.RUnlock()
 	if a == nil {
 		t.Fatal("no attachment found immediately after Attach")
@@ -236,7 +238,7 @@ func TestDetachOnSessionReadError(t *testing.T) {
 	}
 
 	stack.mu.RLock()
-	_, exists := stack.routes[mustAddr(ip)]
+	_, exists := stack.routes[netstacktest.MustAddr(ip)]
 	stack.mu.RUnlock()
 	if exists {
 		t.Fatal("route was not removed after the session's Read returned an error")
@@ -246,32 +248,29 @@ func TestDetachOnSessionReadError(t *testing.T) {
 // TestSingleReaderPerSession asserts Attach starts exactly one goroutine
 // per attached session that calls Session.Read (session.go:305-313's
 // single-reader contract) — via both an overlap check and a distinct
-// goroutine-identity count (see fakeSession's doc comment).
+// goroutine-identity count (see netstacktest.FakeSession's doc comment).
 func TestSingleReaderPerSession(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	ip := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, ip); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
 
 	for i := 0; i < 50; i++ {
-		fs.inbound <- buildICMPEchoRequest(mustAddr(ip), mustAddr(testServerIP()), 1, uint16(i), nil)
+		fs.Inject(netstacktest.BuildICMPEchoRequest(netstacktest.MustAddr(ip), netstacktest.MustAddr(testServerIP()), 1, uint16(i), nil))
 		waitForOutbound(t, fs, time.Second)
 	}
 
-	fs.readMu.Lock()
-	overlapped := fs.readOverlapped
-	distinct := len(fs.readerIDs)
-	fs.readMu.Unlock()
+	obs := fs.ReadObservations()
 
-	if overlapped {
+	if obs.Overlapped {
 		t.Fatal("Session.Read was called concurrently from more than one goroutine")
 	}
-	if distinct != 1 {
-		t.Fatalf("Session.Read was called from %d distinct goroutines, want exactly 1", distinct)
+	if obs.DistinctReaders != 1 {
+		t.Fatalf("Session.Read was called from %d distinct goroutines, want exactly 1", obs.DistinctReaders)
 	}
 }
 
@@ -279,20 +278,20 @@ func TestSourceIPSpoofDropped(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	ip := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, ip); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
 
 	otherClient := net.IPv4(10, 8, 0, 3).To4()
-	fs.inbound <- buildICMPEchoRequest(mustAddr(otherClient), mustAddr(testServerIP()), 1, 1, nil)
+	fs.Inject(netstacktest.BuildICMPEchoRequest(netstacktest.MustAddr(otherClient), netstacktest.MustAddr(testServerIP()), 1, 1, nil))
 	assertNoOutbound(t, fs, 50*time.Millisecond)
 	if got := stack.Stats().SpoofedSourceDropped; got != 1 {
 		t.Fatalf("Stats().SpoofedSourceDropped = %d, want 1 (claiming another client's IP)", got)
 	}
 
-	fs.inbound <- buildICMPEchoRequest(mustAddr(testServerIP()), mustAddr(testServerIP()), 2, 1, nil)
+	fs.Inject(netstacktest.BuildICMPEchoRequest(netstacktest.MustAddr(testServerIP()), netstacktest.MustAddr(testServerIP()), 2, 1, nil))
 	assertNoOutbound(t, fs, 50*time.Millisecond)
 	if got := stack.Stats().SpoofedSourceDropped; got != 2 {
 		t.Fatalf("Stats().SpoofedSourceDropped = %d, want 2 (claiming the server's own IP)", got)
@@ -303,14 +302,14 @@ func TestNonServerDestinationDropped(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	ip := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, ip); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
 
 	wrongDst := net.IPv4(10, 8, 0, 7).To4()
-	fs.inbound <- buildICMPEchoRequest(mustAddr(ip), mustAddr(wrongDst), 1, 1, nil)
+	fs.Inject(netstacktest.BuildICMPEchoRequest(netstacktest.MustAddr(ip), netstacktest.MustAddr(wrongDst), 1, 1, nil))
 	assertNoOutbound(t, fs, 50*time.Millisecond)
 	if got := stack.Stats().WrongDestinationDropped; got != 1 {
 		t.Fatalf("Stats().WrongDestinationDropped = %d, want 1", got)
@@ -346,7 +345,7 @@ func icmpEchoFragments(t *testing.T, src, dst netip.Addr, id uint16, chunk int, 
 	if chunk%8 != 0 {
 		t.Fatalf("icmpEchoFragments: chunk %d is not a multiple of 8", chunk)
 	}
-	req := buildICMPEchoRequest(src, dst, 1, 1, payload)
+	req := netstacktest.BuildICMPEchoRequest(src, dst, 1, 1, payload)
 	icmpMsg = req[minIPv4HeaderLen:]
 
 	for off := 0; off < len(icmpMsg); off += chunk {
@@ -354,7 +353,7 @@ func icmpEchoFragments(t *testing.T, src, dst netip.Addr, id uint16, chunk int, 
 		if end > len(icmpMsg) {
 			end = len(icmpMsg)
 		}
-		frags = append(frags, buildFragmentForTest(src, dst, protocolICMP, id, off, end < len(icmpMsg), icmpMsg[off:end]))
+		frags = append(frags, netstacktest.BuildFragment(src, dst, protocolICMP, id, off, end < len(icmpMsg), icmpMsg[off:end]))
 	}
 	return icmpMsg, frags
 }
@@ -367,20 +366,20 @@ func TestFragmentedICMPEchoReassembled(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	clientIP := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, clientIP); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
 
-	client, server := mustAddr(clientIP), mustAddr(testServerIP())
+	client, server := netstacktest.MustAddr(clientIP), netstacktest.MustAddr(testServerIP())
 	icmpMsg, frags := icmpEchoFragments(t, client, server, 0x2222, 16, bytes.Repeat([]byte{0xAB}, 40))
 	if len(frags) != 3 {
 		t.Fatalf("test fixture produced %d fragments, want 3", len(frags))
 	}
 
 	for i := len(frags) - 1; i >= 0; i-- {
-		fs.inbound <- frags[i]
+		fs.Inject(frags[i])
 	}
 
 	reply := waitForOutbound(t, fs, time.Second)
@@ -428,13 +427,13 @@ func TestOversizedInboundUDPDatagramReassembled(t *testing.T) {
 	}
 	defer conn.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	clientIP := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, clientIP); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
 
-	client, server := mustAddr(clientIP), mustAddr(testServerIP())
+	client, server := netstacktest.MustAddr(clientIP), netstacktest.MustAddr(testServerIP())
 	appPayload := bytes.Repeat([]byte("INVITE sip:voxio "), 200) // 3400 bytes
 	datagram := buildUDP(nil, client, server, 40000, 5060, appPayload)
 
@@ -445,7 +444,7 @@ func TestOversizedInboundUDPDatagramReassembled(t *testing.T) {
 		if end > len(datagram) {
 			end = len(datagram)
 		}
-		fs.inbound <- buildFragmentForTest(client, server, protocolUDP, 0x3333, off, end < len(datagram), datagram[off:end])
+		fs.Inject(netstacktest.BuildFragment(client, server, protocolUDP, 0x3333, off, end < len(datagram), datagram[off:end]))
 		sent++
 	}
 	if sent < 3 {
@@ -484,18 +483,18 @@ func TestSpoofedFragmentAllocatesNothing(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	clientIP := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, clientIP); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
 
 	stack.mu.RLock()
-	a := stack.routes[mustAddr(clientIP)]
+	a := stack.routes[netstacktest.MustAddr(clientIP)]
 	stack.mu.RUnlock()
 
-	otherClient := mustAddr(net.IPv4(10, 8, 0, 3).To4())
-	fs.inbound <- buildFragmentForTest(otherClient, mustAddr(testServerIP()), protocolUDP, 1, 0, true, bytes.Repeat([]byte{0x01}, 16))
+	otherClient := netstacktest.MustAddr(net.IPv4(10, 8, 0, 3).To4())
+	fs.Inject(netstacktest.BuildFragment(otherClient, netstacktest.MustAddr(testServerIP()), protocolUDP, 1, 0, true, bytes.Repeat([]byte{0x01}, 16)))
 
 	st := waitForStat(t, stack, func(s Stats) bool { return s.SpoofedSourceDropped == 1 }, time.Second)
 	if st.FragmentsDropped != 0 || st.ReassemblyBoundExceeded != 0 {
@@ -517,18 +516,18 @@ func TestMisalignedFragmentIsMalformed(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	clientIP := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, clientIP); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
 
 	stack.mu.RLock()
-	a := stack.routes[mustAddr(clientIP)]
+	a := stack.routes[netstacktest.MustAddr(clientIP)]
 	stack.mu.RUnlock()
 
-	client, server := mustAddr(clientIP), mustAddr(testServerIP())
-	fs.inbound <- buildFragmentForTest(client, server, protocolUDP, 1, 1480, true, make([]byte, 13))
+	client, server := netstacktest.MustAddr(clientIP), netstacktest.MustAddr(testServerIP())
+	fs.Inject(netstacktest.BuildFragment(client, server, protocolUDP, 1, 1480, true, make([]byte, 13)))
 
 	st := waitForStat(t, stack, func(s Stats) bool { return s.MalformedDropped == 1 }, time.Second)
 	if st.FragmentsDropped != 0 {
@@ -552,19 +551,19 @@ func TestLoneFragmentTimesOut(t *testing.T) {
 	stack := newTestStack(t, WithClock(clock))
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	clientIP := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, clientIP); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
 
-	client, server := mustAddr(clientIP), mustAddr(testServerIP())
-	fs.inbound <- buildFragmentForTest(client, server, protocolUDP, 0x4444, 0, true, make([]byte, 16))
+	client, server := netstacktest.MustAddr(clientIP), netstacktest.MustAddr(testServerIP())
+	fs.Inject(netstacktest.BuildFragment(client, server, protocolUDP, 0x4444, 0, true, make([]byte, 16)))
 	waitForStat(t, stack, func(s Stats) bool { return s.PacketsReceived == 1 }, time.Second)
 
 	clock.Advance(31 * time.Second)
 
-	fs.inbound <- buildFragmentForTest(client, server, protocolUDP, 0x5555, 0, true, make([]byte, 16))
+	fs.Inject(netstacktest.BuildFragment(client, server, protocolUDP, 0x5555, 0, true, make([]byte, 16)))
 	st := waitForStat(t, stack, func(s Stats) bool { return s.ReassemblyTimeouts == 1 }, time.Second)
 	if st.FragmentsDropped != 0 {
 		t.Errorf("Stats().FragmentsDropped = %d, want 0 (a timeout is its own counter)", st.FragmentsDropped)
@@ -587,7 +586,7 @@ func TestOutboundFragmentation(t *testing.T) {
 	}
 	defer conn.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	clientIP := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, clientIP); err != nil {
 		t.Fatalf("Attach: %v", err)
@@ -717,7 +716,7 @@ func TestTCPMSSFollowsMTU(t *testing.T) {
 	}
 	defer ln.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	clientIP := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, clientIP); err != nil {
 		t.Fatalf("Attach: %v", err)
@@ -760,19 +759,19 @@ func TestDetachWithOpenReassemblyBuffer(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	clientIP := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, clientIP); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
 
 	stack.mu.RLock()
-	first := stack.routes[mustAddr(clientIP)]
+	first := stack.routes[netstacktest.MustAddr(clientIP)]
 	stack.mu.RUnlock()
 
-	client, server := mustAddr(clientIP), mustAddr(testServerIP())
+	client, server := netstacktest.MustAddr(clientIP), netstacktest.MustAddr(testServerIP())
 	_, frags := icmpEchoFragments(t, client, server, 0x6666, 16, bytes.Repeat([]byte{0xCD}, 40))
-	fs.inbound <- frags[0]
+	fs.Inject(frags[0])
 	waitForStat(t, stack, func(s Stats) bool { return s.PacketsReceived == 1 }, time.Second)
 
 	first.reasm.mu.Lock()
@@ -799,12 +798,12 @@ func TestDetachWithOpenReassemblyBuffer(t *testing.T) {
 
 	// A re-attach on the same IP starts with empty reassembly state and
 	// reassembles a fresh datagram normally.
-	fs2 := newFakeSession()
+	fs2 := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs2, clientIP); err != nil {
 		t.Fatalf("re-Attach: %v", err)
 	}
 	stack.mu.RLock()
-	second := stack.routes[mustAddr(clientIP)]
+	second := stack.routes[netstacktest.MustAddr(clientIP)]
 	stack.mu.RUnlock()
 	if second == first {
 		t.Fatal("re-Attach reused the detached attachment")
@@ -817,7 +816,7 @@ func TestDetachWithOpenReassemblyBuffer(t *testing.T) {
 	}
 
 	for _, frag := range frags {
-		fs2.inbound <- frag
+		fs2.Inject(frag)
 	}
 	reply := waitForOutbound(t, fs2, time.Second)
 	hdr, err := parseIPv4(reply)
@@ -833,14 +832,14 @@ func TestOutboundSourceIPFailClosed(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	ip := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, ip); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
 
 	stack.mu.RLock()
-	a := stack.routes[mustAddr(ip)]
+	a := stack.routes[netstacktest.MustAddr(ip)]
 	stack.mu.RUnlock()
 
 	badICMP := []byte{icmpTypeEchoReply, 0, 0, 0, 0, 0, 0, 0}
@@ -848,7 +847,7 @@ func TestOutboundSourceIPFailClosed(t *testing.T) {
 	binaryPutChecksum(badICMP)
 	// Source == client IP, not the server's own tunnel IP: this must never
 	// reach the wire (D-04).
-	badPkt := buildIPv4(nil, mustAddr(ip), mustAddr(ip), protocolICMP, badICMP)
+	badPkt := buildIPv4(nil, netstacktest.MustAddr(ip), netstacktest.MustAddr(ip), protocolICMP, badICMP)
 
 	err := stack.writePacket(a, badPkt)
 	if !errors.Is(err, ErrOutboundSourceMismatch) {
@@ -856,7 +855,7 @@ func TestOutboundSourceIPFailClosed(t *testing.T) {
 	}
 
 	select {
-	case <-fs.outbound:
+	case <-fs.Outbound():
 		t.Fatal("a packet reached the fake session's outbound channel despite the outbound source-IP mismatch")
 	default:
 	}
@@ -880,21 +879,21 @@ func TestUnhandledProtocolDropped(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	ip := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, ip); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
 
-	udpPkt := buildIPv4(nil, mustAddr(ip), mustAddr(testServerIP()), protocolUDP, []byte("hello"))
-	fs.inbound <- udpPkt
+	udpPkt := buildIPv4(nil, netstacktest.MustAddr(ip), netstacktest.MustAddr(testServerIP()), protocolUDP, []byte("hello"))
+	fs.Inject(udpPkt)
 	assertNoOutbound(t, fs, 50*time.Millisecond)
 	if got := stack.Stats().UnhandledProtocolDropped; got != 1 {
 		t.Fatalf("Stats().UnhandledProtocolDropped = %d, want 1 after a UDP packet with no registered handler", got)
 	}
 
-	tcpPkt := buildIPv4(nil, mustAddr(ip), mustAddr(testServerIP()), protocolTCP, []byte("hello"))
-	fs.inbound <- tcpPkt
+	tcpPkt := buildIPv4(nil, netstacktest.MustAddr(ip), netstacktest.MustAddr(testServerIP()), protocolTCP, []byte("hello"))
+	fs.Inject(tcpPkt)
 	assertNoOutbound(t, fs, 50*time.Millisecond)
 	if got := stack.Stats().UnhandledProtocolDropped; got != 2 {
 		t.Fatalf("Stats().UnhandledProtocolDropped = %d, want 2 after a TCP packet with no registered handler", got)
@@ -1008,19 +1007,19 @@ func TestWithReassemblyLimitsBufferBound(t *testing.T) {
 	stack := newTestStack(t, WithReassemblyLimits(ReassemblyLimits{MaxDatagramsPerAttachment: 2}))
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	clientIP := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, clientIP); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
-	client, server := mustAddr(clientIP), mustAddr(testServerIP())
+	client, server := netstacktest.MustAddr(clientIP), netstacktest.MustAddr(testServerIP())
 
 	for i := 0; i < 2; i++ {
-		fs.inbound <- buildFragmentForTest(client, server, protocolUDP, uint16(i), 0, true, make([]byte, 16))
+		fs.Inject(netstacktest.BuildFragment(client, server, protocolUDP, uint16(i), 0, true, make([]byte, 16)))
 	}
 	waitForStat(t, stack, func(s Stats) bool { return s.PacketsReceived == 2 }, time.Second)
 
-	fs.inbound <- buildFragmentForTest(client, server, protocolUDP, 2, 0, true, make([]byte, 16))
+	fs.Inject(netstacktest.BuildFragment(client, server, protocolUDP, 2, 0, true, make([]byte, 16)))
 	st := waitForStat(t, stack, func(s Stats) bool { return s.ReassemblyBoundExceeded == 1 }, time.Second)
 	if st.PacketsReceived != 3 {
 		t.Fatalf("Stats().PacketsReceived = %d, want 3", st.PacketsReceived)
@@ -1036,14 +1035,14 @@ func TestWithReassemblyLimitsTimeout(t *testing.T) {
 	stack := newTestStack(t, WithClock(clock), WithReassemblyLimits(ReassemblyLimits{Timeout: shortTimeout}))
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	clientIP := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, clientIP); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
-	client, server := mustAddr(clientIP), mustAddr(testServerIP())
+	client, server := netstacktest.MustAddr(clientIP), netstacktest.MustAddr(testServerIP())
 
-	fs.inbound <- buildFragmentForTest(client, server, protocolUDP, 0x6666, 0, true, make([]byte, 16))
+	fs.Inject(netstacktest.BuildFragment(client, server, protocolUDP, 0x6666, 0, true, make([]byte, 16)))
 	waitForStat(t, stack, func(s Stats) bool { return s.PacketsReceived == 1 }, time.Second)
 
 	// Past the CUSTOM (short) timeout but well inside the default 30s
@@ -1051,7 +1050,7 @@ func TestWithReassemblyLimitsTimeout(t *testing.T) {
 	// default, is what this attachment enforces.
 	clock.Advance(shortTimeout + time.Second)
 
-	fs.inbound <- buildFragmentForTest(client, server, protocolUDP, 0x7777, 0, true, make([]byte, 16))
+	fs.Inject(netstacktest.BuildFragment(client, server, protocolUDP, 0x7777, 0, true, make([]byte, 16)))
 	waitForStat(t, stack, func(s Stats) bool { return s.ReassemblyTimeouts == 1 }, time.Second)
 }
 
@@ -1096,5 +1095,108 @@ func TestFakeClockDrivesTimer(t *testing.T) {
 	case <-timer.C():
 	case <-time.After(time.Second):
 		t.Fatal("timer did not fire after the fake clock advanced past its duration")
+	}
+}
+
+// TestIsAttached covers Stack.IsAttached: true for an attached IP, false
+// after Detach, false for the server's own tunnel IP, and false (never a
+// panic) for a nil, IPv6, or otherwise malformed argument.
+func TestIsAttached(t *testing.T) {
+	stack := newTestStack(t)
+	defer stack.Close()
+
+	ip := net.IPv4(10, 8, 0, 2).To4()
+	if stack.IsAttached(ip) {
+		t.Fatal("IsAttached = true before Attach, want false")
+	}
+
+	fs := netstacktest.NewFakeSession()
+	if err := stack.Attach(fs, ip); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	if !stack.IsAttached(ip) {
+		t.Fatal("IsAttached = false right after Attach, want true")
+	}
+
+	if stack.IsAttached(testServerIP()) {
+		t.Fatal("IsAttached(server IP) = true, want false")
+	}
+
+	if stack.IsAttached(nil) {
+		t.Fatal("IsAttached(nil) = true, want false")
+	}
+	if stack.IsAttached(net.ParseIP("::1")) {
+		t.Fatal("IsAttached(IPv6) = true, want false")
+	}
+	if stack.IsAttached(net.IP{1, 2, 3}) {
+		t.Fatal("IsAttached(malformed) = true, want false")
+	}
+
+	if !stack.Detach(ip) {
+		t.Fatal("Detach = false, want true")
+	}
+	if stack.IsAttached(ip) {
+		t.Fatal("IsAttached = true after Detach, want false")
+	}
+}
+
+// TestRoutes covers Stack.Routes: empty-stack zero-length result, ascending
+// sort order regardless of attach order, and that mutating a returned
+// net.IP does not change what a later Routes()/IsAttached call reports
+// (the defensive-copy guarantee).
+func TestRoutes(t *testing.T) {
+	stack := newTestStack(t)
+	defer stack.Close()
+
+	routes := stack.Routes()
+	if len(routes) != 0 {
+		t.Fatalf("Routes() on an empty stack = %v, want zero-length", routes)
+	}
+
+	ip3 := net.IPv4(10, 8, 0, 4).To4()
+	ip1 := net.IPv4(10, 8, 0, 2).To4()
+	ip2 := net.IPv4(10, 8, 0, 3).To4()
+
+	// Attach out of order to prove Routes() sorts rather than returning
+	// attachment order.
+	for _, ip := range []net.IP{ip3, ip1, ip2} {
+		if err := stack.Attach(netstacktest.NewFakeSession(), ip); err != nil {
+			t.Fatalf("Attach(%v): %v", ip, err)
+		}
+	}
+
+	routes = stack.Routes()
+	if len(routes) != 3 {
+		t.Fatalf("Routes() = %v, want 3 entries", routes)
+	}
+	want := []net.IP{ip1, ip2, ip3}
+	for i, ip := range want {
+		if !routes[i].Equal(ip) {
+			t.Fatalf("Routes()[%d] = %v, want %v (ascending order)", i, routes[i], ip)
+		}
+	}
+
+	// Defensive-copy guarantee: mutating an element of the returned slice
+	// must not be observable in a later Routes() or IsAttached call.
+	routes[0][0] = 0xFF
+	if !stack.IsAttached(ip1) {
+		t.Fatal("IsAttached(ip1) = false after mutating a previously returned Routes() element, want true (mutation must not reach stack state)")
+	}
+	routesAgain := stack.Routes()
+	if !routesAgain[0].Equal(ip1) {
+		t.Fatalf("Routes()[0] after mutating a prior result = %v, want unaffected %v", routesAgain[0], ip1)
+	}
+
+	if !stack.Detach(ip2) {
+		t.Fatal("Detach(ip2) = false, want true")
+	}
+	routes = stack.Routes()
+	if len(routes) != 2 {
+		t.Fatalf("Routes() after Detach = %v, want 2 entries", routes)
+	}
+	for _, ip := range routes {
+		if ip.Equal(ip2) {
+			t.Fatalf("Routes() after Detach(ip2) still contains ip2: %v", routes)
+		}
 	}
 }

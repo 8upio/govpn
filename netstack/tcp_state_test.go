@@ -6,6 +6,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/8upio/govpn/netstack/netstacktest"
 )
 
 // TestTCPHandshake: the test client's SYN to a listening port draws a
@@ -24,7 +26,7 @@ func TestTCPHandshake(t *testing.T) {
 	}
 	defer ln.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs, testClientAddr()); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -120,7 +122,7 @@ func TestTCPEchoStream(t *testing.T) {
 	}
 	defer ln.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs, testClientAddr()); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -186,7 +188,7 @@ func TestTCPSequenceNumbersAdvanceCorrectly(t *testing.T) {
 	}
 	defer ln.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs, testClientAddr()); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -264,7 +266,7 @@ func TestTCPCleanClose(t *testing.T) {
 	}
 	defer ln.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs, testClientAddr()); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -339,7 +341,7 @@ func TestTCPISNIsRandom(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ListenTCP: %v", err)
 		}
-		fs := newFakeSession()
+		fs := netstacktest.NewFakeSession()
 		if err := stack.Attach(fs, testClientAddr()); err != nil {
 			t.Fatalf("Attach: %v", err)
 		}
@@ -387,7 +389,7 @@ func TestTCPCumulativeAckAdvancesSendWindow(t *testing.T) {
 		t.Fatalf("ListenTCP: %v", err)
 	}
 	defer ln.Close()
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs, testClientAddr()); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -437,7 +439,7 @@ func TestTCPOutOfOrderBuffered(t *testing.T) {
 		t.Fatalf("ListenTCP: %v", err)
 	}
 	defer ln.Close()
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs, testClientAddr()); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -493,7 +495,7 @@ func TestTCPReorderBufferBounded(t *testing.T) {
 		t.Fatalf("ListenTCP: %v", err)
 	}
 	defer ln.Close()
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs, testClientAddr()); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -567,7 +569,7 @@ func TestTCPDuplicateSegmentIgnored(t *testing.T) {
 		t.Fatalf("ListenTCP: %v", err)
 	}
 	defer ln.Close()
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs, testClientAddr()); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -638,7 +640,7 @@ func TestTCPRespectsPeerWindow(t *testing.T) {
 		t.Fatalf("ListenTCP: %v", err)
 	}
 	defer ln.Close()
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs, testClientAddr()); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -696,7 +698,7 @@ func TestTCPAdvertisedWindowShrinksWithBuffer(t *testing.T) {
 		t.Fatalf("ListenTCP: %v", err)
 	}
 	defer ln.Close()
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs, testClientAddr()); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -754,7 +756,7 @@ func TestTCPReceiveWindowEnforcedOnIngress(t *testing.T) {
 		t.Fatalf("ListenTCP: %v", err)
 	}
 	defer ln.Close()
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs, testClientAddr()); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -827,7 +829,7 @@ func TestTCPRSTOutOfWindowIgnored(t *testing.T) {
 		t.Fatalf("ListenTCP: %v", err)
 	}
 	defer ln.Close()
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs, testClientAddr()); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -882,7 +884,7 @@ func TestTCPSynRcvdBadAckBroadcastsBeforeUnlock(t *testing.T) {
 		t.Fatalf("ListenTCP: %v", err)
 	}
 	defer ln.Close()
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs, testClientAddr()); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -893,7 +895,7 @@ func TestTCPSynRcvdBadAckBroadcastsBeforeUnlock(t *testing.T) {
 	client.serverISN = synack.seq
 
 	d := demuxOf(t, stack)
-	key := fourTuple{remoteIP: mustAddr(testClientAddr()), remotePort: client.localPort, localPort: 8080}
+	key := fourTuple{remoteIP: netstacktest.MustAddr(testClientAddr()), remotePort: client.localPort, localPort: 8080}
 	conn := connOf(t, d, key)
 	notify := func() chan struct{} {
 		conn.mu.Lock()
@@ -926,14 +928,14 @@ func TestTCPNoSACKOptionEmitted(t *testing.T) {
 		t.Fatalf("ListenTCP: %v", err)
 	}
 	defer ln.Close()
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs, testClientAddr()); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
 	client := newTCPTestClient(t, fs, testClientAddr(), 34567, testServerIP(), 8080)
 
 	client.sendRaw(tcpSegment{srcPort: client.localPort, dstPort: client.remotePort, seq: client.isn, flags: flagSYN, window: 65535, hasMSS: true, mss: 1460})
-	synackPkt := assertOnlyOption(t, <-fs.outbound, mssOptionKind)
+	synackPkt := assertOnlyOption(t, <-fs.Outbound(), mssOptionKind)
 	synack, err := parseTCP(synackPkt)
 	if err != nil {
 		t.Fatalf("parseTCP: %v", err)
@@ -953,13 +955,13 @@ func TestTCPNoSACKOptionEmitted(t *testing.T) {
 	// so far, none of which may carry any option at all (no MSS on a
 	// non-SYN-ACK segment, and definitely no SACK).
 	go conn.Write([]byte("payload"))
-	assertOnlyOption(t, <-fs.outbound, -1)
+	assertOnlyOption(t, <-fs.Outbound(), -1)
 	clock.Advance(initialRTO)
-	assertOnlyOption(t, <-fs.outbound, -1)
+	assertOnlyOption(t, <-fs.Outbound(), -1)
 
 	// Out-of-order delivery must also never provoke a SACK option.
 	client.sendRaw(tcpSegment{srcPort: client.localPort, dstPort: client.remotePort, seq: client.sndNext + 10, ack: client.rcvNext, flags: flagACK, window: 65535, payload: []byte("x")})
-	assertOnlyOption(t, <-fs.outbound, -1)
+	assertOnlyOption(t, <-fs.Outbound(), -1)
 }
 
 // assertOnlyOption parses pkt's IPv4+TCP headers and fails the test unless

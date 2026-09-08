@@ -4,6 +4,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/8upio/govpn/netstack/netstacktest"
 )
 
 // setupEstablishedConn is a small helper shared by this file's tests: it
@@ -16,7 +18,7 @@ func setupEstablishedConn(t *testing.T, clock *fakeClock) (*Stack, net.Listener,
 	if err != nil {
 		t.Fatalf("ListenTCP: %v", err)
 	}
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs, testClientAddr()); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -67,7 +69,7 @@ func TestTCPRetransmitsUnackedData(t *testing.T) {
 		seq: client.sndNext, ack: first.seq + uint32(len(payload)), flags: flagACK, window: 65535,
 	})
 	// The ACK is delivered asynchronously (the stack's read-loop
-	// goroutine drains fs.inbound) — give it a moment to be processed
+	// goroutine drains fs.Inject-ed packets) — give it a moment to be processed
 	// and disarm the retransmit timer before advancing the clock again,
 	// or this assertion would race the ACK's own delivery.
 	time.Sleep(50 * time.Millisecond)
@@ -161,7 +163,7 @@ func TestTCPZeroWindowDoesNotSpin(t *testing.T) {
 		t.Fatalf("ListenTCP: %v", err)
 	}
 	defer ln.Close()
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs, testClientAddr()); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -236,7 +238,7 @@ func TestTCPZeroWindowPersistGivesUpEventually(t *testing.T) {
 		t.Fatalf("ListenTCP: %v", err)
 	}
 	defer ln.Close()
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs, testClientAddr()); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}

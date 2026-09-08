@@ -8,13 +8,15 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/8upio/govpn/netstack/netstacktest"
 )
 
 func TestUDPAddrShape(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	clientIP := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, clientIP); err != nil {
 		t.Fatalf("Attach: %v", err)
@@ -28,8 +30,8 @@ func TestUDPAddrShape(t *testing.T) {
 
 	assertUDPAddrShape(t, conn.LocalAddr(), testServerIP(), 11000)
 
-	pkt := buildUDPIPv4(mustAddr(clientIP), mustAddr(testServerIP()), 5000, 11000, []byte("x"))
-	fs.inbound <- pkt
+	pkt := netstacktest.BuildUDP(netstacktest.MustAddr(clientIP), netstacktest.MustAddr(testServerIP()), 5000, 11000, []byte("x"))
+	fs.Inject(pkt)
 
 	buf := make([]byte, 64)
 	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {

@@ -19,12 +19,14 @@ import (
 	"encoding/binary"
 	"errors"
 	"net/netip"
+
+	"github.com/8upio/govpn/netstack/internal/frame"
 )
 
 const (
 	// minIPv4HeaderLen is the shortest legal IPv4 header: IHL=5, no
 	// options (RFC 791 §3.1).
-	minIPv4HeaderLen = 20
+	minIPv4HeaderLen = frame.MinIPv4HeaderLen
 
 	// maxIPv4HeaderLen is the longest legal IPv4 header: IHL=15 (RFC 791
 	// §3.1, the 4-bit IHL field's maximum value, ×4 bytes/word).
@@ -33,19 +35,19 @@ const (
 	// defaultTTL is the TTL this stack sets on every packet it builds.
 	// This is this project's own choice (no RFC mandates a specific
 	// value); 64 matches common Linux/BSD defaults.
-	defaultTTL = 64
+	defaultTTL = frame.DefaultTTL
 
 	// IPv4 protocol numbers this stack recognizes (RFC 791 §3.1's
 	// Protocol field; assignments from the IANA protocol-numbers
 	// registry).
-	protocolICMP = 1
-	protocolTCP  = 6
-	protocolUDP  = 17
+	protocolICMP = frame.ProtocolICMP
+	protocolTCP  = frame.ProtocolTCP
+	protocolUDP  = frame.ProtocolUDP
 
 	// flagMoreFragments is the MF bit of the 3-bit Flags field, packed
 	// into the same 16-bit big-endian word as the 13-bit Fragment Offset
 	// (RFC 791 §3.1).
-	flagMoreFragments = 0x2000
+	flagMoreFragments = frame.FlagMoreFragments
 
 	// fragOffsetMask isolates the 13-bit Fragment Offset from the
 	// combined Flags+Fragment-Offset word (RFC 791 §3.1).
@@ -200,30 +202,7 @@ func parseIPv4(pkt []byte) (ipv4Header, error) {
 // never reassembled: an identification is assigned only when writePacket
 // actually fragments (see fragmentIPv4), and only to the fragments it emits.
 func buildIPv4(dst []byte, src, dstAddr netip.Addr, protocol uint8, payload []byte) []byte {
-	totalLen := minIPv4HeaderLen + len(payload)
-
-	start := len(dst)
-	dst = append(dst, make([]byte, minIPv4HeaderLen)...)
-	hdr := dst[start : start+minIPv4HeaderLen]
-
-	hdr[0] = 0x45 // version 4, IHL 5 (20 bytes, no options)
-	hdr[1] = 0    // DSCP/ECN
-	binary.BigEndian.PutUint16(hdr[2:4], uint16(totalLen))
-	binary.BigEndian.PutUint16(hdr[4:6], 0) // identification
-	binary.BigEndian.PutUint16(hdr[6:8], 0) // flags/fragment offset
-	hdr[8] = defaultTTL
-	hdr[9] = protocol
-	hdr[10], hdr[11] = 0, 0 // checksum, computed below with this zeroed
-
-	srcB := src.As4()
-	dstB := dstAddr.As4()
-	copy(hdr[12:16], srcB[:])
-	copy(hdr[16:20], dstB[:])
-
-	binary.BigEndian.PutUint16(hdr[10:12], internetChecksum(hdr))
-
-	dst = append(dst, payload...)
-	return dst
+	return frame.BuildIPv4(dst, src, dstAddr, protocol, payload)
 }
 
 // fragmentIPv4 splits an already-parsed, already-valid datagram into
@@ -294,18 +273,7 @@ func fragmentIPv4(hdr ipv4Header, pkt []byte, mtu int, id uint16) [][]byte {
 // octets to be checksummed are paired to form 16-bit integers, and the 1's
 // complement sum of these 16-bit integers is formed."
 func internetChecksum(b []byte) uint16 {
-	var sum uint32
-	n := len(b)
-	for i := 0; i+1 < n; i += 2 {
-		sum += uint32(b[i])<<8 | uint32(b[i+1])
-	}
-	if n%2 == 1 {
-		sum += uint32(b[n-1]) << 8
-	}
-	for sum>>16 != 0 {
-		sum = (sum & 0xFFFF) + (sum >> 16)
-	}
-	return ^uint16(sum)
+	return frame.InternetChecksum(b)
 }
 
 // pseudoHeaderSum computes the RFC 768 / RFC 9293 §3.1 12-byte IPv4
@@ -317,17 +285,7 @@ func internetChecksum(b []byte) uint16 {
 // (TCP) can both consume them in wave 2 without either plan creating the
 // same function in the other's file.
 func pseudoHeaderSum(src, dst netip.Addr, protocol uint8, length uint16) uint32 {
-	srcB := src.As4()
-	dstB := dst.As4()
-
-	var sum uint32
-	sum += uint32(srcB[0])<<8 | uint32(srcB[1])
-	sum += uint32(srcB[2])<<8 | uint32(srcB[3])
-	sum += uint32(dstB[0])<<8 | uint32(dstB[1])
-	sum += uint32(dstB[2])<<8 | uint32(dstB[3])
-	sum += uint32(protocol)
-	sum += uint32(length)
-	return sum
+	return frame.PseudoHeaderSum(src, dst, protocol, length)
 }
 
 // transportChecksum folds pseudoHeaderSum's partial sum together with
@@ -336,17 +294,5 @@ func pseudoHeaderSum(src, dst netip.Addr, protocol uint8, length uint16) uint32 
 // payload here means the full transport segment (header with its own
 // checksum field zeroed, plus data), per RFC 768/9293.
 func transportChecksum(src, dst netip.Addr, protocol uint8, payload []byte) uint16 {
-	sum := pseudoHeaderSum(src, dst, protocol, uint16(len(payload)))
-
-	n := len(payload)
-	for i := 0; i+1 < n; i += 2 {
-		sum += uint32(payload[i])<<8 | uint32(payload[i+1])
-	}
-	if n%2 == 1 {
-		sum += uint32(payload[n-1]) << 8
-	}
-	for sum>>16 != 0 {
-		sum = (sum & 0xFFFF) + (sum >> 16)
-	}
-	return ^uint16(sum)
+	return frame.TransportChecksum(src, dst, protocol, payload)
 }

@@ -15,6 +15,8 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"github.com/8upio/govpn/netstack/netstacktest"
 )
 
 // establishedTestConn is the shared setup every test below starts from: a
@@ -33,7 +35,7 @@ func establishedTestConn(t *testing.T, clock *fakeClock) (*Stack, net.Listener, 
 	if err != nil {
 		t.Fatalf("ListenTCP: %v", err)
 	}
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs, testClientAddr()); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}

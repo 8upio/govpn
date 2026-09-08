@@ -26,6 +26,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/8upio/govpn/netstack/netstacktest"
 )
 
 // netTestConn adapts a *tcpTestClient into a real net.Conn. Deadlines are
@@ -246,15 +248,15 @@ func (nc *netTestConn) SetWriteDeadline(t time.Time) error { return nil }
 // reported as a plain error instead, which net/http's Transport surfaces
 // normally through Get/Do.
 func dialTCPTestConn(stack *Stack, clientIP net.IP, clientPort, port uint16) (net.Conn, error) {
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs, clientIP); err != nil {
 		return nil, fmt.Errorf("dialTCPTestConn: Attach: %w", err)
 	}
 	tc := &tcpTestClient{
 		fs:         fs,
-		localIP:    mustAddr(clientIP),
+		localIP:    netstacktest.MustAddr(clientIP),
 		localPort:  clientPort,
-		remoteIP:   mustAddr(stack.ServerIP()),
+		remoteIP:   netstacktest.MustAddr(stack.ServerIP()),
 		remotePort: port,
 		isn:        1000,
 	}
@@ -566,7 +568,7 @@ func TestTCPConnImplementsCloseWriter(t *testing.T) {
 	}
 	defer ln.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs, testClientAddr()); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -600,7 +602,7 @@ func TestCloseWriteIsHalfClose(t *testing.T) {
 	}
 	defer ln.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs, testClientAddr()); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -684,7 +686,7 @@ func TestHTTPIdleKeepAliveDoesNotReset(t *testing.T) {
 	defer h.close()
 
 	// First client: connects, sends nothing at all.
-	idleFS := newFakeSession()
+	idleFS := netstacktest.NewFakeSession()
 	if err := h.stack.Attach(idleFS, net.IPv4(10, 8, 0, 200)); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}

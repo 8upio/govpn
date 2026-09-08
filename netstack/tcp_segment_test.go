@@ -4,6 +4,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/8upio/govpn/netstack/netstacktest"
 )
 
 func testClientAddr() net.IP { return net.IPv4(10, 8, 0, 2).To4() }
@@ -14,8 +16,8 @@ func testClientAddr() net.IP { return net.IPv4(10, 8, 0, 2).To4() }
 // option (header length 24, not 20); the checksum re-verified over the
 // pseudo-header folds to zero.
 func TestTCPSegmentRoundTrip(t *testing.T) {
-	src := mustAddr(testClientAddr())
-	dst := mustAddr(testServerIP())
+	src := netstacktest.MustAddr(testClientAddr())
+	dst := netstacktest.MustAddr(testServerIP())
 
 	seg := tcpSegment{
 		srcPort: 12345,
@@ -69,8 +71,8 @@ func TestTCPSegmentRoundTrip(t *testing.T) {
 // buffer, and an options region truncated mid-option, all return a typed
 // error and never panic.
 func TestTCPParseNeverPanics(t *testing.T) {
-	src := mustAddr(testClientAddr())
-	dst := mustAddr(testServerIP())
+	src := netstacktest.MustAddr(testClientAddr())
+	dst := netstacktest.MustAddr(testServerIP())
 	full := buildTCP(nil, tcpSegment{srcPort: 1, dstPort: 2, flags: flagACK, window: 100}, src, dst)
 
 	for n := 0; n < tcpHeaderMinLen; n++ {
@@ -149,7 +151,7 @@ func TestTCPMSSOption(t *testing.T) {
 			}
 			defer ln.Close()
 
-			fs := newFakeSession()
+			fs := netstacktest.NewFakeSession()
 			if err := stack.Attach(fs, testClientAddr()); err != nil {
 				t.Fatalf("Attach: %v", err)
 			}

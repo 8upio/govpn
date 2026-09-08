@@ -7,6 +7,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/8upio/govpn/netstack/netstacktest"
 )
 
 // TestParseIPv4NeverPanics drives parseIPv4 with every truncation of a
@@ -19,7 +21,7 @@ func TestParseIPv4NeverPanics(t *testing.T) {
 	// A 20-byte payload keeps the full valid packet at 48 bytes, so every
 	// prefix length in [0,40] below is a genuine truncation (never the
 	// full, successfully-parseable packet).
-	valid := buildICMPEchoRequest(mustAddr(clientIP), mustAddr(serverIP), 1, 1, make([]byte, 20))
+	valid := netstacktest.BuildICMPEchoRequest(netstacktest.MustAddr(clientIP), netstacktest.MustAddr(serverIP), 1, 1, make([]byte, 20))
 	if len(valid) < 48 {
 		t.Fatalf("test fixture too short: len(valid) = %d, want >= 48", len(valid))
 	}
@@ -104,11 +106,11 @@ func TestIPOptionsAreSkippedNotRejected(t *testing.T) {
 
 	stack := newTestStack(t)
 	defer stack.Close()
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs, clientIP); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
-	fs.inbound <- pkt
+	fs.Inject(pkt)
 
 	reply := waitForOutbound(t, fs, time.Second)
 	replyHdr, err := parseIPv4(reply)
@@ -145,8 +147,8 @@ func TestInternetChecksumRFC1071(t *testing.T) {
 // (src, dst, zero, protocol, length) against a hand-derived literal — a
 // transposed src/dst or a missing zero byte would fail this.
 func TestPseudoHeaderSumLayout(t *testing.T) {
-	src := mustAddr(net.IPv4(10, 8, 0, 1).To4())
-	dst := mustAddr(net.IPv4(10, 8, 0, 2).To4())
+	src := netstacktest.MustAddr(net.IPv4(10, 8, 0, 1).To4())
+	dst := netstacktest.MustAddr(net.IPv4(10, 8, 0, 2).To4())
 
 	// (0x0A08 + 0x0001) + (0x0A08 + 0x0002) + 0x11 (protocol 17) + 0x10
 	// (length 16) = 0x1434.
@@ -163,8 +165,8 @@ func TestPseudoHeaderSumLayout(t *testing.T) {
 // and MF it carries plus an offset scaled from the on-wire 8-byte units
 // into BYTES, which is the unit every call site in this package uses.
 func TestParseIPv4FragmentFields(t *testing.T) {
-	client := mustAddr(net.IPv4(10, 8, 0, 2).To4())
-	server := mustAddr(net.IPv4(10, 8, 0, 1).To4())
+	client := netstacktest.MustAddr(net.IPv4(10, 8, 0, 2).To4())
+	server := netstacktest.MustAddr(net.IPv4(10, 8, 0, 1).To4())
 
 	whole := buildIPv4(nil, client, server, protocolUDP, make([]byte, 16))
 	hdr, err := parseIPv4(whole)
@@ -180,7 +182,7 @@ func TestParseIPv4FragmentFields(t *testing.T) {
 
 	// On the wire the offset field holds 1480/8 = 185; parseIPv4 must
 	// report it back in bytes.
-	frag := buildFragmentForTest(client, server, protocolUDP, 0xBEEF, 1480, true, make([]byte, 16))
+	frag := netstacktest.BuildFragment(client, server, protocolUDP, 0xBEEF, 1480, true, make([]byte, 16))
 	hdr, err = parseIPv4(frag)
 	if err != nil {
 		t.Fatalf("parseIPv4(fragment): %v", err)
@@ -199,7 +201,7 @@ func TestParseIPv4FragmentFields(t *testing.T) {
 	}
 
 	// A final fragment (MF clear, non-zero offset) is still a fragment.
-	last := buildFragmentForTest(client, server, protocolUDP, 0xBEEF, 2960, false, make([]byte, 5))
+	last := netstacktest.BuildFragment(client, server, protocolUDP, 0xBEEF, 2960, false, make([]byte, 5))
 	hdr, err = parseIPv4(last)
 	if err != nil {
 		t.Fatalf("parseIPv4(final fragment): %v", err)
@@ -215,8 +217,8 @@ func TestParseIPv4FragmentFields(t *testing.T) {
 // multiple of 8, and no fragment claims bytes past the 65535 a Total
 // Length field can address.
 func TestParseIPv4RejectsBadFragmentGeometry(t *testing.T) {
-	client := mustAddr(net.IPv4(10, 8, 0, 2).To4())
-	server := mustAddr(net.IPv4(10, 8, 0, 1).To4())
+	client := netstacktest.MustAddr(net.IPv4(10, 8, 0, 2).To4())
+	server := netstacktest.MustAddr(net.IPv4(10, 8, 0, 1).To4())
 
 	tests := []struct {
 		name        string
@@ -234,7 +236,7 @@ func TestParseIPv4RejectsBadFragmentGeometry(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			pkt := buildFragmentForTest(client, server, protocolUDP, 1, tt.offsetBytes, tt.mf, make([]byte, tt.payloadLen))
+			pkt := netstacktest.BuildFragment(client, server, protocolUDP, 1, tt.offsetBytes, tt.mf, make([]byte, tt.payloadLen))
 			if _, err := parseIPv4(pkt); !errors.Is(err, errBadFragment) {
 				t.Fatalf("parseIPv4 = %v, want errBadFragment", err)
 			}
@@ -249,8 +251,8 @@ func TestParseIPv4RejectsBadFragmentGeometry(t *testing.T) {
 // may legitimately SUCCEED (a valid fragment is no longer an error); only a
 // panic fails the test.
 func TestParseIPv4FragmentWordsNeverPanic(t *testing.T) {
-	client := mustAddr(net.IPv4(10, 8, 0, 2).To4())
-	server := mustAddr(net.IPv4(10, 8, 0, 1).To4())
+	client := netstacktest.MustAddr(net.IPv4(10, 8, 0, 2).To4())
+	server := netstacktest.MustAddr(net.IPv4(10, 8, 0, 1).To4())
 	valid := buildIPv4(nil, client, server, protocolUDP, make([]byte, 24))
 
 	for _, word := range []uint16{
@@ -296,8 +298,8 @@ func mustNotPanicParseAny(t *testing.T, pkt []byte) {
 // closes the loop by feeding all three back through a reassembler and
 // recovering the original payload byte-for-byte.
 func TestFragmentIPv4(t *testing.T) {
-	server := mustAddr(net.IPv4(10, 8, 0, 1).To4())
-	client := mustAddr(net.IPv4(10, 8, 0, 2).To4())
+	server := netstacktest.MustAddr(net.IPv4(10, 8, 0, 1).To4())
+	client := netstacktest.MustAddr(net.IPv4(10, 8, 0, 2).To4())
 
 	payload := make([]byte, 4000-minIPv4HeaderLen)
 	for i := range payload {

@@ -5,21 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"net/netip"
 	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-)
 
-// buildUDPIPv4 builds a complete, checksummed IPv4+UDP datagram from src to
-// dst with the given ports and payload — mirrors fakesession_test.go's
-// buildICMPEchoRequest, so tests read as intent, not hand-assembled bytes.
-func buildUDPIPv4(src, dst netip.Addr, srcPort, dstPort uint16, payload []byte) []byte {
-	udpSegment := buildUDP(nil, src, dst, srcPort, dstPort, payload)
-	return buildIPv4(nil, src, dst, protocolUDP, udpSegment)
-}
+	"github.com/8upio/govpn/netstack/netstacktest"
+)
 
 // TestUDPRoundTrip is Task 1's tracer slice: a datagram from an attached
 // fake session reaches ListenUDP's conn, and a reply written back through
@@ -29,7 +22,7 @@ func TestUDPRoundTrip(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	clientIP := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, clientIP); err != nil {
 		t.Fatalf("Attach: %v", err)
@@ -42,8 +35,8 @@ func TestUDPRoundTrip(t *testing.T) {
 	defer conn.Close()
 
 	payload := []byte("hello from client")
-	pkt := buildUDPIPv4(mustAddr(clientIP), mustAddr(testServerIP()), 5000, 9999, payload)
-	fs.inbound <- pkt
+	pkt := netstacktest.BuildUDP(netstacktest.MustAddr(clientIP), netstacktest.MustAddr(testServerIP()), 5000, 9999, payload)
+	fs.Inject(pkt)
 
 	buf := make([]byte, 2048)
 	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
@@ -74,10 +67,10 @@ func TestUDPRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseIPv4(reply): %v", err)
 	}
-	if hdr.src != mustAddr(testServerIP()) {
+	if hdr.src != netstacktest.MustAddr(testServerIP()) {
 		t.Errorf("reply IPv4 source = %v, want server IP", hdr.src)
 	}
-	if hdr.dst != mustAddr(clientIP) {
+	if hdr.dst != netstacktest.MustAddr(clientIP) {
 		t.Errorf("reply IPv4 destination = %v, want client IP", hdr.dst)
 	}
 	if hdr.protocol != protocolUDP {
@@ -107,7 +100,7 @@ func TestUDPConnSatisfiesPacketConn(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	clientIP := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, clientIP); err != nil {
 		t.Fatalf("Attach: %v", err)
@@ -123,11 +116,11 @@ func TestUDPConnSatisfiesPacketConn(t *testing.T) {
 
 // roundTripThroughPacketConn's parameter type is net.PacketConn, not
 // *udpConn — this is the whole point of the test above.
-func roundTripThroughPacketConn(t *testing.T, pc net.PacketConn, fs *fakeSession, clientIP net.IP) {
+func roundTripThroughPacketConn(t *testing.T, pc net.PacketConn, fs *netstacktest.FakeSession, clientIP net.IP) {
 	t.Helper()
 	payload := []byte("via net.PacketConn")
-	pkt := buildUDPIPv4(mustAddr(clientIP), mustAddr(testServerIP()), 4000, 9998, payload)
-	fs.inbound <- pkt
+	pkt := netstacktest.BuildUDP(netstacktest.MustAddr(clientIP), netstacktest.MustAddr(testServerIP()), 4000, 9998, payload)
+	fs.Inject(pkt)
 
 	buf := make([]byte, 2048)
 	if err := pc.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
@@ -151,8 +144,8 @@ func roundTripThroughPacketConn(t *testing.T, pc net.PacketConn, fs *fakeSession
 // against a literal expected value for one fixed datagram, so a
 // transposed src/dst or a missing zero byte in the pseudo-header fails.
 func TestUDPChecksumIsPseudoHeaderCorrect(t *testing.T) {
-	src := mustAddr(net.IPv4(10, 8, 0, 1).To4())
-	dst := mustAddr(net.IPv4(10, 8, 0, 2).To4())
+	src := netstacktest.MustAddr(net.IPv4(10, 8, 0, 1).To4())
+	dst := netstacktest.MustAddr(net.IPv4(10, 8, 0, 2).To4())
 	payload := []byte("fixed datagram payload")
 
 	datagram := buildUDP(nil, src, dst, 1234, 5678, payload)
@@ -178,8 +171,8 @@ func TestUDPChecksumIsPseudoHeaderCorrect(t *testing.T) {
 // raw computed checksum is 0x0000 and asserts buildUDP transmits 0xFFFF
 // instead (RFC 768).
 func TestUDPComputedZeroChecksumTransmittedAsAllOnes(t *testing.T) {
-	src := mustAddr(net.IPv4(10, 8, 0, 1).To4())
-	dst := mustAddr(net.IPv4(10, 8, 0, 2).To4())
+	src := netstacktest.MustAddr(net.IPv4(10, 8, 0, 1).To4())
+	dst := netstacktest.MustAddr(net.IPv4(10, 8, 0, 2).To4())
 	payload := []byte{0xDE, 0xC2} // chosen so the raw computed checksum is 0
 
 	datagram := buildUDP(nil, src, dst, 1111, 2222, payload)
@@ -195,7 +188,7 @@ func TestUDPInboundZeroChecksumAccepted(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	clientIP := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, clientIP); err != nil {
 		t.Fatalf("Attach: %v", err)
@@ -207,7 +200,7 @@ func TestUDPInboundZeroChecksumAccepted(t *testing.T) {
 	defer conn.Close()
 
 	payload := []byte("no checksum here")
-	pkt := buildUDPIPv4(mustAddr(clientIP), mustAddr(testServerIP()), 4321, 7000, payload)
+	pkt := netstacktest.BuildUDP(netstacktest.MustAddr(clientIP), netstacktest.MustAddr(testServerIP()), 4321, 7000, payload)
 	hdr, err := parseIPv4(pkt)
 	if err != nil {
 		t.Fatalf("parseIPv4: %v", err)
@@ -217,7 +210,7 @@ func TestUDPInboundZeroChecksumAccepted(t *testing.T) {
 	// must be accepted without verification.
 	pkt[hdr.payloadOff+6] = 0
 	pkt[hdr.payloadOff+7] = 0
-	fs.inbound <- pkt
+	fs.Inject(pkt)
 
 	buf := make([]byte, 2048)
 	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
@@ -234,7 +227,7 @@ func TestUDPInboundZeroChecksumAccepted(t *testing.T) {
 	demux := stack.udpHandler.(*udpDemux)
 	before := demux.badChecksumDropped.Load()
 
-	pkt2 := buildUDPIPv4(mustAddr(clientIP), mustAddr(testServerIP()), 4321, 7000, payload)
+	pkt2 := netstacktest.BuildUDP(netstacktest.MustAddr(clientIP), netstacktest.MustAddr(testServerIP()), 4321, 7000, payload)
 	hdr2, err := parseIPv4(pkt2)
 	if err != nil {
 		t.Fatalf("parseIPv4: %v", err)
@@ -242,7 +235,7 @@ func TestUDPInboundZeroChecksumAccepted(t *testing.T) {
 	// A non-zero, wrong checksum.
 	pkt2[hdr2.payloadOff+6] = 0x12
 	pkt2[hdr2.payloadOff+7] = 0x34
-	fs.inbound <- pkt2
+	fs.Inject(pkt2)
 
 	if err := conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
 		t.Fatalf("SetReadDeadline: %v", err)
@@ -284,7 +277,7 @@ func TestUDPLocalAddr(t *testing.T) {
 // valid datagram, a too-small length field, and an oversized length field —
 // all must return a typed error and never panic.
 func TestUDPParseNeverPanics(t *testing.T) {
-	full := buildUDP(nil, mustAddr(net.IPv4(10, 8, 0, 1).To4()), mustAddr(net.IPv4(10, 8, 0, 2).To4()), 1000, 2000, []byte("payload data"))
+	full := buildUDP(nil, netstacktest.MustAddr(net.IPv4(10, 8, 0, 1).To4()), netstacktest.MustAddr(net.IPv4(10, 8, 0, 2).To4()), 1000, 2000, []byte("payload data"))
 
 	for i := 0; i <= 7; i++ {
 		prefix := full[:i]
@@ -320,7 +313,7 @@ func TestUDPArbitraryRuntimePorts(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	clientIP := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, clientIP); err != nil {
 		t.Fatalf("Attach: %v", err)
@@ -340,8 +333,8 @@ func TestUDPArbitraryRuntimePorts(t *testing.T) {
 	buf := make([]byte, 2048)
 	for _, p := range ports {
 		payload := []byte(fmt.Sprintf("to port %d", p))
-		pkt := buildUDPIPv4(mustAddr(clientIP), mustAddr(testServerIP()), 9000, p, payload)
-		fs.inbound <- pkt
+		pkt := netstacktest.BuildUDP(netstacktest.MustAddr(clientIP), netstacktest.MustAddr(testServerIP()), 9000, p, payload)
+		fs.Inject(pkt)
 
 		if err := conns[p].SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 			t.Fatalf("SetReadDeadline: %v", err)
@@ -375,7 +368,7 @@ func TestUDPPortInUse(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	clientIP := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, clientIP); err != nil {
 		t.Fatalf("Attach: %v", err)
@@ -391,8 +384,8 @@ func TestUDPPortInUse(t *testing.T) {
 	}
 
 	payload := []byte("still alive")
-	pkt := buildUDPIPv4(mustAddr(clientIP), mustAddr(testServerIP()), 1000, 4444, payload)
-	fs.inbound <- pkt
+	pkt := netstacktest.BuildUDP(netstacktest.MustAddr(clientIP), netstacktest.MustAddr(testServerIP()), 1000, 4444, payload)
+	fs.Inject(pkt)
 	buf := make([]byte, 2048)
 	if err := conn1.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatalf("SetReadDeadline: %v", err)
@@ -415,8 +408,8 @@ func TestUDPPortInUse(t *testing.T) {
 	}
 	defer conn2.Close()
 
-	pkt2 := buildUDPIPv4(mustAddr(clientIP), mustAddr(testServerIP()), 1001, 4444, payload)
-	fs.inbound <- pkt2
+	pkt2 := netstacktest.BuildUDP(netstacktest.MustAddr(clientIP), netstacktest.MustAddr(testServerIP()), 1001, 4444, payload)
+	fs.Inject(pkt2)
 	if err := conn2.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatalf("SetReadDeadline: %v", err)
 	}
@@ -444,7 +437,7 @@ func TestUDPNoListenerDropped(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	clientIP := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, clientIP); err != nil {
 		t.Fatalf("Attach: %v", err)
@@ -459,8 +452,8 @@ func TestUDPNoListenerDropped(t *testing.T) {
 	demux := stack.udpHandler.(*udpDemux)
 	before := demux.noListenerDropped.Load()
 
-	pkt := buildUDPIPv4(mustAddr(clientIP), mustAddr(testServerIP()), 1000, 9, []byte("nobody home"))
-	fs.inbound <- pkt
+	pkt := netstacktest.BuildUDP(netstacktest.MustAddr(clientIP), netstacktest.MustAddr(testServerIP()), 1000, 9, []byte("nobody home"))
+	fs.Inject(pkt)
 	assertNoOutbound(t, fs, 50*time.Millisecond)
 
 	if after := demux.noListenerDropped.Load(); after != before+1 {
@@ -474,9 +467,9 @@ func TestUDPMultiSessionRouting(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
-	fsA := newFakeSession()
-	fsB := newFakeSession()
-	fsC := newFakeSession()
+	fsA := netstacktest.NewFakeSession()
+	fsB := netstacktest.NewFakeSession()
+	fsC := netstacktest.NewFakeSession()
 	ipA := net.IPv4(10, 8, 0, 2).To4()
 	ipB := net.IPv4(10, 8, 0, 3).To4()
 	ipC := net.IPv4(10, 8, 0, 4).To4()
@@ -497,7 +490,7 @@ func TestUDPMultiSessionRouting(t *testing.T) {
 	defer conn.Close()
 
 	sessions := []struct {
-		fs   *fakeSession
+		fs   *netstacktest.FakeSession
 		ip   net.IP
 		port uint16
 	}{
@@ -509,8 +502,8 @@ func TestUDPMultiSessionRouting(t *testing.T) {
 	buf := make([]byte, 2048)
 	for _, s := range sessions {
 		payload := []byte(fmt.Sprintf("from %s", s.ip))
-		pkt := buildUDPIPv4(mustAddr(s.ip), mustAddr(testServerIP()), s.port, 6000, payload)
-		s.fs.inbound <- pkt
+		pkt := netstacktest.BuildUDP(netstacktest.MustAddr(s.ip), netstacktest.MustAddr(testServerIP()), s.port, 6000, payload)
+		s.fs.Inject(pkt)
 
 		if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 			t.Fatalf("SetReadDeadline: %v", err)
@@ -536,8 +529,8 @@ func TestUDPMultiSessionRouting(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parseIPv4: %v", err)
 		}
-		if hdr.dst != mustAddr(s.ip) {
-			t.Fatalf("reply destination = %v, want %v", hdr.dst, mustAddr(s.ip))
+		if hdr.dst != netstacktest.MustAddr(s.ip) {
+			t.Fatalf("reply destination = %v, want %v", hdr.dst, netstacktest.MustAddr(s.ip))
 		}
 
 		for _, other := range sessions {
@@ -569,7 +562,7 @@ func TestUDPWriteAfterDetach(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	ip := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, ip); err != nil {
 		t.Fatalf("Attach: %v", err)
@@ -590,8 +583,8 @@ func TestUDPWriteAfterDetach(t *testing.T) {
 		t.Fatalf("WriteTo(detached) = %v, want ErrUDPNoRoute", err)
 	}
 
-	pkt := buildUDPIPv4(mustAddr(ip), mustAddr(testServerIP()), 4000, 8888, []byte("post-detach"))
-	fs.inbound <- pkt
+	pkt := netstacktest.BuildUDP(netstacktest.MustAddr(ip), netstacktest.MustAddr(testServerIP()), 4000, 8888, []byte("post-detach"))
+	fs.Inject(pkt)
 	if err := conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
 		t.Fatalf("SetReadDeadline: %v", err)
 	}
@@ -608,7 +601,7 @@ func TestUDPSpoofedSourceNotDelivered(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	ip := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, ip); err != nil {
 		t.Fatalf("Attach: %v", err)
@@ -621,8 +614,8 @@ func TestUDPSpoofedSourceNotDelivered(t *testing.T) {
 	defer conn.Close()
 
 	otherIP := net.IPv4(10, 8, 0, 3).To4()
-	pkt := buildUDPIPv4(mustAddr(otherIP), mustAddr(testServerIP()), 1000, 5555, []byte("spoofed"))
-	fs.inbound <- pkt
+	pkt := netstacktest.BuildUDP(netstacktest.MustAddr(otherIP), netstacktest.MustAddr(testServerIP()), 1000, 5555, []byte("spoofed"))
+	fs.Inject(pkt)
 
 	if err := conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
 		t.Fatalf("SetReadDeadline: %v", err)
@@ -645,7 +638,7 @@ func TestUDPQueueOverflowDropsNewest(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	ip := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, ip); err != nil {
 		t.Fatalf("Attach: %v", err)
@@ -660,12 +653,12 @@ func TestUDPQueueOverflowDropsNewest(t *testing.T) {
 	total := udpQueueDepth + 20
 	for i := 0; i < total; i++ {
 		payload := []byte{byte(i)}
-		pkt := buildUDPIPv4(mustAddr(ip), mustAddr(testServerIP()), uint16(2000+i), 9090, payload)
-		fs.inbound <- pkt
+		pkt := netstacktest.BuildUDP(netstacktest.MustAddr(ip), netstacktest.MustAddr(testServerIP()), uint16(2000+i), 9090, payload)
+		fs.Inject(pkt)
 	}
 
-	req := buildICMPEchoRequest(mustAddr(ip), mustAddr(testServerIP()), 1, 1, []byte("still alive"))
-	fs.inbound <- req
+	req := netstacktest.BuildICMPEchoRequest(netstacktest.MustAddr(ip), netstacktest.MustAddr(testServerIP()), 1, 1, []byte("still alive"))
+	fs.Inject(req)
 	waitForOutbound(t, fs, time.Second)
 
 	buf := make([]byte, 2048)
@@ -720,7 +713,7 @@ func TestUDPDeadlineInThePast(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	ip := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, ip); err != nil {
 		t.Fatalf("Attach: %v", err)
@@ -732,8 +725,8 @@ func TestUDPDeadlineInThePast(t *testing.T) {
 	}
 	defer conn.Close()
 
-	pkt := buildUDPIPv4(mustAddr(ip), mustAddr(testServerIP()), 3000, 10002, []byte("queued"))
-	fs.inbound <- pkt
+	pkt := netstacktest.BuildUDP(netstacktest.MustAddr(ip), netstacktest.MustAddr(testServerIP()), 3000, 10002, []byte("queued"))
+	fs.Inject(pkt)
 	time.Sleep(20 * time.Millisecond)
 
 	if err := conn.SetReadDeadline(time.Now().Add(-time.Second)); err != nil {
@@ -760,7 +753,7 @@ func TestUDPDeadlineCleared(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	ip := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, ip); err != nil {
 		t.Fatalf("Attach: %v", err)
@@ -784,8 +777,8 @@ func TestUDPDeadlineCleared(t *testing.T) {
 		t.Fatalf("SetReadDeadline(zero): %v", err)
 	}
 
-	pkt := buildUDPIPv4(mustAddr(ip), mustAddr(testServerIP()), 3001, 10003, []byte("after clear"))
-	fs.inbound <- pkt
+	pkt := netstacktest.BuildUDP(netstacktest.MustAddr(ip), netstacktest.MustAddr(testServerIP()), 3001, 10003, []byte("after clear"))
+	fs.Inject(pkt)
 
 	done := make(chan struct{})
 	go func() {
@@ -840,7 +833,7 @@ func TestUDPWriteDeadline(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	ip := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, ip); err != nil {
 		t.Fatalf("Attach: %v", err)
@@ -912,7 +905,7 @@ func TestUDPConcurrentReadFromAndWriteTo(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	clientIP := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, clientIP); err != nil {
 		t.Fatalf("Attach: %v", err)
@@ -929,7 +922,7 @@ func TestUDPConcurrentReadFromAndWriteTo(t *testing.T) {
 	// Drain the fake session's outbound channel continuously so the 8
 	// WriteTo goroutines below never block on it.
 	go func() {
-		for range fs.outbound {
+		for range fs.Outbound() {
 		}
 	}()
 
@@ -938,8 +931,8 @@ func TestUDPConcurrentReadFromAndWriteTo(t *testing.T) {
 	go func() {
 		for i := 0; i < iterations; i++ {
 			payload := []byte{byte(i)}
-			pkt := buildUDPIPv4(mustAddr(clientIP), mustAddr(testServerIP()), uint16(20000+i), 10007, payload)
-			fs.inbound <- pkt
+			pkt := netstacktest.BuildUDP(netstacktest.MustAddr(clientIP), netstacktest.MustAddr(testServerIP()), uint16(20000+i), 10007, payload)
+			fs.Inject(pkt)
 		}
 	}()
 
@@ -1021,7 +1014,7 @@ func TestUDPDropOldestKeepsNewest(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	ip := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, ip); err != nil {
 		t.Fatalf("Attach: %v", err)
@@ -1035,15 +1028,15 @@ func TestUDPDropOldestKeepsNewest(t *testing.T) {
 
 	for i := 0; i < 4; i++ {
 		payload := []byte{byte(i)}
-		pkt := buildUDPIPv4(mustAddr(ip), mustAddr(testServerIP()), uint16(3000+i), 9210, payload)
-		fs.inbound <- pkt
+		pkt := netstacktest.BuildUDP(netstacktest.MustAddr(ip), netstacktest.MustAddr(testServerIP()), uint16(3000+i), 9210, payload)
+		fs.Inject(pkt)
 	}
 
-	// Barrier: the stack's single read loop processes fs.inbound strictly
+	// Barrier: the stack's single read loop processes fs.Inject-ed packets strictly
 	// in order, so waiting for this ICMP reply proves every UDP datagram
 	// sent above has already been offered to the demux.
-	req := buildICMPEchoRequest(mustAddr(ip), mustAddr(testServerIP()), 1, 1, []byte("still alive"))
-	fs.inbound <- req
+	req := netstacktest.BuildICMPEchoRequest(netstacktest.MustAddr(ip), netstacktest.MustAddr(testServerIP()), 1, 1, []byte("still alive"))
+	fs.Inject(req)
 	waitForOutbound(t, fs, time.Second)
 
 	buf := make([]byte, 2048)
@@ -1080,7 +1073,7 @@ func TestUDPDropNewestKeepsOldestUnchanged(t *testing.T) {
 			stack := newTestStack(t)
 			defer stack.Close()
 
-			fs := newFakeSession()
+			fs := netstacktest.NewFakeSession()
 			ip := net.IPv4(10, 8, 0, 2).To4()
 			if err := stack.Attach(fs, ip); err != nil {
 				t.Fatalf("Attach: %v", err)
@@ -1094,12 +1087,12 @@ func TestUDPDropNewestKeepsOldestUnchanged(t *testing.T) {
 
 			for i := 0; i < 4; i++ {
 				payload := []byte{byte(i)}
-				pkt := buildUDPIPv4(mustAddr(ip), mustAddr(testServerIP()), uint16(3100+i), 9211, payload)
-				fs.inbound <- pkt
+				pkt := netstacktest.BuildUDP(netstacktest.MustAddr(ip), netstacktest.MustAddr(testServerIP()), uint16(3100+i), 9211, payload)
+				fs.Inject(pkt)
 			}
 
-			req := buildICMPEchoRequest(mustAddr(ip), mustAddr(testServerIP()), 1, 1, []byte("still alive"))
-			fs.inbound <- req
+			req := netstacktest.BuildICMPEchoRequest(netstacktest.MustAddr(ip), netstacktest.MustAddr(testServerIP()), 1, 1, []byte("still alive"))
+			fs.Inject(req)
 			waitForOutbound(t, fs, time.Second)
 
 			buf := make([]byte, 2048)
@@ -1133,7 +1126,7 @@ func TestUDPStatsQueueFullCountsBothPolicies(t *testing.T) {
 			stack := newTestStack(t)
 			defer stack.Close()
 
-			fs := newFakeSession()
+			fs := netstacktest.NewFakeSession()
 			ip := net.IPv4(10, 8, 0, 2).To4()
 			if err := stack.Attach(fs, ip); err != nil {
 				t.Fatalf("Attach: %v", err)
@@ -1147,12 +1140,12 @@ func TestUDPStatsQueueFullCountsBothPolicies(t *testing.T) {
 
 			for i := 0; i < 5; i++ {
 				payload := []byte{byte(i)}
-				pkt := buildUDPIPv4(mustAddr(ip), mustAddr(testServerIP()), uint16(3200+i), 9220, payload)
-				fs.inbound <- pkt
+				pkt := netstacktest.BuildUDP(netstacktest.MustAddr(ip), netstacktest.MustAddr(testServerIP()), uint16(3200+i), 9220, payload)
+				fs.Inject(pkt)
 			}
 
-			req := buildICMPEchoRequest(mustAddr(ip), mustAddr(testServerIP()), 1, 1, []byte("still alive"))
-			fs.inbound <- req
+			req := netstacktest.BuildICMPEchoRequest(netstacktest.MustAddr(ip), netstacktest.MustAddr(testServerIP()), 1, 1, []byte("still alive"))
+			fs.Inject(req)
 			waitForOutbound(t, fs, time.Second)
 
 			if got := stack.UDPStats().QueueFullDropped; got != 3 {
@@ -1168,7 +1161,7 @@ func TestUDPStatsMirrorsInternalCounters(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	ip := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, ip); err != nil {
 		t.Fatalf("Attach: %v", err)
@@ -1181,12 +1174,12 @@ func TestUDPStatsMirrorsInternalCounters(t *testing.T) {
 	defer dummy.Close()
 
 	// No listener on port 9.
-	pkt := buildUDPIPv4(mustAddr(ip), mustAddr(testServerIP()), 1000, 9, []byte("nobody home"))
-	fs.inbound <- pkt
+	pkt := netstacktest.BuildUDP(netstacktest.MustAddr(ip), netstacktest.MustAddr(testServerIP()), 1000, 9, []byte("nobody home"))
+	fs.Inject(pkt)
 
 	// Bad checksum: build a valid datagram then corrupt its UDP checksum
 	// field in place.
-	bad := buildUDPIPv4(mustAddr(ip), mustAddr(testServerIP()), 1001, 1, []byte("corrupt"))
+	bad := netstacktest.BuildUDP(netstacktest.MustAddr(ip), netstacktest.MustAddr(testServerIP()), 1001, 1, []byte("corrupt"))
 	hdr, err := parseIPv4(bad)
 	if err != nil {
 		t.Fatalf("parseIPv4(test fixture): %v", err)
@@ -1199,10 +1192,10 @@ func TestUDPStatsMirrorsInternalCounters(t *testing.T) {
 	if bad[udpStart+6] == orig0 && bad[udpStart+7] == orig1 {
 		bad[udpStart+6], bad[udpStart+7] = 0x12, 0x34
 	}
-	fs.inbound <- bad
+	fs.Inject(bad)
 
-	req := buildICMPEchoRequest(mustAddr(ip), mustAddr(testServerIP()), 1, 1, []byte("still alive"))
-	fs.inbound <- req
+	req := netstacktest.BuildICMPEchoRequest(netstacktest.MustAddr(ip), netstacktest.MustAddr(testServerIP()), 1, 1, []byte("still alive"))
+	fs.Inject(req)
 	waitForOutbound(t, fs, time.Second)
 
 	demux := stack.udpHandler.(*udpDemux)

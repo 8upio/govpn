@@ -1,5 +1,5 @@
 // tcpclient_test.go is the test-only minimal TCP client (D-12) that makes
-// this whole plan testable without Docker: it wraps a fakeSession plus a
+// this whole plan testable without Docker: it wraps a netstacktest.FakeSession plus a
 // client IP/port, drives a handshake, a data stream, and a close sequence
 // against a Stack's ListenTCP, and exposes raw escape hatches
 // (sendRaw/recvRaw) for hand-crafting adversarial or intentionally
@@ -14,14 +14,16 @@ import (
 	"net/netip"
 	"testing"
 	"time"
+
+	"github.com/8upio/govpn/netstack/netstacktest"
 )
 
 // tcpTestClient is the fast tier's stand-in for a real OpenVPN client's TCP
-// stack, driving a fakeSession with hand-built segments.
+// stack, driving a netstacktest.FakeSession with hand-built segments.
 type tcpTestClient struct {
 	t *testing.T
 
-	fs *fakeSession
+	fs *netstacktest.FakeSession
 
 	localIP    netip.Addr
 	localPort  uint16
@@ -40,14 +42,14 @@ type tcpTestClient struct {
 // (tcp_conn.go's randomISN), so a fixed value keeps test assertions
 // readable; TestTCPISNIsRandom exercises the real production path
 // directly, never through this client.
-func newTCPTestClient(t *testing.T, fs *fakeSession, clientIP net.IP, clientPort uint16, serverIP net.IP, serverPort uint16) *tcpTestClient {
+func newTCPTestClient(t *testing.T, fs *netstacktest.FakeSession, clientIP net.IP, clientPort uint16, serverIP net.IP, serverPort uint16) *tcpTestClient {
 	t.Helper()
 	return &tcpTestClient{
 		t:          t,
 		fs:         fs,
-		localIP:    mustAddr(clientIP),
+		localIP:    netstacktest.MustAddr(clientIP),
 		localPort:  clientPort,
-		remoteIP:   mustAddr(serverIP),
+		remoteIP:   netstacktest.MustAddr(serverIP),
 		remotePort: serverPort,
 		isn:        1000,
 	}
@@ -58,7 +60,7 @@ func newTCPTestClient(t *testing.T, fs *fakeSession, clientIP net.IP, clientPort
 func (c *tcpTestClient) sendRaw(seg tcpSegment) {
 	tcpBytes := buildTCP(nil, seg, c.localIP, c.remoteIP)
 	pkt := buildIPv4(nil, c.localIP, c.remoteIP, protocolTCP, tcpBytes)
-	c.fs.inbound <- pkt
+	c.fs.Inject(pkt)
 }
 
 // recvRaw reads the next outbound packet the stack wrote to this client's
@@ -67,7 +69,7 @@ func (c *tcpTestClient) sendRaw(seg tcpSegment) {
 func (c *tcpTestClient) recvRaw(timeout time.Duration) tcpSegment {
 	c.t.Helper()
 	select {
-	case pkt := <-c.fs.outbound:
+	case pkt := <-c.fs.Outbound():
 		hdr, err := parseIPv4(pkt)
 		if err != nil {
 			c.t.Fatalf("recvRaw: parseIPv4: %v", err)
@@ -88,7 +90,7 @@ func (c *tcpTestClient) recvRaw(timeout time.Duration) tcpSegment {
 // of a segment.
 func (c *tcpTestClient) tryRecvRaw(timeout time.Duration) (tcpSegment, bool) {
 	select {
-	case pkt := <-c.fs.outbound:
+	case pkt := <-c.fs.Outbound():
 		hdr, err := parseIPv4(pkt)
 		if err != nil {
 			return tcpSegment{}, false

@@ -5,6 +5,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/8upio/govpn/netstack/netstacktest"
 )
 
 // demuxOf returns stack's TCP demux, failing the test if ListenTCP has
@@ -34,12 +36,12 @@ func connOf(t *testing.T, d *tcpDemux, key fourTuple) *tcpConn {
 	return c
 }
 
-// drainOutbound reads and discards exactly n packets from fs.outbound,
+// drainOutbound reads and discards exactly n packets from fs.Outbound(),
 // failing the test if fewer than n arrive within timeout — used where
-// several connections share one fakeSession and this test only cares
+// several connections share one FakeSession and this test only cares
 // about the count (e.g. one RST per aborted backlog/half-open connection),
 // not which connection produced which packet.
-func drainOutbound(t *testing.T, fs *fakeSession, n int, timeout time.Duration) {
+func drainOutbound(t *testing.T, fs *netstacktest.FakeSession, n int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for i := 0; i < n; i++ {
@@ -48,7 +50,7 @@ func drainOutbound(t *testing.T, fs *fakeSession, n int, timeout time.Duration) 
 			t.Fatalf("drainOutbound: only drained %d/%d packets before timing out", i, n)
 		}
 		select {
-		case <-fs.outbound:
+		case <-fs.Outbound():
 		case <-time.After(remaining):
 			t.Fatalf("drainOutbound: only drained %d/%d packets before timing out", i, n)
 		}
@@ -70,7 +72,7 @@ func TestTCPRSTForClosedPort(t *testing.T) {
 	}
 	defer ln.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs, testClientAddr()); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -110,7 +112,7 @@ func TestTCPRSTForUnknownConnection(t *testing.T) {
 	}
 	defer ln.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs, testClientAddr()); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -141,7 +143,7 @@ func TestTCPRSTClosesConnection(t *testing.T) {
 		t.Fatalf("ListenTCP: %v", err)
 	}
 	defer ln.Close()
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs, testClientAddr()); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -192,7 +194,7 @@ func TestTCPBacklogBounded(t *testing.T) {
 		t.Fatalf("ListenTCP: %v", err)
 	}
 	defer ln.Close()
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs, testClientAddr()); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -228,7 +230,7 @@ func TestTCPBacklogBounded(t *testing.T) {
 func TestTCPHalfOpenBounded(t *testing.T) {
 	// A fixed fake clock (never advanced) guarantees none of the initial
 	// half-open connections' SYN-ACK retransmit timers can fire mid-test
-	// and pollute the shared fs.outbound channel with a stray segment
+	// and pollute the shared fs.Outbound() channel with a stray segment
 	// that tryRecvRaw (which does not filter by port) could misattribute
 	// to one of the "excess" clients below.
 	clock := newFakeClock(time.Unix(0, 0))
@@ -239,7 +241,7 @@ func TestTCPHalfOpenBounded(t *testing.T) {
 		t.Fatalf("ListenTCP: %v", err)
 	}
 	defer ln.Close()
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs, testClientAddr()); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -277,12 +279,12 @@ func TestTCPHalfOpenIsPerSession(t *testing.T) {
 	}
 	defer ln.Close()
 
-	fsA := newFakeSession()
+	fsA := netstacktest.NewFakeSession()
 	ipA := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fsA, ipA); err != nil {
 		t.Fatalf("Attach A: %v", err)
 	}
-	fsB := newFakeSession()
+	fsB := netstacktest.NewFakeSession()
 	ipB := net.IPv4(10, 8, 0, 3).To4()
 	if err := stack.Attach(fsB, ipB); err != nil {
 		t.Fatalf("Attach B: %v", err)
@@ -321,7 +323,7 @@ func TestTCPHalfOpenTimesOut(t *testing.T) {
 		t.Fatalf("ListenTCP: %v", err)
 	}
 	defer ln.Close()
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs, testClientAddr()); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -354,7 +356,7 @@ func TestTCPHalfOpenTimesOut(t *testing.T) {
 drainLoop:
 	for i := 0; i < 1000; i++ {
 		select {
-		case <-fs.outbound:
+		case <-fs.Outbound():
 		default:
 			break drainLoop
 		}
@@ -383,7 +385,7 @@ func TestTCPListenerCloseResetsQueued(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ListenTCP: %v", err)
 		}
-		fs := newFakeSession()
+		fs := netstacktest.NewFakeSession()
 		if err := stack.Attach(fs, testClientAddr()); err != nil {
 			t.Fatalf("Attach: %v", err)
 		}
@@ -454,7 +456,7 @@ func TestTCPDetachDuringConnectionCleansUp(t *testing.T) {
 		t.Fatalf("ListenTCP: %v", err)
 	}
 	defer ln.Close()
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs, testClientAddr()); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -494,7 +496,7 @@ func TestTCPBadAckInSynRcvdResets(t *testing.T) {
 		t.Fatalf("ListenTCP: %v", err)
 	}
 	defer ln.Close()
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs, testClientAddr()); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -539,7 +541,7 @@ func TestTCPLiveConnCapPerSession(t *testing.T) {
 		t.Fatalf("ListenTCP: %v", err)
 	}
 	defer ln.Close()
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	if err := stack.Attach(fs, testClientAddr()); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -549,7 +551,7 @@ func TestTCPLiveConnCapPerSession(t *testing.T) {
 	// Left open deliberately, never Close'd: stack.Close() (deferred
 	// above) tears every attachment down directly (onAttachmentDetached,
 	// no wire I/O) rather than this test driving 64 individual FIN
-	// sequences through fs.outbound's small fixed buffer, which nothing
+	// sequences through fs.Outbound()'s small fixed buffer, which nothing
 	// here drains.
 	for i := 0; i < maxLiveConnsPerSession; i++ {
 		client := newTCPTestClient(t, fs, testClientAddr(), uint16(25000+i), testServerIP(), 8080)
@@ -615,7 +617,7 @@ func TestTCPListenerEnqueueCloseRaceLeavesNothingBehind(t *testing.T) {
 		if err != nil {
 			t.Fatalf("trial %d: ListenTCP: %v", trial, err)
 		}
-		fs := newFakeSession()
+		fs := netstacktest.NewFakeSession()
 		if err := stack.Attach(fs, testClientAddr()); err != nil {
 			t.Fatalf("trial %d: Attach: %v", trial, err)
 		}

@@ -20,12 +20,14 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/8upio/govpn/netstack/internal/frame"
 )
 
 const (
 	// udpHeaderLen is the fixed 8-byte UDP header: source port, destination
 	// port, length, checksum (RFC 768).
-	udpHeaderLen = 8
+	udpHeaderLen = frame.UDPHeaderLen
 
 	// udpQueueDepth is the per-listener bounded inbound queue depth (D-14).
 	// 64 rather than session.go's own per-session 32 (session.go:365-384)
@@ -121,29 +123,7 @@ func parseUDP(payload []byte) (srcPort, dstPort uint16, data []byte, err error) 
 // means "sender computed no checksum" and must not be confused with an
 // actual zero result.
 func buildUDP(dst []byte, src, dstAddr netip.Addr, srcPort, dstPort uint16, payload []byte) []byte {
-	start := len(dst)
-	totalLen := udpHeaderLen + len(payload)
-
-	dst = append(dst, make([]byte, udpHeaderLen)...)
-	hdr := dst[start : start+udpHeaderLen]
-	binary.BigEndian.PutUint16(hdr[0:2], srcPort)
-	binary.BigEndian.PutUint16(hdr[2:4], dstPort)
-	binary.BigEndian.PutUint16(hdr[4:6], uint16(totalLen))
-	hdr[6], hdr[7] = 0, 0 // checksum, computed below with this zeroed
-
-	dst = append(dst, payload...)
-
-	segment := dst[start:]
-	checksum := transportChecksum(src, dstAddr, protocolUDP, segment)
-	if checksum == 0 {
-		// RFC 768: "If the computed checksum is zero, it is transmitted
-		// as all ones" — an on-wire 0x0000 means "no checksum computed"
-		// and must never be produced by a sender that did compute one.
-		checksum = 0xFFFF
-	}
-	binary.BigEndian.PutUint16(dst[start+6:start+8], checksum)
-
-	return dst
+	return frame.BuildUDP(dst, src, dstAddr, srcPort, dstPort, payload)
 }
 
 // UDPDropPolicy selects what a udpConn's bounded inbound queue does when a

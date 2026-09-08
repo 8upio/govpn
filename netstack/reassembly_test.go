@@ -11,11 +11,13 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/8upio/govpn/netstack/netstacktest"
 )
 
 var (
-	reasmSrc = mustAddr(net.IPv4(10, 8, 0, 2).To4())
-	reasmDst = mustAddr(net.IPv4(10, 8, 0, 1).To4())
+	reasmSrc = netstacktest.MustAddr(net.IPv4(10, 8, 0, 2).To4())
+	reasmDst = netstacktest.MustAddr(net.IPv4(10, 8, 0, 1).To4())
 )
 
 // addFrag parses frag and offers it to r, failing the test if the fragment
@@ -66,9 +68,9 @@ func assertReassembled(t *testing.T, datagram, want []byte) {
 func threeFragments(id uint16) (payload []byte, frags [][]byte) {
 	payload = []byte("AAAAAAAABBBBBBBBCCCCCCCC")
 	frags = [][]byte{
-		buildFragmentForTest(reasmSrc, reasmDst, protocolUDP, id, 0, true, payload[0:8]),
-		buildFragmentForTest(reasmSrc, reasmDst, protocolUDP, id, 8, true, payload[8:16]),
-		buildFragmentForTest(reasmSrc, reasmDst, protocolUDP, id, 16, false, payload[16:24]),
+		netstacktest.BuildFragment(reasmSrc, reasmDst, protocolUDP, id, 0, true, payload[0:8]),
+		netstacktest.BuildFragment(reasmSrc, reasmDst, protocolUDP, id, 8, true, payload[8:16]),
+		netstacktest.BuildFragment(reasmSrc, reasmDst, protocolUDP, id, 16, false, payload[16:24]),
 	}
 	return payload, frags
 }
@@ -155,10 +157,10 @@ func TestReassemblyPermissiveOverlap(t *testing.T) {
 	// first fragment's.
 	secondPayload := []byte("YYYYYYYYZZZZZZZZ")
 
-	if _, outcome, _ := addFrag(t, &r, now, buildFragmentForTest(reasmSrc, reasmDst, protocolUDP, 9, 0, true, firstPayload)); outcome != reasmBuffered {
+	if _, outcome, _ := addFrag(t, &r, now, netstacktest.BuildFragment(reasmSrc, reasmDst, protocolUDP, 9, 0, true, firstPayload)); outcome != reasmBuffered {
 		t.Fatalf("first fragment outcome = %v, want reasmBuffered", outcome)
 	}
-	datagram, outcome, _ := addFrag(t, &r, now, buildFragmentForTest(reasmSrc, reasmDst, protocolUDP, 9, 8, false, secondPayload))
+	datagram, outcome, _ := addFrag(t, &r, now, netstacktest.BuildFragment(reasmSrc, reasmDst, protocolUDP, 9, 8, false, secondPayload))
 	if outcome != reasmComplete {
 		t.Fatalf("overlapping final fragment outcome = %v, want reasmComplete", outcome)
 	}
@@ -181,12 +183,12 @@ func TestReassemblyConflictsDropTheDatagram(t *testing.T) {
 			// A final fragment at 0..7 says the datagram is 8 bytes;
 			// the first said 16.
 			name:   "second final fragment declares a different total length",
-			second: buildFragmentForTest(reasmSrc, reasmDst, protocolUDP, 3, 0, false, []byte("00000000")),
+			second: netstacktest.BuildFragment(reasmSrc, reasmDst, protocolUDP, 3, 0, false, []byte("00000000")),
 		},
 		{
 			// Bytes 16..23 lie past the known 16-byte end.
 			name:   "data beyond an already-known end",
-			second: buildFragmentForTest(reasmSrc, reasmDst, protocolUDP, 3, 16, true, []byte("11111111")),
+			second: netstacktest.BuildFragment(reasmSrc, reasmDst, protocolUDP, 3, 16, true, []byte("11111111")),
 		},
 	}
 
@@ -196,7 +198,7 @@ func TestReassemblyConflictsDropTheDatagram(t *testing.T) {
 			now := time.Unix(1000, 0)
 
 			// Establishes totalLen = 16 while leaving bytes 0..7 missing.
-			first := buildFragmentForTest(reasmSrc, reasmDst, protocolUDP, 3, 8, false, []byte("FINALFIN"))
+			first := netstacktest.BuildFragment(reasmSrc, reasmDst, protocolUDP, 3, 8, false, []byte("FINALFIN"))
 			if _, outcome, _ := addFrag(t, &r, now, first); outcome != reasmBuffered {
 				t.Fatalf("first fragment outcome = %v, want reasmBuffered", outcome)
 			}
@@ -229,7 +231,7 @@ func TestReassemblyLazyExpiry(t *testing.T) {
 
 	// One second before the deadline: a fragment for a SECOND datagram
 	// sweeps nothing.
-	other := buildFragmentForTest(reasmSrc, reasmDst, protocolUDP, 12, 0, true, []byte("EARLYFRG"))
+	other := netstacktest.BuildFragment(reasmSrc, reasmDst, protocolUDP, 12, 0, true, []byte("EARLYFRG"))
 	if _, _, expired := addFrag(t, &r, start.Add(reassemblyTimeout-time.Second), other); expired != 0 {
 		t.Fatalf("expired = %d one second before the deadline, want 0", expired)
 	}
@@ -238,7 +240,7 @@ func TestReassemblyLazyExpiry(t *testing.T) {
 	// datagram sweeps exactly that one. The second datagram's own
 	// deadline runs from ITS first fragment, so it survives — deadlines
 	// are per datagram and are never extended by other traffic.
-	third := buildFragmentForTest(reasmSrc, reasmDst, protocolUDP, 13, 0, true, []byte("LATEFRAG"))
+	third := netstacktest.BuildFragment(reasmSrc, reasmDst, protocolUDP, 13, 0, true, []byte("LATEFRAG"))
 	_, _, expired := addFrag(t, &r, start.Add(reassemblyTimeout+time.Second), third)
 	if expired != 1 {
 		t.Fatalf("expired = %d, want 1 (counted per datagram dropped)", expired)
@@ -269,7 +271,7 @@ func TestReassemblyTimeoutIsNeverExtended(t *testing.T) {
 
 	// Had the second fragment extended the deadline, nothing would be
 	// swept here.
-	sweeper := buildFragmentForTest(reasmSrc, reasmDst, protocolUDP, 32, 0, true, []byte("SWEEPFRG"))
+	sweeper := netstacktest.BuildFragment(reasmSrc, reasmDst, protocolUDP, 32, 0, true, []byte("SWEEPFRG"))
 	if _, _, expired := addFrag(t, &r, start.Add(reassemblyTimeout+time.Second), sweeper); expired != 1 {
 		t.Fatalf("expired = %d, want 1 — the deadline was extended by a later fragment", expired)
 	}
@@ -282,13 +284,13 @@ func TestReassemblyBufferCap(t *testing.T) {
 	now := time.Unix(1000, 0)
 
 	for i := 0; i < maxReassemblyBuffersPerSession; i++ {
-		frag := buildFragmentForTest(reasmSrc, reasmDst, protocolUDP, uint16(i), 0, true, []byte("01234567"))
+		frag := netstacktest.BuildFragment(reasmSrc, reasmDst, protocolUDP, uint16(i), 0, true, []byte("01234567"))
 		if _, outcome, _ := addFrag(t, &r, now, frag); outcome != reasmBuffered {
 			t.Fatalf("datagram %d outcome = %v, want reasmBuffered", i, outcome)
 		}
 	}
 
-	overflow := buildFragmentForTest(reasmSrc, reasmDst, protocolUDP, uint16(maxReassemblyBuffersPerSession), 0, true, []byte("01234567"))
+	overflow := netstacktest.BuildFragment(reasmSrc, reasmDst, protocolUDP, uint16(maxReassemblyBuffersPerSession), 0, true, []byte("01234567"))
 	if _, outcome, _ := addFrag(t, &r, now, overflow); outcome != reasmBoundExceeded {
 		t.Fatalf("datagram %d outcome = %v, want reasmBoundExceeded", maxReassemblyBuffersPerSession, outcome)
 	}
@@ -308,7 +310,7 @@ func TestReassemblyByteCap(t *testing.T) {
 
 	const sparseOffset = 65520
 	for i := 0; i < 4; i++ {
-		frag := buildFragmentForTest(reasmSrc, reasmDst, protocolUDP, uint16(i), sparseOffset, true, []byte("01234567"))
+		frag := netstacktest.BuildFragment(reasmSrc, reasmDst, protocolUDP, uint16(i), sparseOffset, true, []byte("01234567"))
 		if _, outcome, _ := addFrag(t, &r, now, frag); outcome != reasmBuffered {
 			t.Fatalf("sparse datagram %d outcome = %v, want reasmBuffered", i, outcome)
 		}
@@ -317,7 +319,7 @@ func TestReassemblyByteCap(t *testing.T) {
 		t.Fatalf("accounted bytes = %d, want %d (charged by reached buffer length)", r.bytes, want)
 	}
 
-	fifth := buildFragmentForTest(reasmSrc, reasmDst, protocolUDP, 4, sparseOffset, true, []byte("01234567"))
+	fifth := netstacktest.BuildFragment(reasmSrc, reasmDst, protocolUDP, 4, sparseOffset, true, []byte("01234567"))
 	if _, outcome, _ := addFrag(t, &r, now, fifth); outcome != reasmBoundExceeded {
 		t.Fatalf("fifth sparse datagram outcome = %v, want reasmBoundExceeded", outcome)
 	}
@@ -363,7 +365,7 @@ func TestReassemblyCustomBufferLimit(t *testing.T) {
 	now := time.Unix(1000, 0)
 
 	for i := 0; i < 2; i++ {
-		frag := buildFragmentForTest(reasmSrc, reasmDst, protocolUDP, uint16(i), 0, true, []byte("01234567"))
+		frag := netstacktest.BuildFragment(reasmSrc, reasmDst, protocolUDP, uint16(i), 0, true, []byte("01234567"))
 		if _, outcome, _ := addFrag(t, &r, now, frag); outcome != reasmBuffered {
 			t.Fatalf("datagram %d outcome = %v, want reasmBuffered", i, outcome)
 		}
@@ -372,7 +374,7 @@ func TestReassemblyCustomBufferLimit(t *testing.T) {
 	// A default-limit reassembler would accept a third and even a
 	// sixteenth concurrent half-reassembled datagram; this one, limited
 	// to 2, must refuse the third.
-	third := buildFragmentForTest(reasmSrc, reasmDst, protocolUDP, 2, 0, true, []byte("01234567"))
+	third := netstacktest.BuildFragment(reasmSrc, reasmDst, protocolUDP, 2, 0, true, []byte("01234567"))
 	if _, outcome, _ := addFrag(t, &r, now, third); outcome != reasmBoundExceeded {
 		t.Fatalf("third datagram outcome = %v, want reasmBoundExceeded with maxBufs=2", outcome)
 	}
@@ -382,7 +384,7 @@ func TestReassemblyCustomBufferLimit(t *testing.T) {
 	// default, not merely coincidentally rejecting this one fragment.
 	var defaultR reassembler
 	for i := 0; i < 16; i++ {
-		frag := buildFragmentForTest(reasmSrc, reasmDst, protocolUDP, uint16(100+i), 0, true, []byte("01234567"))
+		frag := netstacktest.BuildFragment(reasmSrc, reasmDst, protocolUDP, uint16(100+i), 0, true, []byte("01234567"))
 		if _, outcome, _ := addFrag(t, &defaultR, now, frag); outcome != reasmBuffered {
 			t.Fatalf("default-limit datagram %d outcome = %v, want reasmBuffered (default accepts 16)", i, outcome)
 		}
@@ -397,7 +399,7 @@ func TestReassemblyCustomTimeout(t *testing.T) {
 	r := reassembler{timeout: shortTimeout}
 	start := time.Unix(1000, 0)
 
-	first := buildFragmentForTest(reasmSrc, reasmDst, protocolUDP, 1, 0, true, []byte("01234567"))
+	first := netstacktest.BuildFragment(reasmSrc, reasmDst, protocolUDP, 1, 0, true, []byte("01234567"))
 	if _, outcome, _ := addFrag(t, &r, start, first); outcome != reasmBuffered {
 		t.Fatalf("first fragment outcome = %v, want reasmBuffered", outcome)
 	}
@@ -406,7 +408,7 @@ func TestReassemblyCustomTimeout(t *testing.T) {
 	// reassemblyTimeout: a fragment for a second datagram must sweep the
 	// first, proving the shortened timeout — not the package default —
 	// is what's enforced.
-	sweeper := buildFragmentForTest(reasmSrc, reasmDst, protocolUDP, 2, 0, true, []byte("SWEEPFRG"))
+	sweeper := netstacktest.BuildFragment(reasmSrc, reasmDst, protocolUDP, 2, 0, true, []byte("SWEEPFRG"))
 	_, _, expired := addFrag(t, &r, start.Add(shortTimeout+time.Second), sweeper)
 	if expired != 1 {
 		t.Fatalf("expired = %d, want 1 — the shortened timeout was not enforced", expired)

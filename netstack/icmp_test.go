@@ -5,6 +5,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/8upio/govpn/netstack/netstacktest"
 )
 
 // TestICMPNonEchoDropped asserts D-11: the responder answers echo requests
@@ -15,7 +17,7 @@ func TestICMPNonEchoDropped(t *testing.T) {
 	stack := newTestStack(t)
 	defer stack.Close()
 
-	fs := newFakeSession()
+	fs := netstacktest.NewFakeSession()
 	ip := net.IPv4(10, 8, 0, 2).To4()
 	if err := stack.Attach(fs, ip); err != nil {
 		t.Fatalf("Attach: %v", err)
@@ -25,9 +27,9 @@ func TestICMPNonEchoDropped(t *testing.T) {
 		icmp := make([]byte, minICMPHeaderLen)
 		icmp[0] = icmpType
 		binary.BigEndian.PutUint16(icmp[2:4], internetChecksum(icmp))
-		pkt := buildIPv4(nil, mustAddr(ip), mustAddr(testServerIP()), protocolICMP, icmp)
+		pkt := buildIPv4(nil, netstacktest.MustAddr(ip), netstacktest.MustAddr(testServerIP()), protocolICMP, icmp)
 
-		fs.inbound <- pkt
+		fs.Inject(pkt)
 		assertNoOutbound(t, fs, 50*time.Millisecond)
 	}
 }

@@ -14,17 +14,21 @@
 // fail-closed check applies to it exactly like any other outbound packet.
 package netstack
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+
+	"github.com/8upio/govpn/netstack/internal/frame"
+)
 
 const (
 	// icmpTypeEchoRequest / icmpTypeEchoReply are RFC 792's ICMP type
 	// values for echo request and echo reply.
-	icmpTypeEchoRequest = 8
+	icmpTypeEchoRequest = frame.ICMPTypeEchoRequest
 	icmpTypeEchoReply   = 0
 
 	// minICMPHeaderLen is the fixed ICMP echo header size (type, code,
 	// checksum, identifier, sequence number — RFC 792).
-	minICMPHeaderLen = 8
+	minICMPHeaderLen = frame.MinICMPHeaderLen
 )
 
 // handleICMP answers icmpMsg, the ICMP message carried by an IPv4 packet
