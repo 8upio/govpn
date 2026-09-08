@@ -6,7 +6,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project does not yet follow Semantic Versioning strictly (pre-1.0), but
 version numbers below still increase monotonically with each release.
 
-## [Unreleased]
+## [0.2.0] - 2026-09-08
 
 ### Added
 
