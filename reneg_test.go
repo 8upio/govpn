@@ -70,6 +70,7 @@ func mirrorDataKeys(server keyderiv.DataKeys) keyderiv.DataKeys {
 		EncryptImplicitIV: server.DecryptImplicitIV,
 		DecryptCipher:     server.EncryptCipher,
 		DecryptImplicitIV: server.EncryptImplicitIV,
+		CipherKeyLen:      server.CipherKeyLen,
 	}
 }
 
@@ -745,6 +746,7 @@ func lameDuckTestKeys(seed byte) keyderiv.DataKeys {
 	}
 	keys.DecryptCipher = keys.EncryptCipher
 	keys.DecryptImplicitIV = keys.EncryptImplicitIV
+	keys.CipherKeyLen = 32
 	return keys
 }
 
@@ -1287,6 +1289,12 @@ func TestRunRenegotiationAbandonsSwapWhenPendingRenegAlreadyCleared(t *testing.T
 		srv:             srv,
 		stopCh:          make(chan struct{}),
 		primary:         keySlot{keyID: 0, conn: oldPrimaryConn, established: time.Now()},
+		// cipher simulates the cipher already negotiated at this session's
+		// (never-driven-here) initial handshake — CIPH-06: runRenegotiation
+		// must reuse it, never re-select, so it has to be non-empty for
+		// datachan.NewWrapper's own CipherKeyLen validation to succeed on
+		// the rollover this test drives.
+		cipher: "AES-256-GCM",
 		// pendingReneg is deliberately left nil — simulating
 		// enforceRenegotiationWindow having ALREADY observed
 		// sess.pendingReneg == newConn, cleared it, and closed newConn,

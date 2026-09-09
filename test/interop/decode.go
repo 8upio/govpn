@@ -89,6 +89,7 @@ func mirrorDataKeys(keys keyderiv.DataKeys) keyderiv.DataKeys {
 		EncryptImplicitIV: keys.DecryptImplicitIV,
 		DecryptCipher:     keys.EncryptCipher,
 		DecryptImplicitIV: keys.EncryptImplicitIV,
+		CipherKeyLen:      keys.CipherKeyLen,
 	}
 }
 

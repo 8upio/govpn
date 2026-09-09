@@ -72,7 +72,26 @@ type Config struct {
 	// Cipher names the fixed data-channel cipher pushed to clients as
 	// `cipher <name>` (e.g. "AES-256-GCM"). Consumed starting in this
 	// plan; defaults to "AES-256-GCM" when empty.
+	//
+	// Deprecated: Cipher is a compatibility shorthand for the one-element
+	// allow-list [Cipher], consulted only when DataCiphers is nil — see
+	// DataCiphers. It remains a live, working field so no existing
+	// embedder's configuration breaks; nothing in the runtime reads it
+	// after Serve has resolved the allow-list.
 	Cipher string
+
+	// DataCiphers is the server's own ordered data-channel cipher
+	// allow-list (CIPH-01): Serve iterates it outermost against each
+	// client's advertised IV_CIPHERS (or the IV_NCP>=2 implied list) to
+	// pick that session's cipher — the server's own order always decides a
+	// tie, never the client's (selectCipher, cipher.go). A nil DataCiphers
+	// resolves to the one-element list [Cipher] when Cipher is non-empty
+	// (the deprecated shorthand above), or to the default
+	// ["AES-256-GCM", "AES-128-GCM"] otherwise. Serve rejects an unknown
+	// cipher name or a duplicate entry (case-insensitively compared,
+	// canonicalized to upper case) with an error rather than starting with
+	// a silently narrower or wider allow-list than configured.
+	DataCiphers []string
 
 	// OnSession is invoked exactly once per client, after Key Method 2 and
 	// the PUSH_REQUEST/PUSH_REPLY exchange have both completed and the
@@ -464,15 +483,6 @@ func nextKeyID(current uint8) uint8 {
 	return next
 }
 
-// serverKM2Options is the options string this server sends in its own Key
-// Method 2 message. Per RESEARCH.md Pitfall 4, options_cmp_equal
-// (ssl.c:2498) only warns on mismatch (gated on --opt-verify, which this
-// project's clients don't set) — a short, honest string describing this
-// server's actual fixed configuration is sufficient for interop; there is
-// no need to reproduce the reference's exact OCC options-string format
-// byte-for-byte.
-const serverKM2Options = "V4,dev-type tun,link-mtu 1541,tun-mtu 1500,proto UDPv4,cipher AES-256-GCM,auth SHA1,keysize 256,key-method 2,tls-server"
-
 // pushRequestLiteral is the exact string a real OpenVPN client sends
 // (NUL-terminated on the wire, per readControlString/push.go) to request
 // its tunnel configuration, unlike Key Method 2's own length-prefixed
@@ -554,6 +564,15 @@ type Server struct {
 	// hand-built Servers.
 	renegMinInterval time.Duration
 
+	// dataCiphers is Config.DataCiphers (or the Config.Cipher shorthand)
+	// resolved once in Serve via resolveDataCiphers — the server's own
+	// ordered, validated, canonical-name allow-list every session's cipher
+	// negotiation (performKeyMethod2Exchange) iterates. A hand-built
+	// *Server in a test bypasses this resolution and must set it directly,
+	// mirroring renegSec/renegMinInterval's own established
+	// direct-field-override precedent for hand-built Servers.
+	dataCiphers []string
+
 	// clock is a test-only override for every new Session's own clock
 	// field (Session.now, the reneg-sec timer, lame-duck mustDie, and the
 	// reneg-flood rate limit). nil in production, meaning
@@ -603,6 +622,13 @@ type serverStats struct {
 	assignIPRejected    atomic.Uint64
 	poolExhausted       atomic.Uint64
 	datagramsRejected   atomic.Uint64
+
+	// cipherNegotiationFailed counts every CIPH-03 no-shared-cipher
+	// rejection, declared here (alongside its sibling counters) so the
+	// struct is not re-shaped when plan 05-03 wires its first increment —
+	// it never increments s.stats.authFailed for the same event (Pitfall 3:
+	// the two counters must partition, not double-count).
+	cipherNegotiationFailed atomic.Uint64
 }
 
 // NewServer builds a Server from cfg. It does not start listening — call
@@ -721,6 +747,11 @@ func (s *Server) Serve(pc net.PacketConn) error {
 		s.renegSec = defaultRenegSec
 	}
 	s.renegMinInterval = s.renegSec / renegMinIntervalDivisor
+	dataCiphers, err := resolveDataCiphers(s.cfg.DataCiphers, s.cfg.Cipher)
+	if err != nil {
+		return err
+	}
+	s.dataCiphers = dataCiphers
 	// Config.Network is intentionally not required here: a Server built
 	// without it can still complete Phase 1's TLS handshake (existing
 	// tests exercise exactly that). It is only needed once a session
@@ -1370,9 +1401,14 @@ func (s *Server) performPushExchange(sess *Session, w io.Writer) error {
 		return errors.New("ovpn: Config.Network is not set; cannot answer PUSH_REQUEST")
 	}
 
-	cipher := s.cfg.Cipher
+	// T-05-05: the pushed cipher token, the AEAD key length, and the Key
+	// Method 2 options string all read this ONE stored value — an empty
+	// cipher at push time means performKeyMethod2Exchange's own publish
+	// never ran (the negotiation wiring is broken), and this must fail
+	// loudly rather than push a default.
+	cipher := sess.Cipher()
 	if cipher == "" {
-		cipher = "AES-256-GCM"
+		return fmt.Errorf("ovpn: session has no negotiated cipher at push time")
 	}
 
 	for {
@@ -1417,7 +1453,7 @@ func (s *Server) performPushExchange(sess *Session, w io.Writer) error {
 			// D-25 retired the old dataChannelKeyID constant once
 			// renegotiation (SESS-04) made the key-id a per-slot value
 			// rather than a session-wide constant.
-			dataWrapper, err := datachan.NewWrapper(sess.dataKeys.ServerSlots(), peerID, 0)
+			dataWrapper, err := datachan.NewWrapper(sess.dataKeys.ServerSlots(cipherKeyLen(cipher)), peerID, 0)
 			if err != nil {
 				s.pool.release(ip, peerID)
 				return fmt.Errorf("ovpn: build data-channel wrapper: %w", err)
@@ -2017,36 +2053,45 @@ func (s *Server) sendAuthFailed(conn *ctrlconn.Conn, w io.Writer, clientReason s
 	}
 }
 
-// deriveKeyMethod2 runs the Key Method 2 exchange over tlsConn and returns
-// the resulting bufio.Reader (wrapping tlsConn, having consumed exactly the
-// client's Key Method 2 message) and the derived key expansion, plus the
-// raw client/server seed material for diagnostics, plus the client's
-// parsed ClientOptions (opts.Username/opts.Password feed verifyUserPass) —
-// the shared core both performKeyMethod2Exchange (initial handshake) and
-// runRenegotiation (soft reset) call, so a renegotiation's key derivation
-// (and the credentials it authenticates) can never subtly diverge from the
-// initial handshake's own (04-01-PLAN.md Task 1 action 7; quick 260908-m4e
-// key_links: "the credentials must come from the SAME parse both the
-// initial handshake and the renegotiation use"). A six-value return is
-// unlovely, but keeps this a mechanical, two-call-site change rather than
-// introducing a new result struct.
+// readClientKeyMethod2 reads and returns the client's Key Method 2 message:
+// the resulting bufio.Reader (wrapping tlsConn, having consumed exactly
+// that message), the client's raw seed material, and its parsed
+// ClientOptions (opts.PeerInfo feeds selectCipher/peerCipherList below,
+// opts.Username/opts.Password feed verifyUserPass). This is the read half
+// of what used to be the single deriveKeyMethod2 function (05-RESEARCH.md
+// Pattern 1, Pitfall 1): splitting it in two is what lets cipher selection
+// run strictly between the read and the write — the server's own KM2
+// options string (which now embeds the negotiated cipher) must not go on
+// the wire before the client's own advertised capabilities have been read.
+func (s *Server) readClientKeyMethod2(tlsConn *tls.Conn) (*bufio.Reader, *keyderiv.KeySource, *keyderiv.ClientOptions, error) {
+	tlsReader := bufio.NewReader(tlsConn)
+
+	clientKM, clientOpts, err := keyderiv.ReadClientKeyMethod2(tlsReader)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("ovpn: read client Key Method 2: %w", err)
+	}
+	return tlsReader, clientKM, clientOpts, nil
+}
+
+// writeServerKeyMethod2AndDeriveKeys writes the server's own Key Method 2
+// message (carrying opts, e.g. serverKM2Options(selected cipher)) and then
+// derives this exchange's data-channel key expansion from clientKM (the
+// value readClientKeyMethod2 returned) and the just-written server seed
+// material — the write+derive half of the former deriveKeyMethod2
+// (05-RESEARCH.md Pattern 1). This is the shared core both
+// performKeyMethod2Exchange (initial handshake) and runRenegotiation (soft
+// reset) call, so a renegotiation's key derivation can never subtly
+// diverge from the initial handshake's own (04-01-PLAN.md Task 1 action 7).
 // clientSID/serverSID are the SAME control-channel session IDs for both
 // callers — they never change across a soft reset (04-RESEARCH.md
 // Pattern 3). Matches the reference server's own state-machine branch
 // (tls_process, ssl.c:3002-3031: server is "Receive Key" at S_START, "Send
 // Key" at S_GOT_KEY — the opposite order from the client, which already
 // wrote its own message immediately after its handshake completed).
-func (s *Server) deriveKeyMethod2(tlsConn *tls.Conn, clientSID, serverSID wire.SessionID) (*bufio.Reader, *keyderiv.Key2, *keyderiv.KeySource, *keyderiv.KeySource, *keyderiv.ClientOptions, error) {
-	tlsReader := bufio.NewReader(tlsConn)
-
-	clientKM, clientOpts, err := keyderiv.ReadClientKeyMethod2(tlsReader)
+func (s *Server) writeServerKeyMethod2AndDeriveKeys(tlsConn *tls.Conn, clientKM *keyderiv.KeySource, opts string, clientSID, serverSID wire.SessionID) (*keyderiv.Key2, *keyderiv.KeySource, error) {
+	serverKM, err := keyderiv.WriteServerKeyMethod2(tlsConn, opts)
 	if err != nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf("ovpn: read client Key Method 2: %w", err)
-	}
-
-	serverKM, err := keyderiv.WriteServerKeyMethod2(tlsConn, serverKM2Options)
-	if err != nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf("ovpn: write server Key Method 2: %w", err)
+		return nil, nil, fmt.Errorf("ovpn: write server Key Method 2: %w", err)
 	}
 
 	src := &keyderiv.KeySource2{
@@ -2061,19 +2106,26 @@ func (s *Server) deriveKeyMethod2(tlsConn *tls.Conn, clientSID, serverSID wire.S
 	// no new session-ID concept is introduced.
 	dataKeys, err := keyderiv.DeriveKeys(src, (*[8]byte)(&clientSID), (*[8]byte)(&serverSID))
 	if err != nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf("ovpn: derive data-channel keys: %w", err)
+		return nil, nil, fmt.Errorf("ovpn: derive data-channel keys: %w", err)
 	}
-	return tlsReader, dataKeys, clientKM, serverKM, clientOpts, nil
+	return dataKeys, serverKM, nil
 }
 
-// performKeyMethod2Exchange runs deriveKeyMethod2 for the initial handshake
-// and writes its results onto sess: sess.tlsReader (D-15, so plan
-// 02-02's PUSH_REQUEST continuation reads from the same buffered stream
-// rather than losing bytes to a second reader), sess.dataKeys,
-// sess.clientKM, and sess.serverKM. The renegotiation path
-// (runRenegotiation) calls deriveKeyMethod2 directly instead and never
-// touches sess.tlsReader (D-15's single-buffered-reader contract stays
-// scoped to the initial handshake).
+// performKeyMethod2Exchange runs the initial handshake's Key Method 2
+// exchange: read the client's message, select this session's data-channel
+// cipher from the client's own advertised capabilities against the
+// server's resolved allow-list (selectCipher — strictly between the read
+// and the write, per 05-RESEARCH.md Pitfall 1), then write the server's
+// own message (carrying the selected cipher's serverKM2Options) and derive
+// the data-channel keys. It writes its results onto sess: sess.tlsReader
+// (D-15, so plan 02-02's PUSH_REQUEST continuation reads from the same
+// buffered stream rather than losing bytes to a second reader),
+// sess.dataKeys, sess.cipher, sess.clientKM, and sess.serverKM. The
+// renegotiation path (runRenegotiation) calls readClientKeyMethod2/
+// writeServerKeyMethod2AndDeriveKeys directly instead, reusing sess.Cipher()
+// rather than selecting again (CIPH-06), and never touches sess.tlsReader
+// (D-15's single-buffered-reader contract stays scoped to the initial
+// handshake).
 //
 // The existing publishes above happen UNCONDITIONALLY, before
 // verifyUserPass ever runs (quick 260908-m4e key_links): the AUTH_FAILED
@@ -2085,7 +2137,22 @@ func (s *Server) deriveKeyMethod2(tlsConn *tls.Conn, clientSID, serverSID wire.S
 // unconditional also keeps this diff an appended block rather than a
 // restructure.
 func (s *Server) performKeyMethod2Exchange(sess *Session, tlsConn *tls.Conn) error {
-	tlsReader, dataKeys, clientKM, serverKM, clientOpts, err := s.deriveKeyMethod2(tlsConn, sess.clientSessionID, sess.SessionID)
+	tlsReader, clientKM, clientOpts, err := s.readClientKeyMethod2(tlsConn)
+	if err != nil {
+		return err
+	}
+
+	selected, err := selectCipher(s.dataCiphers, peerCipherList(clientOpts.PeerInfo), "")
+	if err != nil {
+		// Wrapped for now, matching every other stage failure in this
+		// function's caller (runHandshake's non-authFailure branch): plan
+		// 05-03 converts this into the typed *authFailure rejection
+		// (AUTH_FAILED,<cipherNegotiationFailedReason>) and its own
+		// Server.Stats().CipherNegotiationFailed counter.
+		return fmt.Errorf("ovpn: cipher negotiation: %w", err)
+	}
+
+	dataKeys, serverKM, err := s.writeServerKeyMethod2AndDeriveKeys(tlsConn, clientKM, serverKM2Options(selected), sess.clientSessionID, sess.SessionID)
 	if err != nil {
 		return err
 	}
@@ -2094,8 +2161,13 @@ func (s *Server) performKeyMethod2Exchange(sess *Session, tlsConn *tls.Conn) err
 	// own doc comment) — this is its initial, single-writer publish, but
 	// DebugDataKeys can be called concurrently from an arbitrary goroutine
 	// at any time, so this write takes the same lock its reader does.
+	// sess.cipher is published in this SAME critical section (T-05-05):
+	// the Key Method 2 options string just written, the PUSH_REPLY cipher
+	// token, and the data-channel AEAD key length must all read the one
+	// value stored here, never re-derived separately.
 	sess.mu.Lock()
 	sess.dataKeys = dataKeys
+	sess.cipher = selected
 	sess.mu.Unlock()
 	sess.clientKM = clientKM
 	sess.serverKM = serverKM
@@ -2282,7 +2354,18 @@ func (s *Server) runRenegotiation(sess *Session, newConn *ctrlconn.Conn, keyID u
 		return
 	}
 
-	_, dataKeys, _, _, clientOpts, err := s.deriveKeyMethod2(tlsConn, sess.clientSessionID, sess.SessionID)
+	_, clientKM, clientOpts, err := s.readClientKeyMethod2(tlsConn)
+	if err != nil {
+		sess.logger().Warn("renegotiation failed", "stage", "key-method-2", "key_id", int(keyID), "err", err)
+		abandon()
+		return
+	}
+
+	// CIPH-06: reuse the cipher already negotiated at connect time — never
+	// select again. sess.Cipher() is safe to call here: this goroutine
+	// holds no lock yet (the swap section below is the first place this
+	// function ever takes sess.mu).
+	dataKeys, _, err := s.writeServerKeyMethod2AndDeriveKeys(tlsConn, clientKM, serverKM2Options(sess.Cipher()), sess.clientSessionID, sess.SessionID)
 	if err != nil {
 		sess.logger().Warn("renegotiation failed", "stage", "key-method-2", "key_id", int(keyID), "err", err)
 		abandon()
@@ -2336,7 +2419,12 @@ func (s *Server) runRenegotiation(sess *Session, newConn *ctrlconn.Conn, keyID u
 		return
 	}
 
-	newWrapper, err := datachan.NewWrapper(dataKeys.ServerSlots(), sess.peerID, keyID)
+	// sess.cipher is read directly, not via sess.Cipher(): sess.mu is
+	// already held in this critical section (see the Lock() call above),
+	// and sess.Cipher() would deadlock trying to re-acquire it. CIPH-06:
+	// this is always the cipher negotiated at connect time — never
+	// re-derived here.
+	newWrapper, err := datachan.NewWrapper(dataKeys.ServerSlots(cipherKeyLen(sess.cipher)), sess.peerID, keyID)
 	if err != nil {
 		// WR-03: clear pendingReneg on this failure path too, mirroring the
 		// swap section's own guard below — otherwise every subsequent

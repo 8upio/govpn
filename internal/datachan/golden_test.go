@@ -101,6 +101,11 @@ func loadGoldenDataKeys(t *testing.T, keyFile string) keyderiv.DataKeys {
 	hexDecodeFixed(t, f.EncryptImplicitIV, keys.EncryptImplicitIV[:])
 	hexDecodeFixed(t, f.DecryptCipher, keys.DecryptCipher[:])
 	hexDecodeFixed(t, f.DecryptImplicitIV, keys.DecryptImplicitIV[:])
+	// Every golden vector committed so far predates cipher negotiation and
+	// is AES-256-GCM only (the only cipher v1.0 ever produced) — the JSON
+	// key-file shape has no cipher/cipher_key_len field yet, so this is
+	// fixed at 32 rather than read from the file.
+	keys.CipherKeyLen = 32
 	return keys
 }
 
@@ -129,6 +134,7 @@ func mirrorDataKeys(keys keyderiv.DataKeys) keyderiv.DataKeys {
 		EncryptImplicitIV: keys.DecryptImplicitIV,
 		DecryptCipher:     keys.EncryptCipher,
 		DecryptImplicitIV: keys.EncryptImplicitIV,
+		CipherKeyLen:      keys.CipherKeyLen,
 	}
 }
 

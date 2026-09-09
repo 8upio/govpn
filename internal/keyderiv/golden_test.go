@@ -85,7 +85,7 @@ func TestGoldenKeyExpansionFromCapture(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DeriveKeys: %v", err)
 	}
-	got := key2.ServerSlots()
+	got := key2.ServerSlots(32)
 
 	keyPath := filepath.Join(goldenDir, "data-channel.key")
 	keyData, err := os.ReadFile(keyPath)
@@ -101,6 +101,11 @@ func TestGoldenKeyExpansionFromCapture(t *testing.T) {
 	hexDecodeFixed(t, wantFile.EncryptImplicitIV, want.EncryptImplicitIV[:])
 	hexDecodeFixed(t, wantFile.DecryptCipher, want.DecryptCipher[:])
 	hexDecodeFixed(t, wantFile.DecryptImplicitIV, want.DecryptImplicitIV[:])
+	// This golden vector predates cipher negotiation and is AES-256-GCM
+	// only (the only cipher v1.0 ever produced) — CipherKeyLen isn't part
+	// of the committed JSON shape, so it's set to match got's own
+	// ServerSlots(32) call above rather than compared as a zero value.
+	want.CipherKeyLen = 32
 
 	if got != want {
 		t.Fatalf("DeriveKeys from the captured Key Method 2 material does not match the committed derived key material:\n got:  %+v\n want: %+v", got, want)

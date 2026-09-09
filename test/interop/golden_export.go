@@ -88,6 +88,12 @@ func readDataChannelKeyExport(path string) (keyderiv.DataKeys, error) {
 	if err := hexDecodeFixed(f.DecryptImplicitIV, out.DecryptImplicitIV[:]); err != nil {
 		return out, fmt.Errorf("%s: decrypt_implicit_iv: %w", path, err)
 	}
+	// The harness server never negotiates anything but AES-256-GCM yet
+	// (test/interop/server/main.go hardcodes it) — dataChannelKeyExportFile
+	// has no cipher/cipher_key_len field, so this is fixed at 32 rather
+	// than read from the file, mirroring internal/datachan/golden_test.go's
+	// own loadGoldenDataKeys.
+	out.CipherKeyLen = 32
 	return out, nil
 }
 

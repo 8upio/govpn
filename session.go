@@ -199,6 +199,16 @@ type Session struct {
 	// consume. nil until the Key Method 2 exchange completes.
 	dataKeys *keyderiv.Key2
 
+	// cipher is this session's negotiated data-channel cipher's canonical
+	// upper-case name (e.g. "AES-128-GCM"), written exactly once by
+	// ovpn.go's performKeyMethod2Exchange, in the SAME sess.mu critical
+	// section that publishes dataKeys — the Key Method 2 options string
+	// already written to the wire, the PUSH_REPLY cipher token, and the
+	// data-channel AEAD key length all read this one stored value (T-05-05).
+	// "" until that publish (Session.Cipher()'s own contract) and never
+	// rewritten by runRenegotiation (CIPH-06). Guarded by mu.
+	cipher string
+
 	// clientKM is the client's own Key Method 2 pre_master/random1/random2,
 	// retained only for diagnostics after DeriveKeys has consumed it.
 	clientKM *keyderiv.KeySource
@@ -279,12 +289,13 @@ type Session struct {
 	log atomic.Pointer[slog.Logger]
 
 	// mu guards assignedIP, peerID, primary, lameDuck, pendingReneg,
-	// pendingRenegKeyID, lastRenegAccepted, lastAuthTraffic, dataKeys, and
-	// establishedAt below (WR-03, extended by 04-01-PLAN.md Task 1 from
+	// pendingRenegKeyID, lastRenegAccepted, lastAuthTraffic, dataKeys,
+	// cipher, and establishedAt below (WR-03, extended by 04-01-PLAN.md Task 1 from
 	// the single dataWrapper field it originally guarded to this phase's
 	// two-slot key state, by 04-02-PLAN.md Task 2 to lastAuthTraffic, by
-	// 04-REVIEW.md WR-01 to dataKeys, and by the Welle-1 SessionStats plan
-	// to establishedAt — no new mutex): ovpn.go's performPushExchange and
+	// 04-REVIEW.md WR-01 to dataKeys, by the Welle-1 SessionStats plan
+	// to establishedAt, and by 05-01-PLAN.md to cipher — no new mutex):
+	// ovpn.go's performPushExchange and
 	// runRenegotiation (running on this session's own goroutines) write
 	// them, while Close — which enforceHandshakeWindow's timeout goroutine
 	// can invoke concurrently at any point — reads them, and the public
@@ -596,6 +607,19 @@ func (s *Session) PeerID() uint32 {
 	return s.peerID
 }
 
+// Cipher returns this session's negotiated data-channel cipher's canonical
+// upper-case name (e.g. "AES-128-GCM"). It is "" before the Key Method 2
+// exchange has completed and never changes afterward, including across a
+// renegotiation (CIPH-06): the same value fed the Key Method 2 options
+// string already sent to the client, the PUSH_REPLY cipher token, and the
+// data-channel AEAD key length, all published together in
+// performKeyMethod2Exchange's single sess.mu critical section (T-05-05).
+func (s *Session) Cipher() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cipher
+}
+
 // RenegotiationCount reports how many soft-reset key rollovers this session
 // has completed (04-03-PLAN.md Task 1) — a diagnostic accessor in the same
 // spirit as PeerID/PushRequestSeen above: an external package (the interop
@@ -679,11 +703,12 @@ func (s *Session) DebugKeyMethod2Material() (src keyderiv.KeySource2, clientSID,
 func (s *Session) DebugDataKeys() (keys keyderiv.DataKeys, ok bool) {
 	s.mu.Lock()
 	dataKeys := s.dataKeys
+	cipher := s.cipher
 	s.mu.Unlock()
 	if dataKeys == nil {
 		return keyderiv.DataKeys{}, false
 	}
-	return dataKeys.ServerSlots(), true
+	return dataKeys.ServerSlots(cipherKeyLen(cipher)), true
 }
 
 // Read delivers exactly one raw, decrypted IP packet per call (D-05):

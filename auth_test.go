@@ -508,7 +508,7 @@ func testAuthFieldRejection(t *testing.T, name string, username, password []byte
 	if err := client.tlsConn.Handshake(); err != nil {
 		t.Fatalf("client handshake: %v", err)
 	}
-	if err := writeTestClientKeyMethod2Raw(client.tlsConn, nil, username, password, nil); err != nil {
+	if err := writeTestClientKeyMethod2Raw(client.tlsConn, nil, username, password, testDefaultPeerInfo); err != nil {
 		t.Fatalf("write client Key Method 2: %v", err)
 	}
 	if err := readTestServerKeyMethod2(client.tlsConn); err != nil {

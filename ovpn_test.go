@@ -484,12 +484,31 @@ func writeTestClientKeyMethod2Raw(w io.Writer, options, username, password, peer
 	return err
 }
 
+// testDefaultPeerInfo is the peer_info payload writeTestClientKeyMethod2Creds
+// (and therefore writeTestClientKeyMethod2/tunnelUpTestClient and every
+// test built on them) sends by default: "IV_NCP=2", the same NCP-support
+// signal a real OpenVPN 2.6 client always sends (tls_peer_info_ncp_ver,
+// ssl_ncp.c:55-70), implying the capability list [AES-256-GCM,
+// AES-128-GCM] (peerCipherList, cipher.go). Phase 5's selectCipher
+// requires the peer to actually advertise SOME capability (or a matching
+// OCC cipher) before it negotiates anything — without this default, every
+// one of this package's many pre-existing handshake/push/renegotiation
+// tests, which never set peer_info themselves, would fail cipher
+// negotiation outright. Advertising IV_NCP=2 rather than an explicit
+// IV_CIPHERS= list keeps the server's own default allow-list order
+// deciding the outcome (AES-256-GCM first, since selectCipher iterates the
+// server's list outermost) — preserving every pre-existing test's implicit
+// assumption of a fixed AES-256-GCM session (05-01-PLAN.md "the
+// AES-256-GCM path is provably unchanged").
+var testDefaultPeerInfo = []byte("IV_NCP=2\n")
+
 // writeTestClientKeyMethod2Creds writes a client Key Method 2 message
-// carrying username/password (options and peer_info left empty), encoding
-// each non-empty credential as append([]byte(s), 0) — write_string's own
-// convention (R2: the wire length includes the trailing NUL) — and an
-// empty string as a genuinely zero-length field (the "not provided by
-// peer" case, distinct from a present-but-empty string).
+// carrying username/password (options left empty, peer_info set to
+// testDefaultPeerInfo above), encoding each non-empty credential as
+// append([]byte(s), 0) — write_string's own convention (R2: the wire
+// length includes the trailing NUL) — and an empty string as a genuinely
+// zero-length field (the "not provided by peer" case, distinct from a
+// present-but-empty string).
 func writeTestClientKeyMethod2Creds(w io.Writer, username, password string) error {
 	encode := func(s string) []byte {
 		if s == "" {
@@ -497,7 +516,7 @@ func writeTestClientKeyMethod2Creds(w io.Writer, username, password string) erro
 		}
 		return append([]byte(s), 0)
 	}
-	return writeTestClientKeyMethod2Raw(w, nil, encode(username), encode(password), nil)
+	return writeTestClientKeyMethod2Raw(w, nil, encode(username), encode(password), testDefaultPeerInfo)
 }
 
 // testPlaceholderUsername/testPlaceholderPassword are content-arbitrary
@@ -773,7 +792,7 @@ func TestPerformPushExchangeAnswersBufferedRetransmitWithSameIP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewKey2: %v", err)
 	}
-	sess := &Session{tlsReader: bufio.NewReader(strings.NewReader(input)), dataKeys: dataKeys}
+	sess := &Session{tlsReader: bufio.NewReader(strings.NewReader(input)), dataKeys: dataKeys, cipher: "AES-256-GCM"}
 
 	var out strings.Builder
 	if err := srv.performPushExchange(sess, &out); err != nil {
@@ -853,6 +872,7 @@ func TestPerformPushExchangeReleasesAllocationWhenSessionAlreadyClosing(t *testi
 	sess := &Session{
 		tlsReader: bufio.NewReader(strings.NewReader(pushRequestLiteral + "\x00")),
 		dataKeys:  dataKeys,
+		cipher:    "AES-256-GCM",
 		srv:       srv,
 		stopCh:    make(chan struct{}),
 	}
@@ -1641,7 +1661,7 @@ func TestSessionReadWriteDatagramSemantics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewKey2: %v", err)
 	}
-	serverKeys := key2.ServerSlots()
+	serverKeys := key2.ServerSlots(32)
 	// clientKeys is the mirror image of serverKeys (matching how a real
 	// peer's own key-direction assignment inverts the server's, Pitfall
 	// 1) — this test's own encrypt/decrypt pairing, not
@@ -1652,6 +1672,7 @@ func TestSessionReadWriteDatagramSemantics(t *testing.T) {
 		EncryptImplicitIV: serverKeys.DecryptImplicitIV,
 		DecryptCipher:     serverKeys.EncryptCipher,
 		DecryptImplicitIV: serverKeys.EncryptImplicitIV,
+		CipherKeyLen:      serverKeys.CipherKeyLen,
 	}
 
 	const peerID = 7
@@ -1752,6 +1773,7 @@ func testSymmetricDataKeys(t testing.TB) keyderiv.DataKeys {
 	}
 	keys.DecryptCipher = keys.EncryptCipher
 	keys.DecryptImplicitIV = keys.EncryptImplicitIV
+	keys.CipherKeyLen = 32
 	return keys
 }
 

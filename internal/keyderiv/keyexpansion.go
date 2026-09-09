@@ -70,13 +70,23 @@ func keyDirection(server bool) (encryptIdx, decryptIdx int) {
 }
 
 // DataKeys is the fully-sliced per-direction key material a
-// internal/datachan.Wrapper needs: a 32-byte AES-256 cipher key and an
+// internal/datachan.Wrapper needs: an up-to-32-byte cipher key and an
 // 8-byte AEAD implicit IV for each of the encrypt and decrypt directions.
 type DataKeys struct {
 	EncryptCipher     [32]byte
 	EncryptImplicitIV [8]byte
 	DecryptCipher     [32]byte
 	DecryptImplicitIV [8]byte
+
+	// CipherKeyLen is how many of EncryptCipher/DecryptCipher's 32 stored
+	// bytes the negotiated data-channel AEAD actually consumes: 32 for
+	// AES-256-GCM, 16 for AES-128-GCM. The EncryptCipher/DecryptCipher
+	// arrays themselves stay 32 bytes wide for EVERY cipher, because the
+	// underlying key-expansion slot (Key2.slot) is always 64 bytes
+	// regardless of which cipher was negotiated — only the AEAD
+	// construction (internal/datachan.NewWrapper) cares how many of those
+	// bytes are the real key versus unused slot padding.
+	CipherKeyLen int
 }
 
 // slot returns the 64-byte cipher field and 64-byte hmac field for
@@ -94,7 +104,15 @@ func (k *Key2) slot(idx int) (cipher, hmacField []byte) {
 //
 //	key_ctx_update_implicit_iv(&key->encrypt, key2->keys[(int)server].hmac, …);
 //	key_ctx_update_implicit_iv(&key->decrypt, key2->keys[1-(int)server].hmac, …);
-func (k *Key2) ServerSlots() DataKeys {
+//
+// cipherKeyLen is the negotiated cipher's key length in bytes (32 for
+// AES-256-GCM, 16 for AES-128-GCM — see the ovpn package's own
+// cipherKeyLen), copied onto the returned DataKeys.CipherKeyLen. It does
+// NOT change which bytes are copied here: the copy lines below always
+// carry the full 64-byte slot prefix, exactly as before this field
+// existed — only internal/datachan.NewWrapper's own AEAD construction
+// slices by CipherKeyLen.
+func (k *Key2) ServerSlots(cipherKeyLen int) DataKeys {
 	encIdx, decIdx := keyDirection(true)
 	encCipher, encHMAC := k.slot(encIdx)
 	decCipher, decHMAC := k.slot(decIdx)
@@ -104,6 +122,7 @@ func (k *Key2) ServerSlots() DataKeys {
 	copy(out.EncryptImplicitIV[:], encHMAC[:8])
 	copy(out.DecryptCipher[:], decCipher[:32])
 	copy(out.DecryptImplicitIV[:], decHMAC[:8])
+	out.CipherKeyLen = cipherKeyLen
 	return out
 }
 

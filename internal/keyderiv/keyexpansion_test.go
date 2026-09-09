@@ -52,7 +52,7 @@ func TestServerSlotsMatchReferenceByteRanges(t *testing.T) {
 		t.Fatalf("NewKey2: %v", err)
 	}
 
-	slots := k.ServerSlots()
+	slots := k.ServerSlots(32)
 
 	wantEncCipher := raw[128:160]
 	wantEncIV := raw[192:200]
@@ -83,7 +83,7 @@ func TestSlotSizes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewKey2: %v", err)
 	}
-	slots := k.ServerSlots()
+	slots := k.ServerSlots(32)
 
 	if len(slots.EncryptCipher) != 32 {
 		t.Fatalf("len(EncryptCipher) = %d, want 32", len(slots.EncryptCipher))

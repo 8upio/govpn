@@ -33,6 +33,7 @@ import (
 	"crypto/cipher"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"sync"
 
 	"github.com/8upio/govpn/internal/keyderiv"
@@ -88,6 +89,15 @@ var (
 	// it must never be delivered to Session.Read's caller and never counts
 	// as a delivered IP packet.
 	ErrPingAbsorbed = errors.New("datachan: packet is a ping keepalive, absorbed")
+
+	// ErrCipherKeyLen is returned by NewWrapper when keys.CipherKeyLen is
+	// not one of the two data-channel AEAD key lengths this milestone
+	// supports (16 for AES-128-GCM, 32 for AES-256-GCM). There is
+	// deliberately no zero-value default here: a caller that forgot to set
+	// CipherKeyLen (or copied a DataKeys from before this field existed)
+	// must fail loudly, not silently build an AEAD at the wrong key
+	// strength (T-05-02).
+	ErrCipherKeyLen = errors.New("datachan: unsupported cipher key length")
 )
 
 // Wrapper implements the data channel's AES-256-GCM Seal/Open for one
@@ -114,8 +124,21 @@ type Wrapper struct {
 // output — do not re-derive which slot is encrypt vs decrypt here, Pitfall
 // 1), peerID (this session's allocated 24-bit peer-id, D-16) and keyID (the
 // TLS key slot, 0 in v1).
+//
+// keys.CipherKeyLen selects the negotiated cipher's AEAD key length — 16
+// bytes for AES-128-GCM, 32 for AES-256-GCM, ErrCipherKeyLen for anything
+// else, checked before either aes.NewCipher call so a bad length is
+// rejected loudly rather than silently building an AEAD at the wrong key
+// strength (T-05-02). Beyond that one slice width, nothing else in this
+// package changes between the two ciphers: cipher.NewGCM and the whole
+// Seal/Open wire layout (12-byte nonce, 16-byte tag, tag-before-ciphertext
+// ordering) are key-size-agnostic.
 func NewWrapper(keys keyderiv.DataKeys, peerID uint32, keyID uint8) (*Wrapper, error) {
-	encBlock, err := aes.NewCipher(keys.EncryptCipher[:])
+	if keys.CipherKeyLen != 16 && keys.CipherKeyLen != 32 {
+		return nil, fmt.Errorf("%w: %d", ErrCipherKeyLen, keys.CipherKeyLen)
+	}
+
+	encBlock, err := aes.NewCipher(keys.EncryptCipher[:keys.CipherKeyLen])
 	if err != nil {
 		return nil, err
 	}
@@ -124,7 +147,7 @@ func NewWrapper(keys keyderiv.DataKeys, peerID uint32, keyID uint8) (*Wrapper, e
 		return nil, err
 	}
 
-	decBlock, err := aes.NewCipher(keys.DecryptCipher[:])
+	decBlock, err := aes.NewCipher(keys.DecryptCipher[:keys.CipherKeyLen])
 	if err != nil {
 		return nil, err
 	}

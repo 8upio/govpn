@@ -32,7 +32,23 @@ func testDataKeys(t testing.TB) keyderiv.DataKeys {
 	}
 	keys.DecryptCipher = keys.EncryptCipher
 	keys.DecryptImplicitIV = keys.EncryptImplicitIV
+	keys.CipherKeyLen = 32
 	return keys
+}
+
+// TestNewWrapperRejectsUnsetCipherKeyLen is 05-01-PLAN.md Task 1's
+// T-05-02 proof: NewWrapper refuses a DataKeys whose CipherKeyLen is
+// neither of the two data-channel AEAD key lengths this milestone
+// supports (16, 32) — an unset (zero-value) or otherwise wrong length
+// must be a loud error, never a silent default.
+func TestNewWrapperRejectsUnsetCipherKeyLen(t *testing.T) {
+	for _, n := range []int{0, 24} {
+		keys := testDataKeys(t)
+		keys.CipherKeyLen = n
+		if _, err := NewWrapper(keys, 1, 0); !errors.Is(err, ErrCipherKeyLen) {
+			t.Errorf("CipherKeyLen=%d: err = %v, want errors.Is(err, ErrCipherKeyLen)", n, err)
+		}
+	}
 }
 
 // TestSealLayout asserts the full P_DATA_V2 wire layout: opcode+keyid byte,
