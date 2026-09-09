@@ -88,6 +88,13 @@ type scenario struct {
 	// file and appends auth-user-pass to client.conf. Empty (every
 	// pre-existing scenario) adds no such directive.
 	credentials string
+
+	// wantDataCipher (05-04-PLAN.md Task 2), when non-empty, asserts (via
+	// assertNegotiatedCipher) that BOTH the real client's own "Data
+	// Channel: cipher '<name>'" log line and the server's PASS line
+	// data_cipher= field equal this canonical cipher name. Empty (every
+	// pre-existing scenario) skips the assertion entirely.
+	wantDataCipher string
 }
 
 // scenarios covers, at minimum, the clean-small/clean-large/lossy-large
@@ -148,6 +155,45 @@ var scenarios = []scenario{
 		composeOverlay: "docker-compose.auth.yml",
 		noClientCert:   true,
 		credentials:    "voxio:s3cr3t",
+	},
+	{
+		// "cipher-128" (05-04-PLAN.md Task 2, ROADMAP success criterion 1)
+		// proves a real, unmodified OpenVPN 2.6 client that can only speak
+		// AES-128-GCM (data-ciphers AES-128-GCM, its sole entry) connects
+		// to a server whose allow-list also contains only AES-128-GCM
+		// (docker-compose.cipher-128.yml's -data-ciphers AES-128-GCM) —
+		// negotiating AES-128-GCM and passing every probe, proving a
+		// one-entry allow-list works against a real client, not only that
+		// AES-128-GCM itself does.
+		name:             "cipher-128",
+		profile:          "small",
+		lossy:            false,
+		largeCert:        false,
+		contextTimeout:   4 * time.Minute,
+		composeOverlay:   "docker-compose.cipher-128.yml",
+		clientDirectives: []string{"data-ciphers AES-128-GCM"},
+		wantDataCipher:   "AES-128-GCM",
+	},
+	{
+		// "cipher-order" (05-04-PLAN.md Task 2, ROADMAP success criterion 2)
+		// proves the server's preference order wins a tie, never the
+		// client's: the server's allow-list is AES-256-GCM:AES-128-GCM
+		// (docker-compose.cipher-order.yml, its OWN order), while the
+		// client is deliberately configured with the REVERSE order
+		// (data-ciphers AES-128-GCM:AES-256-GCM). The expected outcome is
+		// the server's first entry, AES-256-GCM — a failure mode this
+		// scenario exists to catch (inverting whose preference decides a
+		// tie) produces a working tunnel either way, so a unit test alone
+		// cannot prove it against the reference implementation the way a
+		// real client's own handshake log line can.
+		name:             "cipher-order",
+		profile:          "small",
+		lossy:            false,
+		largeCert:        false,
+		contextTimeout:   4 * time.Minute,
+		composeOverlay:   "docker-compose.cipher-order.yml",
+		clientDirectives: []string{"data-ciphers AES-128-GCM:AES-256-GCM"},
+		wantDataCipher:   "AES-256-GCM",
 	},
 }
 
@@ -427,6 +473,14 @@ func TestInteropScenarios(t *testing.T) {
 			assertHandshakeCompleted(t, res, !sc.noClientCert)
 			assertKeyExchangeCompleted(t, res)
 			assertTunnelUp(t, res)
+
+			// 05-04-PLAN.md Task 2 (ROADMAP success criteria 1/2): the
+			// "cipher-128"/"cipher-order" scenarios assert the negotiated
+			// data-channel cipher from BOTH ends. Every other scenario
+			// leaves wantDataCipher at its zero value and skips this.
+			if sc.wantDataCipher != "" {
+				assertNegotiatedCipher(t, res, sc.wantDataCipher)
+			}
 
 			// 02-04-PLAN.md Task 1 (VRFY-03): the ping round-trip proof
 			// (the encrypted ping through Session.Read/Write) now runs
@@ -1153,6 +1207,76 @@ func assertRenegotiation(t *testing.T, res scenarioResult, wantMin int) {
 		t.Fatalf("server output reports renegotiations=%d, want at least %d — see log above", got, wantMin)
 	}
 	t.Logf("server observed renegotiations=%d (want at least %d)", got, wantMin)
+}
+
+// dataChannelClientCipherRe matches the real client's own log line naming
+// the negotiated data-channel cipher (init.c:2232-2236,
+// tls_print_deferred_options_results, AEAD branch — GCM ciphers never take
+// the ", auth '%s'" suffix, since that only fires for non-AEAD modes). The
+// string is quoted verbatim from the reference source, not paraphrased.
+var dataChannelClientCipherRe = regexp.MustCompile(`Data Channel: cipher '([A-Za-z0-9_-]+)'`)
+
+// dataCipherServerRe extracts the data_cipher= field test/interop/server's
+// PASS line carries (05-04-PLAN.md Task 1, sess.Cipher()), anchored on the
+// immediately preceding renegotiations= field — the same anchoring
+// reasoning as renegotiationsRe above: a bare `data_cipher=` pattern risks
+// matching an unrelated occurrence first, since FindStringSubmatch returns
+// only the first match in the composed log.
+var dataCipherServerRe = regexp.MustCompile(`renegotiations=\d+ data_cipher=(\S+)`)
+
+// interopSupportedDataCiphers duplicates cipher.go's own supportedDataCiphers
+// table (unexported, package ovpn) purely so assertNegotiatedCipher can
+// assert the ABSENCE of every OTHER supported cipher's client log line —
+// this package cannot import the unexported slice, and hardcoding the two
+// names here is no less precise than the regexp above already is about the
+// reference's own fixed vocabulary.
+var interopSupportedDataCiphers = []string{"AES-256-GCM", "AES-128-GCM"}
+
+// assertNegotiatedCipher is 05-04-PLAN.md Task 2's two-ended cipher proof:
+// the real client's own "Data Channel: cipher '<name>'" log line AND the
+// server's PASS line data_cipher= field must both equal want, and the
+// client's log must NOT ALSO contain the line for any other supported
+// cipher — otherwise the "cipher-order" scenario could pass on a run where
+// the client happened to log both ciphers somewhere in its output, which
+// would prove nothing about which one was actually negotiated. Asserting
+// both ends (not just the server's own PASS line) is deliberate (T-05-21):
+// a harness that only asked itself would pass a broken negotiation.
+func assertNegotiatedCipher(t *testing.T, res scenarioResult, want string) {
+	t.Helper()
+
+	if res.composeErr != nil {
+		// assertHandshakeCompleted already fails loudly on this; avoid a
+		// second, redundant fatal here obscuring the first.
+		return
+	}
+
+	clientMatch := dataChannelClientCipherRe.FindStringSubmatch(res.composeOut)
+	if clientMatch == nil {
+		t.Fatal("client output does not contain a parsable \"Data Channel: cipher '<name>'\" line — see log above")
+	}
+	if clientMatch[1] != want {
+		t.Fatalf("client negotiated cipher %q, want %q — see log above", clientMatch[1], want)
+	}
+
+	serverMatch := dataCipherServerRe.FindStringSubmatch(res.composeOut)
+	if serverMatch == nil {
+		t.Fatal("server output does not contain a parsable data_cipher= field on its PASS line — see log above")
+	}
+	if serverMatch[1] != want {
+		t.Fatalf("server PASS line reports data_cipher=%s, want %s — see log above", serverMatch[1], want)
+	}
+
+	for _, other := range interopSupportedDataCiphers {
+		if other == want {
+			continue
+		}
+		otherLine := fmt.Sprintf("Data Channel: cipher '%s'", other)
+		if strings.Contains(res.composeOut, otherLine) {
+			t.Fatalf("client output ALSO contains %q — the client logged both ciphers, so this run cannot prove which one was actually negotiated — see log above", otherLine)
+		}
+	}
+
+	t.Logf("negotiated data-channel cipher: %s (client and server agree)", want)
 }
 
 // assertCertificateFlightFragmented is 01-04-PLAN.md Task 1's fragmentation

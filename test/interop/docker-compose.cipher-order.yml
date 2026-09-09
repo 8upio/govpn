@@ -1,0 +1,25 @@
+# Overlay for the "cipher-order" interop scenario (05-04-PLAN.md Task 2):
+# the server's allow-list is `-data-ciphers AES-256-GCM:AES-128-GCM` — the
+# server's OWN preference order. The CLIENT is deliberately configured with
+# the REVERSE order (interop_test.go's "cipher-order" scenario entry,
+# clientDirectives: []string{"data-ciphers AES-128-GCM:AES-256-GCM"}).
+#
+# The expected outcome is the SERVER's first entry, AES-256-GCM — proving
+# ROADMAP success criterion 2 (server order wins a tie, never the client's)
+# against a real, unmodified OpenVPN 2.6 client, not only a unit test. A
+# future reader who "fixes" the apparent client/server mismatch above by
+# making the two lists match would delete the entire point of this
+# scenario: with matching lists, a bug that let the CLIENT's order win
+# would still produce a passing, working tunnel and go completely
+# unnoticed. DO NOT reconcile the two orders.
+#
+# `docker compose -f docker-compose.yml -f docker-compose.cipher-order.yml up`
+# mirrors docker-compose.reneg.yml's own shape and comment discipline:
+# override ONLY the server service's `command`. The server gains NO new
+# privileges here — no cap_add, no privileged, no devices — the unprivileged
+# posture is a standing invariant of this harness (T-01-07), and
+# assertServerStaysUnprivileged runs on this scenario exactly like every
+# other one.
+services:
+  server:
+    command: ["-pki", "/pki", "-listen", "0.0.0.0:1194", "-deadline", "60s", "-data-ciphers", "AES-256-GCM:AES-128-GCM"]

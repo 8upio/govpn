@@ -1,0 +1,24 @@
+# Overlay for the "cipher-128" interop scenario (05-04-PLAN.md Task 2): a
+# real, unmodified OpenVPN 2.6 client configured with `data-ciphers
+# AES-128-GCM` (its only supported cipher) connects to a server whose
+# allow-list ALSO contains only AES-128-GCM (-data-ciphers AES-128-GCM,
+# 05-04-PLAN.md Task 1) — proving ROADMAP success criterion 1's
+# AES-128-GCM half against the reference implementation, not merely a unit
+# test, and proving a one-entry allow-list works at all.
+#
+# `docker compose -f docker-compose.yml -f docker-compose.cipher-128.yml up`
+# mirrors docker-compose.reneg.yml's own shape and comment discipline:
+# override ONLY the server service's `command`. The server gains NO new
+# privileges here — no cap_add, no privileged, no devices — the unprivileged
+# posture is a standing invariant of this harness (T-01-07), and
+# assertServerStaysUnprivileged runs on this scenario exactly like every
+# other one.
+#
+# The client's half of this pairing lives in interop_test.go's "cipher-128"
+# scenario entry (clientDirectives: []string{"data-ciphers AES-128-GCM"},
+# passed through cmd/gentestpki's -client-directive flag) — these two
+# literals must agree, since cmd/gentestpki generates the client side and
+# this file configures the server side independently.
+services:
+  server:
+    command: ["-pki", "/pki", "-listen", "0.0.0.0:1194", "-deadline", "60s", "-data-ciphers", "AES-128-GCM"]
