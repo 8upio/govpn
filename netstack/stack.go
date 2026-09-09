@@ -69,7 +69,7 @@ type protocolHandler interface {
 // (D-14). Session.Read is datagram-shaped and, per its own documented
 // contract (session.go:305-334), returns an error while RETAINING the
 // packet if the caller's buffer is too small for it. 2048 covers the
-// pushed `tun-mtu 1500` (ovpn.go's serverKM2Options) with headroom for any
+// pushed `tun-mtu 1500` (cipher.go's serverKM2Options) with headroom for any
 // future MTU adjustment — but the pushed MTU is advisory only, never
 // enforced upstream of this loop, so a non-conforming or hostile client
 // can still hand this stack a larger packet. See maxReadRetryBufferSize
@@ -95,7 +95,7 @@ const maxReadRetryBufferSize = 65535
 // MSS this stack advertises in every SYN-ACK (maxSegmentSize).
 const (
 	// defaultMTU is the `tun-mtu 1500` this project pushes to clients
-	// (ovpn.go's serverKM2Options). An embedder that changes neither
+	// (cipher.go's serverKM2Options). An embedder that changes neither
 	// side keeps the two in step.
 	defaultMTU = 1500
 

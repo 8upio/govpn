@@ -25,7 +25,7 @@ import "time"
 const (
 	// defaultMSS is this stack's DOCUMENTED default MSS — the value
 	// Stack.maxSegmentSize returns at defaultMTU: RESEARCH.md
-	// Pattern 3 — tun-mtu 1500 (ovpn.go's serverKM2Options) minus 20B
+	// Pattern 3 — tun-mtu 1500 (cipher.go's serverKM2Options) minus 20B
 	// IPv4 minus 20B TCP, with no additional VPN-specific subtraction
 	// (that overhead is already accounted for below the Session
 	// boundary). The MSS actually advertised is derived from the
