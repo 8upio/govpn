@@ -14,6 +14,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -741,5 +742,170 @@ func TestSelectCipherBoundaries(t *testing.T) {
 				t.Errorf("selectCipher(%v, %v, %q) = %q, want %q", tt.allowList, tt.peerCiphers, tt.occCipher, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestTwoConcurrentSessionsNegotiateDifferentCiphers is this plan's
+// in-process half of ROADMAP success criterion 1: two clients connected
+// concurrently to one server, one advertising only AES-128-GCM and the
+// other only AES-256-GCM, each negotiate their own cipher, and each
+// session's data channel keeps working while the other is live — the
+// cipher is per-session state, never a server-wide one. Run under -race and
+// -count=5 so a shared-state bug cannot pass by scheduling luck.
+func TestTwoConcurrentSessionsNegotiateDifferentCiphers(t *testing.T) {
+	_, network, err := net.ParseCIDR("10.45.3.0/24")
+	if err != nil {
+		t.Fatalf("parse network: %v", err)
+	}
+	key := testTLSCryptKey(t)
+
+	srv, serverPC, caPool, sessions := newCipherTracerServer(t, network, key)
+	defer serverPC.Close()
+	defer srv.Close()
+
+	type clientResult struct {
+		sess          *Session
+		client        *testPushClient
+		wantCipher    string
+		wantKeyLen    int
+		clientWrapper *datachan.Wrapper
+	}
+
+	// bringUp drives ONLY the client-side steps (handshake through reading
+	// the push reply) and does NOT touch the shared sessions channel:
+	// OnSession fires from the server's own per-session goroutine, whose
+	// completion is not ordered against the client-side push-reply read
+	// returning, so racing two goroutines each on their own "receive the
+	// next session off the shared channel" would attribute session A to
+	// client B whenever the scheduler interleaves the two arrivals — a bug
+	// in a test asserting per-session state, not in the code under test.
+	// Sessions are collected separately below and matched to a client by
+	// their own negotiated cipher, which is unambiguous because the two
+	// clients advertise different single ciphers.
+	bringUp := func(peerInfoLine string) *testPushClient {
+		t.Helper()
+		client, replyReader, _ := tunnelUpCipherTestClient(t, key, serverPC.LocalAddr(), caPool, peerInfoLine)
+		if err := writeControlString(client.tlsConn, pushRequestLiteral); err != nil {
+			t.Fatalf("write push request: %v", err)
+		}
+		if _, err := readControlString(replyReader, maxControlStringLen); err != nil {
+			t.Fatalf("read push reply: %v", err)
+		}
+		return client
+	}
+
+	var wg sync.WaitGroup
+	results := make([]*clientResult, 2)
+	specs := []struct {
+		peerInfoLine string
+		wantCipher   string
+		wantKeyLen   int
+	}{
+		{"IV_CIPHERS=AES-128-GCM", "AES-128-GCM", 16},
+		{"IV_CIPHERS=AES-256-GCM", "AES-256-GCM", 32},
+	}
+	for i, spec := range specs {
+		i, spec := i, spec
+		results[i] = &clientResult{wantCipher: spec.wantCipher, wantKeyLen: spec.wantKeyLen}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i].client = bringUp(spec.peerInfoLine)
+		}()
+	}
+	wg.Wait()
+
+	// Drain exactly two sessions off the shared channel (any order) and
+	// match each to the clientResult whose wantCipher it negotiated.
+	for n := 0; n < 2; n++ {
+		var sess *Session
+		select {
+		case sess = <-sessions:
+		case <-time.After(5 * time.Second):
+			t.Fatal("OnSession was not called for both sessions")
+		}
+		cipher := sess.Cipher()
+		matched := false
+		for _, r := range results {
+			if r.wantCipher == cipher && r.sess == nil {
+				r.sess = sess
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			t.Fatalf("received a session with cipher %q that does not match any expected client (results: %+v)", cipher, results)
+		}
+	}
+
+	for i, r := range results {
+		defer r.client.Close()
+
+		if got := r.sess.Cipher(); got != r.wantCipher {
+			t.Errorf("client %d: sess.Cipher() = %q, want %q", i, got, r.wantCipher)
+		}
+		if got := r.sess.Stats().Cipher; got != r.wantCipher {
+			t.Errorf("client %d: sess.Stats().Cipher = %q, want %q", i, got, r.wantCipher)
+		}
+		serverKeys, ok := r.sess.DebugDataKeys()
+		if !ok {
+			t.Fatalf("client %d: DebugDataKeys() not ok on an established session", i)
+		}
+		if serverKeys.CipherKeyLen != r.wantKeyLen {
+			t.Errorf("client %d: DebugDataKeys().CipherKeyLen = %d, want %d", i, serverKeys.CipherKeyLen, r.wantKeyLen)
+		}
+
+		clientWrapper, err := datachan.NewWrapper(mirrorDataKeys(serverKeys), r.sess.PeerID(), 0)
+		if err != nil {
+			t.Fatalf("client %d: build client wrapper: %v", i, err)
+		}
+		results[i].clientWrapper = clientWrapper
+	}
+
+	// Both sessions are established at the same moment. Exchange a data
+	// packet on EACH while the other is still live — this is the part that
+	// would catch a shared wrapper or a last-writer-wins field, which
+	// asserting the two cipher names differ alone cannot.
+	for i, r := range results {
+		payloadIn := bytes.Repeat([]byte{byte(0x30 + i)}, 60)
+		sealedIn, err := r.clientWrapper.Seal(nil, payloadIn)
+		if err != nil {
+			t.Fatalf("client %d: Seal: %v", i, err)
+		}
+		r.sess.handleDataPacket(sealedIn)
+
+		buf := make([]byte, 2048)
+		n, err := r.sess.Read(buf)
+		if err != nil {
+			t.Fatalf("client %d: Session.Read: %v", i, err)
+		}
+		if !bytes.Equal(buf[:n], payloadIn) {
+			t.Fatalf("client %d: Session.Read = %x, want %x", i, buf[:n], payloadIn)
+		}
+
+		payloadOut := bytes.Repeat([]byte{byte(0x40 + i)}, 60)
+		if _, err := r.sess.Write(payloadOut); err != nil {
+			t.Fatalf("client %d: Session.Write: %v", i, err)
+		}
+		var wireBytes []byte
+		select {
+		case wireBytes = <-r.client.dataOut:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("client %d: did not observe Write's output data packet", i)
+		}
+		opened, err := r.clientWrapper.Open(nil, wireBytes)
+		if err != nil {
+			t.Fatalf("client %d: client Open of Write's output: %v", i, err)
+		}
+		if !bytes.Equal(opened, payloadOut) {
+			t.Fatalf("client %d: client Open = %x, want %x", i, opened, payloadOut)
+		}
+	}
+
+	if results[0].sess.Cipher() == results[1].sess.Cipher() {
+		t.Fatalf("both sessions negotiated the same cipher %q, want distinct AES-128-GCM/AES-256-GCM", results[0].sess.Cipher())
+	}
+	if !containsFold(srv.dataCiphers, results[0].sess.Cipher()) || !containsFold(srv.dataCiphers, results[1].sess.Cipher()) {
+		t.Fatalf("negotiated ciphers %q/%q are not both members of the server's allow-list %v", results[0].sess.Cipher(), results[1].sess.Cipher(), srv.dataCiphers)
 	}
 }

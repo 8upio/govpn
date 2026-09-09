@@ -337,3 +337,47 @@ func TestSessionStatsLastAuthTrafficAtAdvancesOnAuthOnly(t *testing.T) {
 		t.Fatalf("Stats().LastAuthTrafficAt = %v after forged traffic, want unchanged %v", got, wantTouch)
 	}
 }
+
+// TestSessionStatsReportsNegotiatedCipher is 05-02-PLAN.md Task 3's
+// SessionStats.Cipher behavior: it equals Session.Cipher() once negotiation
+// has completed, and is the empty string before it.
+func TestSessionStatsReportsNegotiatedCipher(t *testing.T) {
+	fresh := &Session{}
+	if got := fresh.Stats().Cipher; got != "" {
+		t.Errorf("Stats().Cipher on a fresh, never-negotiated Session = %q, want empty", got)
+	}
+
+	_, network, err := net.ParseCIDR("10.45.4.0/24")
+	if err != nil {
+		t.Fatalf("parse network: %v", err)
+	}
+	key := testTLSCryptKey(t)
+
+	srv, serverPC, caPool, sessions := newCipherTracerServer(t, network, key)
+	defer serverPC.Close()
+	defer srv.Close()
+
+	client, replyReader, _ := tunnelUpCipherTestClient(t, key, serverPC.LocalAddr(), caPool, "IV_CIPHERS=AES-128-GCM")
+	defer client.Close()
+
+	if err := writeControlString(client.tlsConn, pushRequestLiteral); err != nil {
+		t.Fatalf("write push request: %v", err)
+	}
+	if _, err := readControlString(replyReader, maxControlStringLen); err != nil {
+		t.Fatalf("read push reply: %v", err)
+	}
+
+	var sess *Session
+	select {
+	case sess = <-sessions:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnSession was never called")
+	}
+
+	if got, want := sess.Stats().Cipher, sess.Cipher(); got != want {
+		t.Errorf("Stats().Cipher = %q, want it to equal Cipher() = %q", got, want)
+	}
+	if sess.Cipher() != "AES-128-GCM" {
+		t.Fatalf("sess.Cipher() = %q, want %q", sess.Cipher(), "AES-128-GCM")
+	}
+}

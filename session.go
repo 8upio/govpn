@@ -486,6 +486,13 @@ type SessionStats struct {
 	// exactly like the netstack's own per-listener drop counters.
 	InboundQueueDropped uint64
 
+	// Cipher is the same value Session.Cipher() already exposes — the
+	// negotiated data-channel cipher's canonical upper-case name, "" before
+	// the Key Method 2 exchange completes, never changing afterward
+	// (CIPH-06). Included here so a caller that only wants Stats() doesn't
+	// need a second accessor call.
+	Cipher string
+
 	// Renegotiations is the same value RenegotiationCount() already
 	// exposes — included here so a caller that only wants Stats() doesn't
 	// need a second accessor call.
@@ -650,6 +657,7 @@ func (s *Session) Stats() SessionStats {
 		InboundQueueDropped: s.inboundQueueDropped.Load(),
 	}
 	s.mu.Lock()
+	stats.Cipher = s.cipher
 	stats.Renegotiations = s.renegotiations
 	stats.EstablishedAt = s.establishedAt
 	stats.LastAuthTrafficAt = s.lastAuthTraffic

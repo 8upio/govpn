@@ -26,6 +26,7 @@ import (
 	"net"
 	"runtime/debug"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -779,14 +780,10 @@ func (s *Server) Serve(pc net.PacketConn) error {
 	if s.cfg.Network != nil {
 		networkAttr = s.cfg.Network.String()
 	}
-	cipherAttr := s.cfg.Cipher
-	if cipherAttr == "" {
-		cipherAttr = "AES-256-GCM"
-	}
 	s.logger().Info("server listening",
 		"addr", pc.LocalAddr(),
 		"network", networkAttr,
-		"cipher", cipherAttr,
+		"data_ciphers", strings.Join(s.dataCiphers, ":"),
 		"ping", s.pingInterval,
 		"reap", s.reapWindow,
 		"reneg_sec", s.renegSec,
@@ -1343,6 +1340,7 @@ func (s *Server) runHandshake(sess *Session) {
 	sess.logger().Info("session established",
 		"tls_version", state.Version,
 		"tls_cipher", tls.CipherSuiteName(state.CipherSuite),
+		"cipher", sess.Cipher(),
 	)
 
 	// D-08: OnSession fires only here — after Key Method 2 and the

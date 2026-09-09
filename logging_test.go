@@ -382,3 +382,101 @@ func TestLoggerNeverLeaksKeyMaterial(t *testing.T) {
 		t.Fatalf("rendered log output contains the tls-crypt key hex: %s", buf.String())
 	}
 }
+
+// TestSessionEstablishedRecordCarriesCipher is 05-02-PLAN.md Task 3's
+// coverage of the "session established" record's cipher attribute: it
+// carries the negotiated canonical cipher name.
+func TestSessionEstablishedRecordCarriesCipher(t *testing.T) {
+	_, network, err := net.ParseCIDR("10.45.5.0/24")
+	if err != nil {
+		t.Fatalf("parse network: %v", err)
+	}
+	key := testTLSCryptKey(t)
+
+	serverPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("server listen: %v", err)
+	}
+	defer serverPC.Close()
+
+	tlsCfg, caPool := testHandshakeTLSConfig(t)
+
+	buf := &syncBuffer{}
+	lg := newTestLogger(buf, slog.LevelDebug)
+
+	sessions := make(chan *Session, 1)
+	srv := NewServer(Config{
+		TLSCryptKey:  key,
+		TLSConfig:    tlsCfg,
+		Network:      network,
+		AuthUserPass: testPermissiveAuthUserPass,
+		DataCiphers:  []string{"AES-256-GCM", "AES-128-GCM"},
+		OnSession:    func(sess *Session) { sessions <- sess },
+		Logger:       lg,
+	})
+	go func() { _ = srv.Serve(serverPC) }()
+	defer srv.Close()
+
+	client, replyReader, _ := tunnelUpCipherTestClient(t, key, serverPC.LocalAddr(), caPool, "IV_CIPHERS=AES-128-GCM")
+	defer client.Close()
+
+	if err := writeControlString(client.tlsConn, pushRequestLiteral); err != nil {
+		t.Fatalf("write push request: %v", err)
+	}
+	if _, err := readControlString(replyReader, maxControlStringLen); err != nil {
+		t.Fatalf("read push reply: %v", err)
+	}
+
+	select {
+	case <-sessions:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnSession was never called")
+	}
+
+	established := waitForLogContains(t, buf, `msg="session established"`, 5*time.Second)
+	if !strings.Contains(established, "cipher=AES-128-GCM") {
+		t.Errorf("session established record missing cipher=AES-128-GCM: %s", established)
+	}
+}
+
+// TestServerListeningRecordReportsAllowList is 05-02-PLAN.md Task 3's
+// coverage of the "server listening" record: it carries data_ciphers with
+// the resolved allow-list colon-joined in the server's own configured
+// order, and no longer carries a single fixed cipher attribute.
+func TestServerListeningRecordReportsAllowList(t *testing.T) {
+	_, network, err := net.ParseCIDR("10.45.6.0/24")
+	if err != nil {
+		t.Fatalf("parse network: %v", err)
+	}
+	key := testTLSCryptKey(t)
+
+	serverPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("server listen: %v", err)
+	}
+	defer serverPC.Close()
+
+	tlsCfg, _ := testHandshakeTLSConfig(t)
+
+	buf := &syncBuffer{}
+	lg := newTestLogger(buf, slog.LevelDebug)
+
+	srv := NewServer(Config{
+		TLSCryptKey:  key,
+		TLSConfig:    tlsCfg,
+		Network:      network,
+		AuthUserPass: testPermissiveAuthUserPass,
+		DataCiphers:  []string{"AES-128-GCM", "AES-256-GCM"},
+		Logger:       lg,
+	})
+	go func() { _ = srv.Serve(serverPC) }()
+	defer srv.Close()
+
+	listening := waitForLogContains(t, buf, `msg="server listening"`, 5*time.Second)
+	if !strings.Contains(listening, "data_ciphers=AES-128-GCM:AES-256-GCM") {
+		t.Errorf("server listening record missing data_ciphers=AES-128-GCM:AES-256-GCM: %s", listening)
+	}
+	if strings.Contains(listening, "cipher=") {
+		t.Errorf("server listening record still carries a fixed cipher attribute: %s", listening)
+	}
+}
