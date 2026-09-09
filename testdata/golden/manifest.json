@@ -37,7 +37,8 @@
     "peer_id": 0,
     "data_packet_id": 2,
     "key_file": "data-channel.key",
-    "sender_slot": 0
+    "sender_slot": 0,
+    "cipher": "AES-256-GCM"
   },
   {
     "file": "007-server-to-client-icmp-echo-reply.bin",
@@ -47,7 +48,8 @@
     "peer_id": 0,
     "data_packet_id": 1,
     "key_file": "data-channel.key",
-    "sender_slot": 1
+    "sender_slot": 1,
+    "cipher": "AES-256-GCM"
   },
   {
     "file": "008-server-to-client-ping-keepalive.bin",
@@ -55,8 +57,42 @@
     "opcode": 9,
     "packet_id": 0,
     "peer_id": 0,
-    "data_packet_id": 10,
+    "data_packet_id": 17,
     "key_file": "data-channel.key",
-    "sender_slot": 1
+    "sender_slot": 1,
+    "cipher": "AES-256-GCM"
+  },
+  {
+    "file": "009-client-to-server-icmp-echo-request.bin",
+    "direction": "client-\u003eserver",
+    "opcode": 9,
+    "packet_id": 0,
+    "peer_id": 0,
+    "data_packet_id": 2,
+    "key_file": "data-channel-aes128.key",
+    "sender_slot": 0,
+    "cipher": "AES-128-GCM"
+  },
+  {
+    "file": "010-server-to-client-icmp-echo-reply.bin",
+    "direction": "server-\u003eclient",
+    "opcode": 9,
+    "packet_id": 0,
+    "peer_id": 0,
+    "data_packet_id": 1,
+    "key_file": "data-channel-aes128.key",
+    "sender_slot": 1,
+    "cipher": "AES-128-GCM"
+  },
+  {
+    "file": "011-server-to-client-ping-keepalive.bin",
+    "direction": "server-\u003eclient",
+    "opcode": 9,
+    "packet_id": 0,
+    "peer_id": 0,
+    "data_packet_id": 11,
+    "key_file": "data-channel-aes128.key",
+    "sender_slot": 1,
+    "cipher": "AES-128-GCM"
   }
 ]
