@@ -137,7 +137,16 @@ func main() {
 	soakCycles := flag.Int("soak-cycles", 0, "number of connect/use/clean-disconnect cycles to observe from ONE long-lived server process before printing PASS and exiting; 0 keeps every pre-existing scenario's normal single-session, probe-driven behavior completely unchanged (04-04-PLAN.md Task 1)")
 	noClientCert := flag.Bool("no-client-cert", false, "use tls.NoClientCert instead of tls.RequireAndVerifyClientCert; false (default) leaves every pre-existing scenario's mandatory-client-cert posture unchanged (quick 260908-m4e)")
 	authUserPass := flag.String("auth-user-pass", "", "\"user:pass\" to authenticate clients via ovpn.Config.AuthUserPass; empty (default) leaves the hook nil, unchanged behaviour (quick 260908-m4e)")
+	dataCiphers := flag.String("data-ciphers", "", "colon-separated data-channel cipher allow-list in the server's own preference order (e.g. \"AES-256-GCM:AES-128-GCM\"), passed straight through to ovpn.Config.DataCiphers; empty (default) leaves it nil, which resolves to the library's own default AES-256-GCM/AES-128-GCM pair — every pre-existing scenario's behaviour is unchanged byte-for-byte (05-04-PLAN.md Task 1)")
 	flag.Parse()
+
+	// dataCiphersList is nil when -data-ciphers is empty, matching
+	// ovpn.Config.DataCiphers' own "nil means the library's default" contract
+	// (resolveDataCiphers) rather than passing a single empty-string element.
+	var dataCiphersList []string
+	if *dataCiphers != "" {
+		dataCiphersList = strings.Split(*dataCiphers, ":")
+	}
 
 	// Soak mode (04-04-PLAN.md Task 1) is dispatched to its own entry point,
 	// runSoak, entirely separate from run() below: run()'s single-OnSession,
@@ -145,20 +154,42 @@ func main() {
 	// untouched for every non-soak scenario, rather than threading a branch
 	// through its tightly-coupled single-session channel/select logic.
 	if *soakCycles > 0 {
-		if err := runSoak(*pkiDir, *listenAddr, *deadline, uint16(*httpPort), uint16(*udpPort), *soakCycles); err != nil {
+		if err := runSoak(*pkiDir, *listenAddr, *deadline, uint16(*httpPort), uint16(*udpPort), *soakCycles, dataCiphersList); err != nil {
 			fmt.Fprintln(os.Stderr, "interop-server:", err)
 			os.Exit(1)
 		}
 		return
 	}
 
-	if err := run(*pkiDir, *listenAddr, *deadline, *dropRate, *reorderRate, *reorderDelay, *seed, uint16(*httpPort), uint16(*udpPort), *renegSec, *hold, *noClientCert, *authUserPass); err != nil {
+	if err := run(*pkiDir, *listenAddr, *deadline, *dropRate, *reorderRate, *reorderDelay, *seed, uint16(*httpPort), uint16(*udpPort), *renegSec, *hold, *noClientCert, *authUserPass, dataCiphersList); err != nil {
 		fmt.Fprintln(os.Stderr, "interop-server:", err)
 		os.Exit(1)
 	}
 }
 
-func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorderRatePct float64, reorderDelay time.Duration, seed int64, httpPort, udpPort uint16, renegSec, hold time.Duration, noClientCert bool, authUserPass string) error {
+// defaultDataCiphersDisplay is the human-readable rendering of the
+// library's own default data-channel cipher allow-list (resolveDataCiphers'
+// nil-DataCiphers fallback, cipher.go) — duplicated here (not imported,
+// since resolveDataCiphers is unexported) purely so site.Options.Cipher can
+// display what the server is willing to negotiate when -data-ciphers is
+// unset, without the harness guessing at a string the library itself never
+// exposes for display.
+const defaultDataCiphersDisplay = "AES-256-GCM:AES-128-GCM"
+
+// dataCiphersDisplay renders dataCiphers (nil or empty when -data-ciphers
+// was not given) the way site.Options.Cipher should show it: the resolved
+// allow-list, colon-joined, or defaultDataCiphersDisplay when the flag was
+// left unset. This mirrors ovpn.Config.DataCiphers' own "nil resolves to
+// the library's default pair" semantics for display purposes only — it
+// does not itself validate or canonicalize names, that is Serve's job.
+func dataCiphersDisplay(dataCiphers []string) string {
+	if len(dataCiphers) == 0 {
+		return defaultDataCiphersDisplay
+	}
+	return strings.Join(dataCiphers, ":")
+}
+
+func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorderRatePct float64, reorderDelay time.Duration, seed int64, httpPort, udpPort uint16, renegSec, hold time.Duration, noClientCert bool, authUserPass string, dataCiphers []string) error {
 	tlsCfg, tlsCryptKey, err := loadConfig(pkiDir, noClientCert)
 	if err != nil {
 		return fmt.Errorf("load PKI material: %w", err)
@@ -237,7 +268,13 @@ func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorder
 
 	var httpRequests atomic.Int64
 	instrumented := newRequestCountingHandler(site.Handler(site.Options{
-		Cipher:    "AES-256-GCM",
+		// Cipher (05-04-PLAN.md Task 1): the resolved -data-ciphers
+		// allow-list, not a fixed literal — site.Options.Cipher is a
+		// process-wide value constructed before any session exists, so it
+		// names what the server is WILLING to negotiate, not what one
+		// session actually negotiated (reshaping the site package for
+		// per-session display is out of this phase's scope).
+		Cipher:    dataCiphersDisplay(dataCiphers),
 		StartedAt: time.Now(),
 	}), &httpRequests)
 	// WR-02: an *http.Server with explicit timeouts, not the bare
@@ -283,7 +320,15 @@ func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorder
 		TLSConfig:   tlsCfg,
 		TLSCryptKey: tlsCryptKey,
 		Network:     tunnelNetwork,
-		Cipher:      "AES-256-GCM",
+		// DataCiphers (05-04-PLAN.md Task 1): the resolved -data-ciphers
+		// allow-list, nil when the flag was unset — resolving to the
+		// library's own default AES-256-GCM/AES-128-GCM pair, exactly what
+		// the old fixed Cipher: "AES-256-GCM" resolved to for every
+		// pre-existing scenario. Cipher is deliberately dropped here so a
+		// scenario that passes -data-ciphers can only be exercising
+		// Config.DataCiphers, never silently falling back to the
+		// compatibility shorthand (T-05-23).
+		DataCiphers: dataCiphers,
 		// RenegSec (04-03-PLAN.md Task 1): 0 (every pre-existing scenario's
 		// default flag value) means the library's own 3600s default — this
 		// only shortens the server's own reneg-sec timer for the "reneg"
@@ -451,10 +496,17 @@ func run(pkiDir, listenAddr string, deadline time.Duration, dropRatePct, reorder
 			exitNotifyField = fmt.Sprintf(" exit_notify_close_after=%s", closedAt.Sub(es.openedAt).Round(time.Millisecond))
 		}
 
+		// data_cipher= (05-04-PLAN.md Task 1) reads sess.Cipher() — the
+		// per-session NEGOTIATED data-channel cipher — distinct from the
+		// pre-existing cipher_suite= field above it, which is the
+		// control-channel TLS handshake's own cipher suite. Appended after
+		// the pre-existing renegotiations= field and before the optional
+		// exit_notify_close_after= field, so every pre-existing field keeps
+		// its exact position.
 		log.Printf(
-			"PASS: session established and stable %s past handshake completion; peer_cn=%s tls_version=%s tls_version_raw=0x%04x cipher_suite=%s km2=ok push_request=%s assigned_ip=%s peer_id=%d ping_rx=%d ping_tx=%d udp_rx=%d udp_tx=%d http_requests=%d renegotiations=%d%s",
+			"PASS: session established and stable %s past handshake completion; peer_cn=%s tls_version=%s tls_version_raw=0x%04x cipher_suite=%s km2=ok push_request=%s assigned_ip=%s peer_id=%d ping_rx=%d ping_tx=%d udp_rx=%d udp_tx=%d http_requests=%d renegotiations=%d data_cipher=%s%s",
 			postHandshakeSurvival, sess.PeerCN, tls.VersionName(state.Version), state.Version, tls.CipherSuiteName(state.CipherSuite), pushStatus, sess.AssignedIP(), sess.PeerID(),
-			netStats.ICMPEchoRequests, netStats.ICMPEchoReplies, udpRx.Load(), udpTx.Load(), httpRequests.Load(), sess.RenegotiationCount(), exitNotifyField,
+			netStats.ICMPEchoRequests, netStats.ICMPEchoReplies, udpRx.Load(), udpTx.Load(), httpRequests.Load(), sess.RenegotiationCount(), sess.Cipher(), exitNotifyField,
 		)
 
 		_ = srv.Close()
@@ -621,7 +673,7 @@ func (s *soakTracker) watchClose(cycleNum int, obs *sessionCloseObserver) {
 // disconnect cycles from ONE long-lived server process (ROADMAP Phase 4
 // success criterion 3). run() above is left completely untouched; every
 // non-soak scenario's behavior is unaffected by this function's existence.
-func runSoak(pkiDir, listenAddr string, deadline time.Duration, httpPort, udpPort uint16, cycles int) error {
+func runSoak(pkiDir, listenAddr string, deadline time.Duration, httpPort, udpPort uint16, cycles int, dataCiphers []string) error {
 	// The soak scenario is not part of quick 260908-m4e's scope — always
 	// require a client certificate, exactly as before.
 	tlsCfg, tlsCryptKey, err := loadConfig(pkiDir, false)
@@ -660,7 +712,10 @@ func runSoak(pkiDir, listenAddr string, deadline time.Duration, httpPort, udpPor
 
 	var httpRequests atomic.Int64
 	instrumented := newRequestCountingHandler(site.Handler(site.Options{
-		Cipher:    "AES-256-GCM",
+		// Cipher: same reasoning as run()'s own site.Options construction
+		// above (05-04-PLAN.md Task 1) — the resolved allow-list, not a
+		// fixed literal.
+		Cipher:    dataCiphersDisplay(dataCiphers),
 		StartedAt: time.Now(),
 	}), &httpRequests)
 	httpSrv := newHardenedHTTPServer(instrumented)
@@ -698,7 +753,11 @@ func runSoak(pkiDir, listenAddr string, deadline time.Duration, httpPort, udpPor
 		TLSConfig:   tlsCfg,
 		TLSCryptKey: tlsCryptKey,
 		Network:     tunnelNetwork,
-		Cipher:      "AES-256-GCM",
+		// DataCiphers: same reasoning as run()'s own ovpn.Config
+		// construction above (05-04-PLAN.md Task 1) — Cipher dropped
+		// entirely, DataCiphers carries the resolved allow-list (nil
+		// resolves to the library's default pair).
+		DataCiphers: dataCiphers,
 		Logger:      interopLogger(),
 		OnSession: func(sess *ovpn.Session) {
 			cycleNum := tracker.opened()
@@ -1128,15 +1187,31 @@ const (
 
 // dataChannelKeyExport is the on-disk (hex-encoded) shape of
 // sess.DebugDataKeys()'s output — the server's own per-direction
-// AES-256-GCM key/implicit-IV material (keyderiv.Key2.ServerSlots), read
-// back by test/interop/golden_export.go and internal/datachan/golden_test.go
-// to independently open/re-seal a captured session's P_DATA_V2 traffic
-// (02-04-PLAN.md Task 2).
+// key/implicit-IV material (keyderiv.Key2.ServerSlots), read back by
+// test/interop/golden_export.go and internal/datachan/golden_test.go to
+// independently open/re-seal a captured session's P_DATA_V2 traffic
+// (02-04-PLAN.md Task 2). The four hex fields always encode the FULL
+// 32-byte key-expansion slot, regardless of Cipher/CipherKeyLen: the
+// underlying slot is always 64 bytes wide (32 bytes cipher key + 32 bytes
+// HMAC key) no matter which data-channel cipher was negotiated, and
+// truncating the hex string to CipherKeyLen bytes for an AES-128-GCM
+// session would break the fixed-width decoding golden_export.go and
+// golden_test.go's hexDecodeFixed both depend on. Only the new
+// Cipher/CipherKeyLen fields (05-04-PLAN.md Task 1) tell the reading side
+// how many of those 32 bytes the AEAD construction actually uses.
 type dataChannelKeyExport struct {
 	EncryptCipher     string `json:"encrypt_cipher"`
 	EncryptImplicitIV string `json:"encrypt_implicit_iv"`
 	DecryptCipher     string `json:"decrypt_cipher"`
 	DecryptImplicitIV string `json:"decrypt_implicit_iv"`
+
+	// Cipher and CipherKeyLen (05-04-PLAN.md Task 1) record the negotiated
+	// data-channel cipher (sess.Cipher()) and its AEAD key length in bytes
+	// (keys.CipherKeyLen — 16 or 32), so plan 05-05's golden vectors know
+	// which cipher a captured session's key material was actually derived
+	// for, without guessing from the scenario name alone.
+	Cipher       string `json:"cipher"`
+	CipherKeyLen int    `json:"cipher_key_len"`
 }
 
 // writeDataChannelKeyExport writes sess's derived data-channel key material
@@ -1153,6 +1228,8 @@ func writeDataChannelKeyExport(sess *ovpn.Session) error {
 		EncryptImplicitIV: hex.EncodeToString(keys.EncryptImplicitIV[:]),
 		DecryptCipher:     hex.EncodeToString(keys.DecryptCipher[:]),
 		DecryptImplicitIV: hex.EncodeToString(keys.DecryptImplicitIV[:]),
+		Cipher:            sess.Cipher(),
+		CipherKeyLen:      keys.CipherKeyLen,
 	}
 	data, err := json.MarshalIndent(export, "", "  ")
 	if err != nil {
