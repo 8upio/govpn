@@ -28,6 +28,11 @@ const goldenDir = "../../testdata/golden"
 // the same name exactly — an independent local copy, matching this
 // project's established per-package convention (internal/wire/golden_test.go
 // and internal/tlscrypt/golden_test.go each already define their own).
+// Cipher (05-05-PLAN.md Task 1) is a data-channel-only field: an absent
+// value means AES-256-GCM (every entry committed before Phase 5's cipher
+// negotiation meant that implicitly), so a manifest checked out at an
+// older revision — or any control-channel entry, which never sets it —
+// stays readable unchanged.
 type goldenManifestEntry struct {
 	File      string `json:"file"`
 	Direction string `json:"direction"`
@@ -38,6 +43,17 @@ type goldenManifestEntry struct {
 	DataPacketID *uint32 `json:"data_packet_id,omitempty"`
 	KeyFile      string  `json:"key_file,omitempty"`
 	SenderSlot   *int    `json:"sender_slot,omitempty"`
+	Cipher       string  `json:"cipher,omitempty"`
+}
+
+// manifestCipher returns entry's cipher name, defaulting to "AES-256-GCM"
+// when absent — goldenManifestEntry.Cipher's own documented meaning for
+// every vector committed before cipher negotiation existed.
+func manifestCipher(entry goldenManifestEntry) string {
+	if entry.Cipher == "" {
+		return "AES-256-GCM"
+	}
+	return entry.Cipher
 }
 
 func loadGoldenManifest(t *testing.T) []goldenManifestEntry {
@@ -79,11 +95,21 @@ func readVector(t *testing.T, file string) []byte {
 
 // dataChannelKeyFile mirrors test/interop/server/main.go's own
 // dataChannelKeyExport JSON shape exactly (hex-encoded byte fields).
+// Cipher/CipherKeyLen (05-05-PLAN.md Task 1) are optional: a key file
+// written before 05-04-PLAN.md landed has neither, and loadGoldenDataKeys
+// below defaults CipherKeyLen to 32 in that case — the only cipher v1.0
+// ever produced. EncryptCipher/DecryptCipher stay 32-byte-wide (64 hex
+// chars) for every cipher, including AES-128-GCM: they carry the full
+// key-expansion slot, not the trimmed AEAD key (RESEARCH.md Pitfall 5) —
+// hexDecodeFixed's exact-length check against the fixed [32]byte
+// destination is unchanged and still runs for every key file.
 type dataChannelKeyFile struct {
 	EncryptCipher     string `json:"encrypt_cipher"`
 	EncryptImplicitIV string `json:"encrypt_implicit_iv"`
 	DecryptCipher     string `json:"decrypt_cipher"`
 	DecryptImplicitIV string `json:"decrypt_implicit_iv"`
+	Cipher            string `json:"cipher,omitempty"`
+	CipherKeyLen      int    `json:"cipher_key_len,omitempty"`
 }
 
 func loadGoldenDataKeys(t *testing.T, keyFile string) keyderiv.DataKeys {
@@ -101,11 +127,14 @@ func loadGoldenDataKeys(t *testing.T, keyFile string) keyderiv.DataKeys {
 	hexDecodeFixed(t, f.EncryptImplicitIV, keys.EncryptImplicitIV[:])
 	hexDecodeFixed(t, f.DecryptCipher, keys.DecryptCipher[:])
 	hexDecodeFixed(t, f.DecryptImplicitIV, keys.DecryptImplicitIV[:])
-	// Every golden vector committed so far predates cipher negotiation and
-	// is AES-256-GCM only (the only cipher v1.0 ever produced) — the JSON
-	// key-file shape has no cipher/cipher_key_len field yet, so this is
-	// fixed at 32 rather than read from the file.
-	keys.CipherKeyLen = 32
+	// CipherKeyLen (05-05-PLAN.md Task 1): a key file predating cipher
+	// negotiation (no cipher/cipher_key_len field) means AES-256-GCM,
+	// matching every vector this corpus held before Phase 5 — default to
+	// 32 rather than reading the zero value straight through.
+	keys.CipherKeyLen = f.CipherKeyLen
+	if keys.CipherKeyLen == 0 {
+		keys.CipherKeyLen = 32
+	}
 	return keys
 }
 
@@ -152,7 +181,13 @@ func mirrorDataKeys(keys keyderiv.DataKeys) keyderiv.DataKeys {
 //     encrypt slot must match the client's own encrypt slot).
 //   - RESEAL a server-to-client vector: serverSlots directly (its encrypt
 //     slot must match the server's own encrypt slot).
-func wrapperForVector(t *testing.T, serverSlots keyderiv.DataKeys, peerID uint32, direction string, forOpen bool) *Wrapper {
+//
+// cipher (05-05-PLAN.md Task 1) is the vector's own manifest-named cipher
+// (manifestCipher(entry)) — used only in the failure message below, so a
+// mismatched key length fails with "which cipher the entry claimed" rather
+// than a bare "open failed" that costs an hour to trace back to the
+// manifest.
+func wrapperForVector(t *testing.T, serverSlots keyderiv.DataKeys, peerID uint32, direction string, forOpen bool, cipher string) *Wrapper {
 	t.Helper()
 	clientToServer := direction == "client->server"
 	useServerSlotsDirectly := clientToServer == forOpen
@@ -164,7 +199,7 @@ func wrapperForVector(t *testing.T, serverSlots keyderiv.DataKeys, peerID uint32
 	// live-traffic caller's own fixed value.
 	w, err := NewWrapper(keys, peerID, 0)
 	if err != nil {
-		t.Fatalf("build wrapper (direction=%s forOpen=%v): %v", direction, forOpen, err)
+		t.Fatalf("build wrapper (cipher=%s direction=%s forOpen=%v): %v", cipher, direction, forOpen, err)
 	}
 	return w
 }
@@ -192,7 +227,7 @@ func TestGoldenDataChannelOpen(t *testing.T) {
 			}
 			raw := readVector(t, entry.File)
 			serverSlots := loadGoldenDataKeys(t, entry.KeyFile)
-			w := wrapperForVector(t, serverSlots, *entry.PeerID, entry.Direction, true)
+			w := wrapperForVector(t, serverSlots, *entry.PeerID, entry.Direction, true, manifestCipher(entry))
 
 			plaintext, err := w.Open(nil, raw)
 			if err != nil {
@@ -233,7 +268,7 @@ func TestGoldenDataChannelReseal(t *testing.T) {
 			raw := readVector(t, entry.File)
 			serverSlots := loadGoldenDataKeys(t, entry.KeyFile)
 
-			openW := wrapperForVector(t, serverSlots, *entry.PeerID, entry.Direction, true)
+			openW := wrapperForVector(t, serverSlots, *entry.PeerID, entry.Direction, true, manifestCipher(entry))
 			plaintext, err := openW.Open(nil, raw)
 			if err != nil {
 				if !errors.Is(err, ErrPingAbsorbed) {
@@ -242,7 +277,7 @@ func TestGoldenDataChannelReseal(t *testing.T) {
 				plaintext = append([]byte(nil), pingMagic[:]...)
 			}
 
-			resealW := wrapperForVector(t, serverSlots, *entry.PeerID, entry.Direction, false)
+			resealW := wrapperForVector(t, serverSlots, *entry.PeerID, entry.Direction, false, manifestCipher(entry))
 			resealed := resealW.SealWithPacketID(nil, *entry.DataPacketID, plaintext)
 
 			if string(resealed) != string(raw) {
@@ -275,7 +310,7 @@ func TestGoldenDataChannelTamperHasTeeth(t *testing.T) {
 	}
 	serverSlots := loadGoldenDataKeys(t, entry.KeyFile)
 
-	w := wrapperForVector(t, serverSlots, *entry.PeerID, entry.Direction, true)
+	w := wrapperForVector(t, serverSlots, *entry.PeerID, entry.Direction, true, manifestCipher(entry))
 	if _, err := w.Open(nil, raw); err != nil && !errors.Is(err, ErrPingAbsorbed) {
 		t.Fatalf("untampered golden vector %s failed to open: %v", entry.File, err)
 	}
@@ -283,7 +318,7 @@ func TestGoldenDataChannelTamperHasTeeth(t *testing.T) {
 	tampered := append([]byte(nil), raw...)
 	tampered[offTag] ^= 0xFF // flip the first byte of the tag region
 
-	w2 := wrapperForVector(t, serverSlots, *entry.PeerID, entry.Direction, true)
+	w2 := wrapperForVector(t, serverSlots, *entry.PeerID, entry.Direction, true, manifestCipher(entry))
 	if _, err := w2.Open(nil, tampered); err == nil {
 		t.Fatalf("expected AEAD authentication to fail on a tampered golden vector (%s), but Open succeeded — the byte-exactness assertion above would silently accept corrupted traffic", entry.File)
 	} else {
@@ -319,7 +354,7 @@ func TestGoldenKeyDirectionWouldCatchAnInversion(t *testing.T) {
 	raw := readVector(t, entry.File)
 	serverSlots := loadGoldenDataKeys(t, entry.KeyFile)
 
-	correctW := wrapperForVector(t, serverSlots, *entry.PeerID, entry.Direction, true)
+	correctW := wrapperForVector(t, serverSlots, *entry.PeerID, entry.Direction, true, manifestCipher(*entry))
 	if _, err := correctW.Open(nil, raw); err != nil && !errors.Is(err, ErrPingAbsorbed) {
 		t.Fatalf("sanity check: correct-role Open failed on a committed client-to-server vector: %v", err)
 	}

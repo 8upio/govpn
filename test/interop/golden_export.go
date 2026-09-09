@@ -15,6 +15,17 @@
 // tier — extending manifest.json's schema rather than introducing a second
 // manifest format (01-04-SUMMARY.md's own established pattern).
 //
+// 05-05-PLAN.md Task 1 extends ExportGolden to accept more than one source
+// scenario and write exactly one merged manifest: the pre-existing
+// clean-large source still contributes the control-channel corpus plus its
+// own (AES-256-GCM) data-channel vectors, and a second source (cipher-128)
+// contributes ONLY AES-128-GCM data-channel vectors under their own key
+// file, since key expansion itself is cipher-independent and control-
+// channel vectors need capturing only once. Every data-channel manifest
+// entry now names the cipher its vectors were captured under
+// (goldenManifestEntry.Cipher); an absent value still means AES-256-GCM, so
+// the pre-Phase-5 corpus stays readable unchanged.
+//
 // ExportGolden is driven from a flag on the interop test
 // (-update-golden, see interop_test.go), never as a side effect of an
 // ordinary run — regenerating the corpus is a deliberate act.
@@ -26,6 +37,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/8upio/govpn/internal/ctrlconn"
 	"github.com/8upio/govpn/internal/keyderiv"
@@ -38,7 +50,10 @@ import (
 // data-channel-only fields, always nil/omitted for a control-channel entry
 // — pointers, not bare values, so a legitimate zero (peer-id 0, sender
 // slot 0) is never confused with "field absent" the way an omitempty bare
-// uint32 would.
+// uint32 would. Cipher (05-05-PLAN.md Task 1) is a data-channel-only field
+// too: an absent value means AES-256-GCM, exactly what every entry meant
+// implicitly before this phase, so a corpus regenerated at an older
+// revision (or a pre-Phase-5 checkout of this file) stays readable.
 type goldenManifestEntry struct {
 	File      string `json:"file"`
 	Direction string `json:"direction"`
@@ -49,6 +64,7 @@ type goldenManifestEntry struct {
 	DataPacketID *uint32 `json:"data_packet_id,omitempty"`
 	KeyFile      string  `json:"key_file,omitempty"`
 	SenderSlot   *int    `json:"sender_slot,omitempty"`
+	Cipher       string  `json:"cipher,omitempty"`
 }
 
 // dataChannelKeyExportFile / keyMethod2ExportFile mirror
@@ -64,37 +80,55 @@ type dataChannelKeyExportFile struct {
 	EncryptImplicitIV string `json:"encrypt_implicit_iv"`
 	DecryptCipher     string `json:"decrypt_cipher"`
 	DecryptImplicitIV string `json:"decrypt_implicit_iv"`
+
+	// Cipher/CipherKeyLen (05-05-PLAN.md Task 1) mirror
+	// test/interop/server/main.go's dataChannelKeyExport.Cipher/
+	// .CipherKeyLen (05-04-PLAN.md Task 1) exactly — the negotiated cipher
+	// name and its AEAD key length in bytes (16 or 32). Both are optional:
+	// a key-export file written before 05-04 landed has neither, and
+	// readDataChannelKeyExport below defaults CipherKeyLen to 32 in that
+	// case, matching every vector this corpus held before cipher
+	// negotiation existed. EncryptCipher/DecryptCipher themselves always
+	// stay 32 bytes (64 hex chars) wide regardless of Cipher/CipherKeyLen
+	// — they carry the full key-expansion slot, not the trimmed AEAD key
+	// (RESEARCH.md Pitfall 5); truncating the hex width for AES-128-GCM
+	// would break hexDecodeFixed's exact-length check for no benefit.
+	Cipher       string `json:"cipher,omitempty"`
+	CipherKeyLen int    `json:"cipher_key_len,omitempty"`
 }
 
-func readDataChannelKeyExport(path string) (keyderiv.DataKeys, error) {
+// readDataChannelKeyExport reads path (a dataChannelKeyExportFile) into a
+// keyderiv.DataKeys plus the cipher name it was captured under. An absent
+// (pre-05-04) cipher_key_len defaults to 32 — the only cipher v1.0 ever
+// produced — matching internal/datachan/golden_test.go's own
+// loadGoldenDataKeys default.
+func readDataChannelKeyExport(path string) (keyderiv.DataKeys, string, error) {
 	var out keyderiv.DataKeys
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return out, err
+		return out, "", err
 	}
 	var f dataChannelKeyExportFile
 	if err := json.Unmarshal(data, &f); err != nil {
-		return out, fmt.Errorf("parse %s: %w", path, err)
+		return out, "", fmt.Errorf("parse %s: %w", path, err)
 	}
 	if err := hexDecodeFixed(f.EncryptCipher, out.EncryptCipher[:]); err != nil {
-		return out, fmt.Errorf("%s: encrypt_cipher: %w", path, err)
+		return out, "", fmt.Errorf("%s: encrypt_cipher: %w", path, err)
 	}
 	if err := hexDecodeFixed(f.EncryptImplicitIV, out.EncryptImplicitIV[:]); err != nil {
-		return out, fmt.Errorf("%s: encrypt_implicit_iv: %w", path, err)
+		return out, "", fmt.Errorf("%s: encrypt_implicit_iv: %w", path, err)
 	}
 	if err := hexDecodeFixed(f.DecryptCipher, out.DecryptCipher[:]); err != nil {
-		return out, fmt.Errorf("%s: decrypt_cipher: %w", path, err)
+		return out, "", fmt.Errorf("%s: decrypt_cipher: %w", path, err)
 	}
 	if err := hexDecodeFixed(f.DecryptImplicitIV, out.DecryptImplicitIV[:]); err != nil {
-		return out, fmt.Errorf("%s: decrypt_implicit_iv: %w", path, err)
+		return out, "", fmt.Errorf("%s: decrypt_implicit_iv: %w", path, err)
 	}
-	// The harness server never negotiates anything but AES-256-GCM yet
-	// (test/interop/server/main.go hardcodes it) — dataChannelKeyExportFile
-	// has no cipher/cipher_key_len field, so this is fixed at 32 rather
-	// than read from the file, mirroring internal/datachan/golden_test.go's
-	// own loadGoldenDataKeys.
-	out.CipherKeyLen = 32
-	return out, nil
+	out.CipherKeyLen = f.CipherKeyLen
+	if out.CipherKeyLen == 0 {
+		out.CipherKeyLen = 32
+	}
+	return out, f.Cipher, nil
 }
 
 func hexDecodeFixed(s string, dst []byte) error {
@@ -109,94 +143,165 @@ func hexDecodeFixed(s string, dst []byte) error {
 	return nil
 }
 
-// ExportGolden decodes capturePath under the tls-crypt key at keyPath,
-// selects a small representative set of control-channel vectors (at
-// minimum one client hard reset, one server hard reset, one ACK-only
-// packet, one maximum-size certificate-flight fragment, and one final
-// small control packet) plus a small representative set of data-channel
-// vectors (at minimum one client-to-server ICMP echo request, one
-// server-to-client echo reply, and one ping-magic packet), and writes each
-// vector's raw wire bytes plus a manifest, a copy of the tls-crypt key, and
-// a copy of the data-channel key/Key-Method-2 material into outDir.
-// dataKeysPath/keyMethod2Path are the scenario's own preserved copies of
-// the harness server's /tmp exports (test/interop/server/main.go,
-// retrieved via `docker cp` in interop_test.go's runScenario) — required
-// for the data-channel portion; empty means "skip data-channel export",
-// which keeps ExportGolden usable even for a scenario that failed to
-// produce these files, at the cost of only refreshing the control-channel
-// corpus.
-func ExportGolden(capturePath, keyPath, dataKeysPath, keyMethod2Path, outDir string) error {
-	key, err := readTLSCryptKey(keyPath)
-	if err != nil {
-		return fmt.Errorf("export golden: read tls-crypt key: %w", err)
-	}
+// goldenSource is one interop scenario's own captured data — capture,
+// tls-crypt key, and (when non-empty) data-channel key/Key-Method-2
+// material — that ExportGolden should extract vectors from and fold into
+// one merged manifest (05-05-PLAN.md Task 1). Name is used only in error
+// messages, to say which source a decode/export failure came from.
+//
+// IncludeControlChannel should be true for exactly one source (the one
+// whose capture also anchors tls-crypt.key): control-channel vectors are
+// cipher-independent, so capturing them from a second source would only
+// duplicate work and risk a second, possibly-divergent tls-crypt key ever
+// being committed.
+//
+// DataKeysPath == "" skips data-channel export for this source entirely
+// (matching the pre-05-05 "empty means skip" convention) — Cipher and
+// KeyFileName are meaningless in that case. KeyMethod2Path == "" skips
+// writing data-channel-km2.json for this source: only the first source
+// needs one, since key expansion is cipher-independent and
+// internal/keyderiv's own golden test already proves it byte-exact from
+// that one capture.
+type goldenSource struct {
+	name                  string
+	capturePath           string
+	keyPath               string
+	dataKeysPath          string
+	keyMethod2Path        string
+	cipher                string
+	keyFileName           string
+	includeControlChannel bool
+}
 
-	var dataKeys *dataChannelKeyMaterial
-	var serverSlots keyderiv.DataKeys
-	if dataKeysPath != "" {
-		serverSlots, err = readDataChannelKeyExport(dataKeysPath)
-		if err != nil {
-			return fmt.Errorf("export golden: read data-channel key export: %w", err)
-		}
-		// This harness never allocates more than one session per run, so
-		// the peer-id this session was assigned is always 0 — matching
-		// ippool.go's own allocation policy (sequential first-free,
-		// starting at 0). Recorded here for datachan.NewWrapper's own API
-		// shape (it's used only for Seal's own header, never checked by
-		// Open), and independently confirmed per-vector when decodeCapture
-		// parses each P_DATA_V2 payload's own peer-id field below.
-		dataKeys = &dataChannelKeyMaterial{peerID: 0, serverPerspective: serverSlots}
-	}
-
-	packets, err := decodeCapture(capturePath, key, tunnelPort, dataKeys)
-	if err != nil {
-		return fmt.Errorf("export golden: decode capture: %w", err)
-	}
-
-	selected, err := selectGoldenVectors(packets, dataKeys != nil)
-	if err != nil {
-		return fmt.Errorf("export golden: %w", err)
+// ExportGolden decodes every source's capture under its own tls-crypt key,
+// selects a small representative set of vectors from each — control-channel
+// vectors (at minimum one client hard reset, one server hard reset, one
+// ACK-only packet, one maximum-size certificate-flight fragment, and one
+// final small control packet) from the source(s) with IncludeControlChannel
+// set, and data-channel vectors (at minimum one client-to-server ICMP echo
+// request, one server-to-client echo reply, and one ping-magic packet) from
+// every source with a non-empty DataKeysPath — and writes the combined
+// vector set plus ONE merged manifest.json into outDir. Output file names
+// are numbered continuously across sources (the second source's vectors
+// continue after the first's, never restarting), and each source's
+// data-channel key material is copied to its own KeyFileName so two
+// sources' key sets never collide or overwrite each other (05-05-PLAN.md
+// Task 1).
+func ExportGolden(sources []goldenSource, outDir string) error {
+	if len(sources) == 0 {
+		return fmt.Errorf("export golden: no sources given")
 	}
 
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return fmt.Errorf("export golden: create %s: %w", outDir, err)
 	}
 
-	const dataChannelKeyFile = "data-channel.key"
+	var manifest []goldenManifestEntry
+	fileIndex := 0
 
-	manifest := make([]goldenManifestEntry, 0, len(selected))
-	for i, sel := range selected {
-		file := fmt.Sprintf("%03d-%s-%s.bin", i+1, directionSlug(sel.packet.Direction), sel.label)
-		if err := os.WriteFile(filepath.Join(outDir, file), sel.packet.Raw, 0o644); err != nil {
-			return fmt.Errorf("export golden: write %s: %w", file, err)
+	for _, src := range sources {
+		key, err := readTLSCryptKey(src.keyPath)
+		if err != nil {
+			return fmt.Errorf("export golden: %s: read tls-crypt key: %w", src.name, err)
 		}
 
-		entry := goldenManifestEntry{
-			File:      file,
-			Direction: sel.packet.Direction.String(),
-			Opcode:    int(sel.packet.Control.Opcode),
-			PacketID:  uint32(sel.packet.Control.PacketID),
-		}
-		if sel.packet.IsDataPacket {
-			peerID := sel.packet.PeerID
-			dataPacketID := sel.packet.DataPacketID
-			// sender_slot: RESEARCH Pattern 4/Pitfall 1's mirror-opposite
-			// convention as DATA rather than inference — a client-to-server
-			// vector was encrypted with the client's own encrypt slot
-			// (keys[0]); a server-to-client vector was encrypted with the
-			// server's own encrypt slot (keys[1]).
-			senderSlot := 1
-			if sel.packet.Direction == DirClientToServer {
-				senderSlot = 0
+		var dataKeys *dataChannelKeyMaterial
+		var serverSlots keyderiv.DataKeys
+		cipherName := src.cipher
+		if src.dataKeysPath != "" {
+			var fileCipher string
+			serverSlots, fileCipher, err = readDataChannelKeyExport(src.dataKeysPath)
+			if err != nil {
+				return fmt.Errorf("export golden: %s: read data-channel key export: %w", src.name, err)
 			}
-			entry.Opcode = int(wire.OpDataV2)
-			entry.PacketID = 0 // not a control-channel reliability packet ID; DataPacketID below is the data channel's own
-			entry.PeerID = &peerID
-			entry.DataPacketID = &dataPacketID
-			entry.KeyFile = dataChannelKeyFile
-			entry.SenderSlot = &senderSlot
+			if fileCipher != "" {
+				if src.cipher != "" && !strings.EqualFold(src.cipher, fileCipher) {
+					return fmt.Errorf("export golden: %s: source declared cipher %q but the exported key file names %q", src.name, src.cipher, fileCipher)
+				}
+				cipherName = fileCipher
+			}
+			// This harness never allocates more than one session per run,
+			// so the peer-id this session was assigned is always 0 —
+			// matching ippool.go's own allocation policy (sequential
+			// first-free, starting at 0). Recorded here for
+			// datachan.NewWrapper's own API shape (it's used only for
+			// Seal's own header, never checked by Open), and independently
+			// confirmed per-vector when decodeCapture parses each
+			// P_DATA_V2 payload's own peer-id field below.
+			dataKeys = &dataChannelKeyMaterial{peerID: 0, serverPerspective: serverSlots}
 		}
-		manifest = append(manifest, entry)
+
+		packets, err := decodeCapture(src.capturePath, key, tunnelPort, dataKeys)
+		if err != nil {
+			return fmt.Errorf("export golden: %s: decode capture: %w", src.name, err)
+		}
+
+		selected, err := selectGoldenVectors(packets, src.includeControlChannel, dataKeys != nil)
+		if err != nil {
+			return fmt.Errorf("export golden: %s: %w", src.name, err)
+		}
+
+		for _, sel := range selected {
+			fileIndex++
+			file := fmt.Sprintf("%03d-%s-%s.bin", fileIndex, directionSlug(sel.packet.Direction), sel.label)
+			if err := os.WriteFile(filepath.Join(outDir, file), sel.packet.Raw, 0o644); err != nil {
+				return fmt.Errorf("export golden: write %s: %w", file, err)
+			}
+
+			entry := goldenManifestEntry{
+				File:      file,
+				Direction: sel.packet.Direction.String(),
+				Opcode:    int(sel.packet.Control.Opcode),
+				PacketID:  uint32(sel.packet.Control.PacketID),
+			}
+			if sel.packet.IsDataPacket {
+				peerID := sel.packet.PeerID
+				dataPacketID := sel.packet.DataPacketID
+				// sender_slot: RESEARCH Pattern 4/Pitfall 1's mirror-opposite
+				// convention as DATA rather than inference — a client-to-server
+				// vector was encrypted with the client's own encrypt slot
+				// (keys[0]); a server-to-client vector was encrypted with the
+				// server's own encrypt slot (keys[1]).
+				senderSlot := 1
+				if sel.packet.Direction == DirClientToServer {
+					senderSlot = 0
+				}
+				entry.Opcode = int(wire.OpDataV2)
+				entry.PacketID = 0 // not a control-channel reliability packet ID; DataPacketID below is the data channel's own
+				entry.PeerID = &peerID
+				entry.DataPacketID = &dataPacketID
+				entry.KeyFile = src.keyFileName
+				entry.SenderSlot = &senderSlot
+				// Every entry a fresh regeneration writes names its cipher
+				// explicitly, including AES-256-GCM ones — the absent-
+				// means-AES-256-GCM rule (goldenManifestEntry's own doc
+				// comment) exists only so a manifest committed BEFORE this
+				// field existed stays readable, not so a freshly written
+				// entry should omit it.
+				if cipherName == "" {
+					cipherName = "AES-256-GCM"
+				}
+				entry.Cipher = cipherName
+			}
+			manifest = append(manifest, entry)
+		}
+
+		if src.includeControlChannel {
+			if err := copyFile(src.keyPath, filepath.Join(outDir, "tls-crypt.key")); err != nil {
+				return fmt.Errorf("export golden: %s: copy tls-crypt key: %w", src.name, err)
+			}
+		}
+
+		if dataKeys != nil {
+			if err := copyFile(src.dataKeysPath, filepath.Join(outDir, src.keyFileName)); err != nil {
+				return fmt.Errorf("export golden: %s: copy data-channel key export: %w", src.name, err)
+			}
+			if src.keyMethod2Path != "" {
+				if err := copyFile(src.keyMethod2Path, filepath.Join(outDir, "data-channel-km2.json")); err != nil {
+					return fmt.Errorf("export golden: %s: copy Key Method 2 export: %w", src.name, err)
+				}
+			}
+		}
 	}
 
 	manifestJSON, err := json.MarshalIndent(manifest, "", "  ")
@@ -205,21 +310,6 @@ func ExportGolden(capturePath, keyPath, dataKeysPath, keyMethod2Path, outDir str
 	}
 	if err := os.WriteFile(filepath.Join(outDir, "manifest.json"), append(manifestJSON, '\n'), 0o644); err != nil {
 		return fmt.Errorf("export golden: write manifest.json: %w", err)
-	}
-
-	if err := copyFile(keyPath, filepath.Join(outDir, "tls-crypt.key")); err != nil {
-		return fmt.Errorf("export golden: copy tls-crypt key: %w", err)
-	}
-
-	if dataKeys != nil {
-		if err := copyFile(dataKeysPath, filepath.Join(outDir, dataChannelKeyFile)); err != nil {
-			return fmt.Errorf("export golden: copy data-channel key export: %w", err)
-		}
-		if keyMethod2Path != "" {
-			if err := copyFile(keyMethod2Path, filepath.Join(outDir, "data-channel-km2.json")); err != nil {
-				return fmt.Errorf("export golden: copy Key Method 2 export: %w", err)
-			}
-		}
 	}
 
 	return nil
@@ -242,13 +332,16 @@ type goldenSelection struct {
 // selectGoldenVectors picks the representative control-channel set
 // 01-04-PLAN.md Task 2 established (the client's own hard reset, the
 // server's hard reset, an ACK-only packet, a maximum-size fragment from
-// the certificate flight, and a final small control packet), then — when
-// includeDataChannel is true — extends the same slice with 02-04-PLAN.md
-// Task 2's representative data-channel set (a client-to-server ICMP echo
-// request, a server-to-client echo reply, and a ping-magic packet), all in
-// capture order, deduplicated (the same decodedPacket is never selected
-// twice even if it would satisfy two criteria).
-func selectGoldenVectors(packets []decodedPacket, includeDataChannel bool) ([]goldenSelection, error) {
+// the certificate flight, and a final small control packet) — only when
+// includeControlChannel is true — then, when includeDataChannel is true,
+// extends the same slice with 02-04-PLAN.md Task 2's representative
+// data-channel set (a client-to-server ICMP echo request, a server-to-client
+// echo reply, and a ping-magic packet), all in capture order, deduplicated
+// (the same decodedPacket is never selected twice even if it would satisfy
+// two criteria). 05-05-PLAN.md Task 1 splits the two flags apart so a
+// second source (e.g. cipher-128) can contribute ONLY its data-channel
+// vectors without also re-selecting a redundant control-channel set.
+func selectGoldenVectors(packets []decodedPacket, includeControlChannel, includeDataChannel bool) ([]goldenSelection, error) {
 	var out []goldenSelection
 	used := make(map[int]bool)
 
@@ -264,49 +357,51 @@ func selectGoldenVectors(packets []decodedPacket, includeDataChannel bool) ([]go
 		return false
 	}
 
-	if !pick("client-hard-reset", func(p decodedPacket) bool {
-		return p.Direction == DirClientToServer && p.Control.Opcode == wire.OpControlHardResetClientV2
-	}) {
-		return nil, fmt.Errorf("no client hard reset (OpControlHardResetClientV2) found in capture")
-	}
-
-	if !pick("server-hard-reset", func(p decodedPacket) bool {
-		return p.Direction == DirServerToClient && p.Control.Opcode == wire.OpControlHardResetServerV2
-	}) {
-		return nil, fmt.Errorf("no server hard reset (OpControlHardResetServerV2) found in capture")
-	}
-
-	if !pick("ack-only", func(p decodedPacket) bool {
-		return p.Control.Opcode == wire.OpAckV1
-	}) {
-		return nil, fmt.Errorf("no ack-only (OpAckV1) packet found in capture")
-	}
-
-	if !pick("max-fragment", func(p decodedPacket) bool {
-		return p.Direction == DirServerToClient && p.Control.Opcode == wire.OpControlV1 && len(p.Control.Payload) == ctrlconn.MaxPayload
-	}) {
-		return nil, fmt.Errorf("no maximum-size (%d-byte) server-to-client fragment found in capture — was this exported from a large-certificate scenario?", ctrlconn.MaxPayload)
-	}
-
-	// The final small control packet: the LAST control packet in the whole
-	// capture whose payload is present but strictly smaller than a full
-	// fragment — walk from the end so this is genuinely the tail of the
-	// handshake, not an early small packet.
-	foundFinal := false
-	for i := len(packets) - 1; i >= 0; i-- {
-		if used[i] {
-			continue
+	if includeControlChannel {
+		if !pick("client-hard-reset", func(p decodedPacket) bool {
+			return p.Direction == DirClientToServer && p.Control.Opcode == wire.OpControlHardResetClientV2
+		}) {
+			return nil, fmt.Errorf("no client hard reset (OpControlHardResetClientV2) found in capture")
 		}
-		p := packets[i]
-		if p.Control.Opcode == wire.OpControlV1 && len(p.Control.Payload) > 0 && len(p.Control.Payload) < ctrlconn.MaxPayload {
-			used[i] = true
-			out = append(out, goldenSelection{packet: p, label: "final-small"})
-			foundFinal = true
-			break
+
+		if !pick("server-hard-reset", func(p decodedPacket) bool {
+			return p.Direction == DirServerToClient && p.Control.Opcode == wire.OpControlHardResetServerV2
+		}) {
+			return nil, fmt.Errorf("no server hard reset (OpControlHardResetServerV2) found in capture")
 		}
-	}
-	if !foundFinal {
-		return nil, fmt.Errorf("no final small control packet found in capture")
+
+		if !pick("ack-only", func(p decodedPacket) bool {
+			return p.Control.Opcode == wire.OpAckV1
+		}) {
+			return nil, fmt.Errorf("no ack-only (OpAckV1) packet found in capture")
+		}
+
+		if !pick("max-fragment", func(p decodedPacket) bool {
+			return p.Direction == DirServerToClient && p.Control.Opcode == wire.OpControlV1 && len(p.Control.Payload) == ctrlconn.MaxPayload
+		}) {
+			return nil, fmt.Errorf("no maximum-size (%d-byte) server-to-client fragment found in capture — was this exported from a large-certificate scenario?", ctrlconn.MaxPayload)
+		}
+
+		// The final small control packet: the LAST control packet in the whole
+		// capture whose payload is present but strictly smaller than a full
+		// fragment — walk from the end so this is genuinely the tail of the
+		// handshake, not an early small packet.
+		foundFinal := false
+		for i := len(packets) - 1; i >= 0; i-- {
+			if used[i] {
+				continue
+			}
+			p := packets[i]
+			if p.Control.Opcode == wire.OpControlV1 && len(p.Control.Payload) > 0 && len(p.Control.Payload) < ctrlconn.MaxPayload {
+				used[i] = true
+				out = append(out, goldenSelection{packet: p, label: "final-small"})
+				foundFinal = true
+				break
+			}
+		}
+		if !foundFinal {
+			return nil, fmt.Errorf("no final small control packet found in capture")
+		}
 	}
 
 	if !includeDataChannel {

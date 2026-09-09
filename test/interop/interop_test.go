@@ -27,12 +27,12 @@ import (
 	"github.com/8upio/govpn/internal/wire"
 )
 
-// updateGolden regenerates testdata/golden from this run's clean-large
-// scenario capture (01-04-PLAN.md Task 2) — a deliberate act via
-// `make golden` / `go test -tags interop -run TestInteropScenarios
-// -update-golden ./test/interop/`, never a side effect of an ordinary
-// `make interop` run.
-var updateGolden = flag.Bool("update-golden", false, "regenerate testdata/golden from this run's clean-large scenario capture")
+// updateGolden regenerates testdata/golden from this run's clean-large and
+// cipher-128 scenario captures (01-04-PLAN.md Task 2; extended to two
+// sources by 05-05-PLAN.md Task 1) — a deliberate act via `make golden` /
+// `go test -tags interop -run TestInteropScenarios -update-golden
+// ./test/interop/`, never a side effect of an ordinary `make interop` run.
+var updateGolden = flag.Bool("update-golden", false, "regenerate testdata/golden from this run's clean-large (control-channel + AES-256-GCM data-channel) and cipher-128 (AES-128-GCM data-channel) scenario captures")
 
 // scenario names one docker-compose-driven interop run: which certificate
 // profile cmd/gentestpki should generate, whether the lossy overlay
@@ -279,17 +279,59 @@ func TestMain(m *testing.M) {
 	}
 
 	if *updateGolden {
-		res := scenarioResults["clean-large"]
-		if res.composeErr != nil {
-			fmt.Fprintln(os.Stderr, "interop: -update-golden requested but the clean-large scenario did not pass; not regenerating testdata/golden")
+		// 05-05-PLAN.md Task 1: the corpus is regenerated from TWO source
+		// scenarios in one run — clean-large still anchors the
+		// control-channel vectors and the pre-existing AES-256-GCM
+		// data-channel vectors, and cipher-128 contributes the new
+		// AES-128-GCM data-channel vectors under their own key file.
+		// Refusing to regenerate unless BOTH passed (T-05-25): a partial
+		// regeneration that silently drops half the corpus is worse than
+		// none.
+		cleanLarge := scenarioResults["clean-large"]
+		cipher128 := scenarioResults["cipher-128"]
+		var failed []string
+		if cleanLarge.composeErr != nil {
+			failed = append(failed, "clean-large")
+		}
+		if cipher128.composeErr != nil {
+			failed = append(failed, "cipher-128")
+		}
+		if len(failed) > 0 {
+			fmt.Fprintf(os.Stderr, "interop: -update-golden requested but %s did not pass; not regenerating testdata/golden\n", strings.Join(failed, ", "))
 			os.Exit(1)
 		}
 		outDir := filepath.Join(root, "testdata", "golden")
-		if err := ExportGolden(res.capturePath, res.keyPath, res.dataKeysPath, res.keyMethod2Path, outDir); err != nil {
+		sources := []goldenSource{
+			{
+				name:                  "clean-large",
+				capturePath:           cleanLarge.capturePath,
+				keyPath:               cleanLarge.keyPath,
+				dataKeysPath:          cleanLarge.dataKeysPath,
+				keyMethod2Path:        cleanLarge.keyMethod2Path,
+				cipher:                "AES-256-GCM",
+				keyFileName:           "data-channel.key",
+				includeControlChannel: true,
+			},
+			{
+				name:         "cipher-128",
+				capturePath:  cipher128.capturePath,
+				keyPath:      cipher128.keyPath,
+				dataKeysPath: cipher128.dataKeysPath,
+				// keyMethod2Path intentionally empty: key expansion is
+				// cipher-independent, and clean-large's own
+				// data-channel-km2.json already proves it byte-exact
+				// (internal/keyderiv's golden test) — a second copy would
+				// duplicate that proof, not extend it.
+				keyMethod2Path: "",
+				cipher:         "AES-128-GCM",
+				keyFileName:    "data-channel-aes128.key",
+			},
+		}
+		if err := ExportGolden(sources, outDir); err != nil {
 			fmt.Fprintln(os.Stderr, "interop: export golden vectors:", err)
 			os.Exit(1)
 		}
-		fmt.Println("interop: testdata/golden regenerated from the clean-large scenario capture at", res.capturePath)
+		fmt.Println("interop: testdata/golden regenerated from the clean-large and cipher-128 scenario captures")
 	}
 
 	os.Exit(m.Run())
