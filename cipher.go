@@ -64,12 +64,37 @@ func canonicalCipherName(name string) (string, bool) {
 	if len(name) == 0 || len(name) > maxCipherNameLen {
 		return "", false
 	}
+	if !isCipherNameByteSet(name) {
+		return "", false
+	}
 	for _, candidate := range supportedDataCiphers {
 		if strings.EqualFold(candidate, name) {
 			return candidate, true
 		}
 	}
 	return "", false
+}
+
+// isCipherNameByteSet reports whether every byte of name is one of A-Z,
+// a-z, 0-9 or '-'. This is defence in depth over the two-entry table
+// lookup canonicalCipherName already performs (T-05-11): a name outside
+// this byte set can never match supportedDataCiphers anyway, but checking
+// it explicitly, before the fold-comparison loop, makes the rejection
+// total and cheap for garbage/binary input and documents the intent that
+// no byte outside this set is ever meaningful in a cipher name.
+func isCipherNameByteSet(name string) bool {
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'A' && c <= 'Z':
+		case c >= 'a' && c <= 'z':
+		case c >= '0' && c <= '9':
+		case c == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // cipherKeyLen returns the AEAD key length, in bytes, for canonicalName:
@@ -196,6 +221,36 @@ func peerCipherList(peerInfo []byte) []string {
 		return []string{"AES-256-GCM", "AES-128-GCM"}
 	}
 	return nil
+}
+
+// parseOCCCipher is the port of
+// options_string_extract_option(options, "cipher", NULL)
+// (options.c:4669-4695), reached from ssl.c:2437-2439 as the pre-NCP
+// client's poor-man's capability signal (CIPH-03): its own comma-separated
+// options string
+// (e.g. from OCC or the Key Method 2 options field) is scanned token by
+// token, and the FIRST token whose prefix is "cipher" followed by exactly
+// one space wins — options.c's own scan `break`s on its first match, so a
+// second "cipher " token later in the string is never consulted, which is
+// the opposite of the intuitive "last one wins" guess. Returns the empty
+// string when no token matches, when the matched token has no value after
+// the space, or when the value exceeds maxCipherNameLen. The value is
+// returned exactly as found: no trim, no unquote, no other transform — the
+// reference does not transform it either, and the only consumer is
+// canonicalCipherName, which already rejects anything unexpected.
+func parseOCCCipher(options []byte) string {
+	const prefix = "cipher "
+	for _, token := range strings.Split(string(options), ",") {
+		if !strings.HasPrefix(token, prefix) {
+			continue
+		}
+		value := token[len(prefix):]
+		if value == "" || len(value) > maxCipherNameLen {
+			return ""
+		}
+		return value
+	}
+	return ""
 }
 
 // containsFold reports whether list contains s under strings.EqualFold.

@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"crypto/x509"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"strings"
@@ -489,6 +490,255 @@ func TestServeRejectsInvalidDataCiphers(t *testing.T) {
 			srv.mu.Unlock()
 			if published {
 				t.Error("Serve published its packet connection despite a validation error")
+			}
+		})
+	}
+}
+
+// TestPeerCipherList is 05-02-PLAN.md Task 2's table-driven coverage of
+// peerCipherList's full boundary rule set, including the present-but-empty
+// IV_CIPHERS= case that must NOT fall through to the IV_NCP implied list.
+func TestPeerCipherList(t *testing.T) {
+	tests := []struct {
+		name     string
+		peerInfo []byte
+		want     []string
+	}{
+		{
+			name:     "present-but-empty IV_CIPHERS does not fall through to IV_NCP",
+			peerInfo: []byte("IV_CIPHERS=\nIV_NCP=2\n"),
+			want:     []string{},
+		},
+		{
+			name:     "absent IV_CIPHERS with IV_NCP=2 falls through to the implied list",
+			peerInfo: []byte("IV_NCP=2\n"),
+			want:     []string{"AES-256-GCM", "AES-128-GCM"},
+		},
+		{
+			name:     "absent IV_CIPHERS with IV_NCP=1 yields nil",
+			peerInfo: []byte("IV_NCP=1\n"),
+			want:     nil,
+		},
+		{
+			name:     "nil peer_info yields nil",
+			peerInfo: nil,
+			want:     nil,
+		},
+		{
+			name:     "IV_CIPHERS with a value is split on ':'",
+			peerInfo: []byte("IV_CIPHERS=AES-256-GCM:AES-128-GCM\n"),
+			want:     []string{"AES-256-GCM", "AES-128-GCM"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := peerCipherList(tt.peerInfo)
+			if !stringSlicesEqual(got, tt.want) {
+				t.Errorf("peerCipherList(%q) = %#v, want %#v", tt.peerInfo, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestPeerSupportsNCP is 05-02-PLAN.md Task 2's table-driven coverage of
+// peerSupportsNCP: true for IV_NCP>=2 or for an IV_CIPHERS= line present
+// with any value (including empty), false for nil/empty peer_info or a
+// sub-2 IV_NCP with no IV_CIPHERS.
+func TestPeerSupportsNCP(t *testing.T) {
+	tests := []struct {
+		name     string
+		peerInfo []byte
+		want     bool
+	}{
+		{name: "nil peer_info", peerInfo: nil, want: false},
+		{name: "IV_CIPHERS present with empty value", peerInfo: []byte("IV_CIPHERS=\n"), want: true},
+		{name: "IV_CIPHERS present with a value", peerInfo: []byte("IV_CIPHERS=AES-128-GCM\n"), want: true},
+		{name: "IV_NCP=2", peerInfo: []byte("IV_NCP=2\n"), want: true},
+		{name: "IV_NCP=1", peerInfo: []byte("IV_NCP=1\n"), want: false},
+		{name: "IV_NCP=3", peerInfo: []byte("IV_NCP=3\n"), want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := peerSupportsNCP(tt.peerInfo); got != tt.want {
+				t.Errorf("peerSupportsNCP(%q) = %v, want %v", tt.peerInfo, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestPeerInfoValueIsLineAnchored builds a peer_info in which another
+// variable's value contains the literal text "IV_CIPHERS=" and asserts it
+// is not matched — peerInfoValue anchors to the START of a line, not an
+// unanchored substring search.
+func TestPeerInfoValueIsLineAnchored(t *testing.T) {
+	peerInfo := []byte("SOME_OTHER_VAR=xIV_CIPHERS=AES-128-GCM\n")
+
+	if _, ok := peerInfoValue(peerInfo, "IV_CIPHERS="); ok {
+		t.Error("peerInfoValue matched IV_CIPHERS= embedded inside another variable's value")
+	}
+	if got := peerCipherList(peerInfo); got != nil {
+		t.Errorf("peerCipherList = %#v, want nil (no real capability signal present)", got)
+	}
+}
+
+// TestParseOCCCipher is 05-02-PLAN.md Task 2's table-driven coverage of
+// parseOCCCipher: first-match-wins token selection, and the no-match/
+// empty-value/over-long-value rejection cases.
+func TestParseOCCCipher(t *testing.T) {
+	tests := []struct {
+		name    string
+		options []byte
+		want    string
+	}{
+		{
+			name:    "single cipher token",
+			options: []byte("V4,dev-type tun,cipher AES-128-GCM,auth SHA1"),
+			want:    "AES-128-GCM",
+		},
+		{
+			name:    "two cipher tokens: first wins",
+			options: []byte("cipher AES-128-GCM,auth SHA1,cipher AES-256-GCM"),
+			want:    "AES-128-GCM",
+		},
+		{
+			name:    "no cipher token",
+			options: []byte("auth SHA1,keysize 128"),
+			want:    "",
+		},
+		{
+			name:    "empty options string",
+			options: []byte(""),
+			want:    "",
+		},
+		{
+			name:    "cipher token with no trailing space has no value",
+			options: []byte("cipher,auth SHA1"),
+			want:    "",
+		},
+		{
+			name:    "cipher token with an empty value",
+			options: []byte("cipher ,auth SHA1"),
+			want:    "",
+		},
+		{
+			name:    "over-long value is rejected",
+			options: []byte("cipher " + strings.Repeat("A", maxCipherNameLen+1)),
+			want:    "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := parseOCCCipher(tt.options); got != tt.want {
+				t.Errorf("parseOCCCipher(%q) = %q, want %q", tt.options, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSelectCipherBoundaries is 05-02-PLAN.md Task 2's table-driven
+// coverage of selectCipher's boundary rules: exactly-one-shared, identical
+// lists, opposite orders (the server's own order always wins), the empty-
+// list failure cases, case-insensitive matching on both the client-list and
+// OCC paths, and the null-cipher spellings that must never match.
+func TestSelectCipherBoundaries(t *testing.T) {
+	allowList := []string{"AES-256-GCM", "AES-128-GCM"}
+
+	tests := []struct {
+		name        string
+		allowList   []string
+		peerCiphers []string
+		occCipher   string
+		want        string
+		wantErr     bool
+	}{
+		{
+			name:        "exactly one shared cipher",
+			allowList:   allowList,
+			peerCiphers: []string{"AES-128-GCM"},
+			want:        "AES-128-GCM",
+		},
+		{
+			name:        "identical lists: server's first wins",
+			allowList:   allowList,
+			peerCiphers: []string{"AES-256-GCM", "AES-128-GCM"},
+			want:        "AES-256-GCM",
+		},
+		{
+			name:        "opposite orders: server's first wins, client order never wins",
+			allowList:   allowList,
+			peerCiphers: []string{"AES-128-GCM", "AES-256-GCM"},
+			want:        "AES-256-GCM",
+		},
+		{
+			name:        "empty client list and empty OCC cipher fails",
+			allowList:   allowList,
+			peerCiphers: []string{},
+			occCipher:   "",
+			wantErr:     true,
+		},
+		{
+			name:        "empty allow-list fails",
+			allowList:   []string{},
+			peerCiphers: []string{"AES-256-GCM"},
+			wantErr:     true,
+		},
+		{
+			name:        "lower-case client list entry matches",
+			allowList:   allowList,
+			peerCiphers: []string{"aes-128-gcm"},
+			want:        "AES-128-GCM",
+		},
+		{
+			name:        "lower-case OCC entry matches",
+			allowList:   allowList,
+			peerCiphers: nil,
+			occCipher:   "aes-256-gcm",
+			want:        "AES-256-GCM",
+		},
+		{
+			name:        "client offering only none fails",
+			allowList:   allowList,
+			peerCiphers: []string{"none"},
+			wantErr:     true,
+		},
+		{
+			name:        "client offering only [null-cipher] fails",
+			allowList:   allowList,
+			peerCiphers: []string{"[null-cipher]"},
+			wantErr:     true,
+		},
+		{
+			name:        "OCC none never matches",
+			allowList:   allowList,
+			peerCiphers: nil,
+			occCipher:   "none",
+			wantErr:     true,
+		},
+		{
+			name:        "OCC [null-cipher] never matches",
+			allowList:   allowList,
+			peerCiphers: nil,
+			occCipher:   "[null-cipher]",
+			wantErr:     true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := selectCipher(tt.allowList, tt.peerCiphers, tt.occCipher)
+			if tt.wantErr {
+				if !errors.Is(err, errCipherNegotiationFailed) {
+					t.Fatalf("selectCipher(%v, %v, %q) error = %v, want errCipherNegotiationFailed", tt.allowList, tt.peerCiphers, tt.occCipher, err)
+				}
+				if got != "" {
+					t.Errorf("selectCipher(%v, %v, %q) = %q on error, want empty", tt.allowList, tt.peerCiphers, tt.occCipher, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("selectCipher(%v, %v, %q) unexpected error: %v", tt.allowList, tt.peerCiphers, tt.occCipher, err)
+			}
+			if got != tt.want {
+				t.Errorf("selectCipher(%v, %v, %q) = %q, want %q", tt.allowList, tt.peerCiphers, tt.occCipher, got, tt.want)
 			}
 		})
 	}
