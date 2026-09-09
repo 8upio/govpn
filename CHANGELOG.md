@@ -6,6 +6,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project does not yet follow Semantic Versioning strictly (pre-1.0), but
 version numbers below still increase monotonically with each release.
 
+## [Unreleased]
+
+### Fixed
+
+- Data-channel packets were dispatched on one goroutine per datagram, so a
+  session's packets could reach `Session.Read` out of order — measured as 640
+  reordering events in 3.5 minutes on a live PSTN↔phone call, with 2–22 ms of
+  RTCP jitter on the tunnel leg versus 0 ms on a kernel-socket leg. Data packets
+  are now decrypted and enqueued inline in the server's read loop, so each
+  session's packets are delivered in socket arrival order. This also removes a
+  secondary loss source: a packet reordered more than 64 packet-ids behind the
+  highest accepted one was rejected outright by the anti-replay window, so the
+  reordering showed up as packet loss rather than as reordering. Control-channel
+  datagrams are unchanged and still handled concurrently.
+
 ## [0.2.1] - 2026-09-08
 
 ### Fixed

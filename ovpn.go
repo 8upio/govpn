@@ -650,9 +650,14 @@ func (s *Server) logger() *slog.Logger {
 // mirroring tls_pre_decrypt_lite (ssl_pkt.c:305-423): reject datagrams
 // shorter than the tls-crypt prefix or longer than TLS_CHANNEL_BUF_SIZE,
 // and reject header bytes with an out-of-range opcode — all before ever
-// calling Unwrap. Each accepted datagram is then handled on its own
-// goroutine, so datagrams belonging to distinct client sessions are
-// processed concurrently without blocking the read loop.
+// calling Unwrap. Control datagrams are then handled on their own
+// goroutine, so distinct client sessions' handshakes/renegotiations are
+// processed concurrently without blocking the read loop. Data datagrams
+// (P_DATA_V1/P_DATA_V2) are handled INLINE, on this read-loop goroutine
+// itself, so each session's packets reach Session.Read in the order the
+// socket delivered them — mirroring the reference implementation, where
+// mudp.c:385-388 reads and processes each datagram in the same loop
+// iteration on the same thread.
 func (s *Server) Serve(pc net.PacketConn) error {
 	// Fail fast on malformed key material rather than discovering it on the
 	// first inbound datagram; NewWrapper's own length check is authoritative,
@@ -773,6 +778,44 @@ func (s *Server) Serve(pc net.PacketConn) error {
 			}
 			s.logger().Warn("read loop stopped", "err", err)
 			return err
+		}
+
+		// B3: data-channel packets are dispatched INLINE, on this
+		// goroutine, so a session's packets reach Session.Read in the
+		// order the socket delivered them. The previous
+		// goroutine-per-datagram dispatch let two RTP packets 20 ms
+		// apart race each other through the peer-id lookup and the
+		// ipInbound enqueue and arrive swapped — and a packet more than
+		// replayWindowSize (64) behind the highest accepted packet-id is
+		// then dropped outright by the anti-replay window, turning
+		// reordering into real loss. The reference has no such window:
+		// mudp.c:385-388 reads the datagram and processes it
+		// (multi_process_incoming_link) in the same loop iteration on
+		// the same thread, so socket order IS delivery order for every
+		// real client.
+		//
+		// Nothing on this path can block the read loop: the peer-id
+		// lookup is one short s.mu critical section, Wrapper.Open is
+		// pure CPU, the ipInbound delivery is a select with a default
+		// drop (session.go's handleDataPacket, D-06), and the
+		// exit-notify branch's closeWithReason only takes short mutexes
+		// and calls the non-blocking ctrlconn.Conn.Close — the
+		// OnSessionClosed callback itself is dispatched on its own
+		// goroutine. Control packets keep their own goroutine below:
+		// TLS handshakes and renegotiation must never run here.
+		//
+		// The copy stays even though this path is now synchronous:
+		// datachan.Wrapper.Open does not retain the ciphertext slice
+		// today, but nothing enforces that invariant, and a future
+		// change that retained it would corrupt packets from the
+		// reused read buffer in a way no test would reliably catch.
+		if n >= 1 && n <= maxDatagramSize {
+			if opcode, _ := wire.ParseHeaderByte(buf[0]); opcode == wire.OpDataV1 || opcode == wire.OpDataV2 {
+				packet := make([]byte, n)
+				copy(packet, buf[:n])
+				s.handleDataDatagram(opcode, packet)
+				continue
+			}
 		}
 
 		packet := make([]byte, n)

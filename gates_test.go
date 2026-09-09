@@ -1116,3 +1116,96 @@ func TestPhase3StdlibOnlyImports(t *testing.T) {
 		}
 	})
 }
+
+// TestGateServeDispatchesDataInline is this quick task's own standing gate
+// (B3, quick-260909-pkf): Serve must dispatch handleDataDatagram as a
+// direct call on the read-loop goroutine, never hand it to a `go`
+// statement — a future edit that reintroduces goroutine-per-datagram
+// dispatch for data packets silently reintroduces the per-session
+// reordering bug this task fixes. TestGate* (not TestPhaseN*) is the
+// naming prefix for gates that are not tied to a numbered phase; it still
+// runs under `make test` (go test -race ./...) and the fast `gates` tier
+// regardless of its name.
+func TestGateServeDispatchesDataInline(t *testing.T) {
+	file, fset := parseGoFile(t, "ovpn.go")
+
+	var serveDecl *ast.FuncDecl
+	for _, decl := range file.Decls {
+		fd, ok := decl.(*ast.FuncDecl)
+		if !ok || fd.Body == nil {
+			continue
+		}
+		if fd.Name.Name == "Serve" && fd.Recv != nil {
+			serveDecl = fd
+			break
+		}
+	}
+	if serveDecl == nil {
+		t.Fatal("ovpn.go: no Serve method found")
+	}
+
+	// First pass: collect every CallExpr that is the Call of a GoStmt
+	// (i.e. dispatched onto its own goroutine).
+	goStmtCalls := map[ast.Expr]bool{}
+	ast.Inspect(serveDecl.Body, func(n ast.Node) bool {
+		if goStmt, ok := n.(*ast.GoStmt); ok {
+			goStmtCalls[goStmt.Call] = true
+		}
+		return true
+	})
+
+	sawInlineDataDispatch := false
+	goStmtCallsDataDatagram := false
+
+	ast.Inspect(serveDecl.Body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "handleDataDatagram" {
+			return true
+		}
+		if goStmtCalls[call] {
+			goStmtCallsDataDatagram = true
+			pos := fset.Position(call.Pos())
+			t.Errorf(
+				"%s:%d: Serve dispatches handleDataDatagram via a go statement — data packets must not be handed to a goroutine, or per-session arrival order is lost again (B3, mudp.c:385-388)",
+				pos.Filename, pos.Line,
+			)
+			return true
+		}
+		sawInlineDataDispatch = true
+		return true
+	})
+
+	if !sawInlineDataDispatch {
+		t.Error("Serve no longer dispatches handleDataDatagram directly on the read-loop goroutine — data packets must not be handed to a goroutine, or per-session arrival order is lost again (B3, mudp.c:385-388)")
+	}
+	_ = goStmtCallsDataDatagram
+
+	// Second, cheaper assertion: every `go` statement inside Serve must
+	// call handleDatagram (the control path) — any other `go` statement
+	// in Serve is a new concurrency source and must be reviewed.
+	ast.Inspect(serveDecl.Body, func(n ast.Node) bool {
+		goStmt, ok := n.(*ast.GoStmt)
+		if !ok {
+			return true
+		}
+		callee := ""
+		switch fun := goStmt.Call.Fun.(type) {
+		case *ast.SelectorExpr:
+			callee = fun.Sel.Name
+		case *ast.Ident:
+			callee = fun.Name
+		}
+		if callee != "handleDatagram" {
+			pos := fset.Position(goStmt.Pos())
+			t.Errorf(
+				"%s:%d: Serve spawns a goroutine calling %q — the only goroutine Serve's read loop may spawn is the control-path handleDatagram; a new concurrency source here needs explicit review",
+				pos.Filename, pos.Line, callee,
+			)
+		}
+		return true
+	})
+}

@@ -16,9 +16,12 @@ test: gates
 # Runs the standing prohibition gates (gates_test.go) — every
 # must_haves.prohibitions entry declared across Phase 2's, Phase 3's, and
 # Phase 4's plans, turned into assertions that fail a normal `go test` run
-# rather than sitting in a document nobody greps.
+# rather than sitting in a document nobody greps. TestGate* is the naming
+# prefix for gates that are not tied to a numbered phase (e.g. quick-task
+# regressions like B3's TestGateServeDispatchesDataInline) — it runs here
+# too, in the fast tier, rather than only under the full `go test ./...`.
 gates:
-	go test -race -run 'TestPhase2|TestPhase3|TestPhase4' -v ./
+	go test -race -run 'TestPhase2|TestPhase3|TestPhase4|TestGate' -v ./
 
 # Full interop tier: generates a fresh test PKI in Go (large profile, so
 # the certificate-fragmentation assertions have something to fragment —

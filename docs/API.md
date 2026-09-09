@@ -306,6 +306,18 @@ returns a plain error.
 A 16-byte ping keepalive received from the client is absorbed entirely
 inside the decrypt path and never reaches `Read`'s caller.
 
+**Ordering.** `Read` delivers a session's data packets in the order the
+server socket received them. The server's read loop decrypts and enqueues
+data-channel packets inline, on the same goroutine that reads the socket —
+matching the reference implementation, which reads and processes each
+datagram in one loop iteration on one thread. UDP itself can still reorder
+packets in transit, and the session's inbound queue still drops the newest
+packet on overflow (`Config.SessionInboundQueue`,
+`SessionStats.InboundQueueDropped`), but the server never introduces
+reordering of its own. This matters for latency-sensitive payloads such as
+RTP, where reordering also interacts badly with the data channel's
+64-packet anti-replay window.
+
 ### Concurrency
 
 A single `Session`'s `Read`/`Write`/`Close` may each be called concurrently
@@ -316,7 +328,9 @@ ordinary `io.Reader` implementations rely on (the same contract
 `bufio.Reader` has). All exported accessor methods below (`AssignedIP`,
 `PeerID`, `PushRequestSeen`, `RenegotiationCount`, `ConnectionState`,
 `DebugDataKeys`, `DebugKeyMethod2Material`) are safe to call from any
-goroutine at any time.
+goroutine at any time. Control-channel work (handshake, renegotiation)
+still runs on its own per-datagram goroutine, so a slow session's
+handshake never delays another session's data.
 
 ### Lifecycle and `Close`
 
