@@ -1419,8 +1419,14 @@ func (s *Server) performPushExchange(sess *Session, w io.Writer) error {
 	// Method 2 options string all read this ONE stored value — an empty
 	// cipher at push time means performKeyMethod2Exchange's own publish
 	// never ran (the negotiation wiring is broken), and this must fail
-	// loudly rather than push a default.
-	cipher := sess.Cipher()
+	// loudly rather than push a default. supportsNCP is read from the same
+	// sess.mu critical section performKeyMethod2Exchange published it in
+	// (CIPH-04): buildPushReply below needs it to decide whether to push a
+	// `cipher` token at all (push.c:663-666).
+	sess.mu.Lock()
+	cipher := sess.cipher
+	supportsNCP := sess.peerSupportsNCP
+	sess.mu.Unlock()
 	if cipher == "" {
 		return fmt.Errorf("ovpn: session has no negotiated cipher at push time")
 	}
@@ -1578,7 +1584,7 @@ func (s *Server) performPushExchange(sess *Session, w io.Writer) error {
 			sess.startReap()
 		}
 
-		reply := buildPushReply(sess.assignedIP, s.cfg.Network, sess.peerID, cipher,
+		reply := buildPushReply(sess.assignedIP, s.cfg.Network, sess.peerID, cipher, supportsNCP,
 			durationToPushedSeconds(s.pingInterval), durationToPushedSeconds(s.reapWindow))
 		if _, err := w.Write(reply); err != nil {
 			return fmt.Errorf("ovpn: write push reply: %w", err)

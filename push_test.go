@@ -16,7 +16,7 @@ func TestPushReplyStringExact(t *testing.T) {
 	}
 	clientIP := net.ParseIP("10.8.0.2")
 
-	got := buildPushReply(clientIP, network, 0, "AES-256-GCM", 10, 60)
+	got := buildPushReply(clientIP, network, 0, "AES-256-GCM", true, 10, 60)
 
 	want := append([]byte("PUSH_REPLY,ifconfig 10.8.0.2 255.255.255.0,topology subnet,peer-id 0,cipher AES-256-GCM,ping 10,ping-restart 60"), 0)
 
@@ -40,7 +40,7 @@ func TestPushReplyNetmaskFromPrefix(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse network %s: %v", c.cidr, err)
 		}
-		reply := buildPushReply(net.ParseIP(c.clientIP), network, 1, "AES-256-GCM", 10, 60)
+		reply := buildPushReply(net.ParseIP(c.clientIP), network, 1, "AES-256-GCM", true, 10, 60)
 		wantSegment := "ifconfig " + c.clientIP + " " + c.wantNetmask
 		if !bytes.Contains(reply, []byte(wantSegment)) {
 			t.Errorf("buildPushReply(%s) = %q, want it to contain %q", c.cidr, reply, wantSegment)
@@ -65,7 +65,7 @@ func TestPushReplyNormalizesSixteenByteMask(t *testing.T) {
 	copy(sixteenByteMask[12:], network.Mask)
 	network.Mask = sixteenByteMask
 
-	reply := buildPushReply(net.ParseIP("10.8.0.2"), network, 0, "AES-256-GCM", 10, 60)
+	reply := buildPushReply(net.ParseIP("10.8.0.2"), network, 0, "AES-256-GCM", true, 10, 60)
 
 	wantSegment := "ifconfig 10.8.0.2 255.255.255.0"
 	if !bytes.Contains(reply, []byte(wantSegment)) {
@@ -78,7 +78,7 @@ func TestPushReplyEndsWithSingleNUL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse network: %v", err)
 	}
-	reply := buildPushReply(net.ParseIP("10.8.0.2"), network, 0, "AES-256-GCM", 10, 60)
+	reply := buildPushReply(net.ParseIP("10.8.0.2"), network, 0, "AES-256-GCM", true, 10, 60)
 
 	if n := bytes.Count(reply, []byte{0}); n != 1 {
 		t.Fatalf("reply contains %d NUL bytes, want exactly 1: %q", n, reply)
@@ -142,7 +142,7 @@ func TestPushReplyCarriesCallerSuppliedPingValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse network: %v", err)
 	}
-	reply := buildPushReply(net.ParseIP("10.8.0.2"), network, 0, "AES-256-GCM", 5, 30)
+	reply := buildPushReply(net.ParseIP("10.8.0.2"), network, 0, "AES-256-GCM", true, 5, 30)
 
 	if !bytes.Contains(reply, []byte("ping 5,ping-restart 30")) {
 		t.Errorf("buildPushReply(pingSeconds=5, pingRestartSeconds=30) = %q, want it to contain %q", reply, "ping 5,ping-restart 30")
@@ -168,6 +168,32 @@ func TestDurationToPushedSecondsFloorsAtOne(t *testing.T) {
 		if got := durationToPushedSeconds(c.d); got != c.want {
 			t.Errorf("durationToPushedSeconds(%v) = %d, want %d", c.d, got, c.want)
 		}
+	}
+}
+
+// TestBuildPushReplyOmitsCipherForNonNCPPeer is CIPH-04's push-gate proof
+// (push.c:663-666): with peerSupportsNCP false, buildPushReply produces the
+// exact same reply as the NCP-true case with only the "cipher AES-256-GCM"
+// option and its leading comma removed — nothing else changes. The expected
+// string is written out explicitly, not derived by stripping a substring
+// from the NCP-true output, so this test cannot pass by mirroring a bug in
+// buildPushReply's own separator handling.
+func TestBuildPushReplyOmitsCipherForNonNCPPeer(t *testing.T) {
+	_, network, err := net.ParseCIDR("10.8.0.0/24")
+	if err != nil {
+		t.Fatalf("parse network: %v", err)
+	}
+	clientIP := net.ParseIP("10.8.0.2")
+
+	got := buildPushReply(clientIP, network, 0, "AES-256-GCM", false, 10, 60)
+
+	want := append([]byte("PUSH_REPLY,ifconfig 10.8.0.2 255.255.255.0,topology subnet,peer-id 0,ping 10,ping-restart 60"), 0)
+
+	if !bytes.Equal(got, want) {
+		t.Errorf("buildPushReply(peerSupportsNCP=false) = %q, want %q", got, want)
+	}
+	if bytes.Contains(got, []byte("cipher")) {
+		t.Errorf("buildPushReply(peerSupportsNCP=false) = %q, want no cipher option at all", got)
 	}
 }
 

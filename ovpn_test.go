@@ -917,6 +917,43 @@ func TestPerformPushExchangeReleasesAllocationWhenSessionAlreadyClosing(t *testi
 	}
 }
 
+// TestPushExchangeFailsWithoutNegotiatedCipher is T-05-05's fail-loud
+// guard (05-03-PLAN.md Task 2): performPushExchange must never substitute a
+// default cipher for a session whose negotiation never ran (sess.cipher ==
+// "") — a hand-built *Session with no cipher set, exactly like a wiring bug
+// that skipped performKeyMethod2Exchange's publish would produce, must
+// error out before writing anything, not silently push AES-256-GCM.
+func TestPushExchangeFailsWithoutNegotiatedCipher(t *testing.T) {
+	_, network, err := net.ParseCIDR("10.20.8.0/24")
+	if err != nil {
+		t.Fatalf("parse network: %v", err)
+	}
+	pool, err := newIPPool(network)
+	if err != nil {
+		t.Fatalf("newIPPool: %v", err)
+	}
+
+	srv := &Server{pool: pool, cfg: Config{Network: network}, dataSessions: make(map[uint32]*Session)}
+
+	dataKeys, err := keyderiv.NewKey2(make([]byte, 256))
+	if err != nil {
+		t.Fatalf("NewKey2: %v", err)
+	}
+	// cipher is deliberately left unset (the zero value, "").
+	sess := &Session{tlsReader: bufio.NewReader(strings.NewReader(pushRequestLiteral + "\x00")), dataKeys: dataKeys}
+
+	var out strings.Builder
+	if err := srv.performPushExchange(sess, &out); err == nil {
+		t.Fatal("performPushExchange succeeded for a session with no negotiated cipher; want an error")
+	}
+	if out.Len() != 0 {
+		t.Errorf("performPushExchange wrote %q, want nothing written when it fails before ever reading the push request", out.String())
+	}
+	if sess.assignedIP != nil {
+		t.Error("sess.assignedIP is set — must not allocate a tunnel IP when the cipher guard fails")
+	}
+}
+
 // TestOnSessionDoesNotFireWhenPushNeverArrives is 02-02-PLAN.md Task 3's
 // proof that runHandshake's doneCh close now covers the whole bring-up
 // sequence, not merely tls.Conn.Handshake() returning nil: a client that

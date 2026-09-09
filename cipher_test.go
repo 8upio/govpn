@@ -1098,3 +1098,47 @@ func TestIVCiphersPresentSuppressesOCCFallback(t *testing.T) {
 	}
 	assertNoCipherNameLeaked(t, reply)
 }
+
+// TestPreNCPSessionReceivesNoCipherOption is CIPH-04's live proof that a
+// pre-NCP client accepted via the OCC fallback (no IV_NCP/IV_CIPHERS at
+// all) receives a PUSH_REPLY with no `cipher` option token — the reference
+// never pushes one to a peer that never signalled NCP support
+// (push.c:663-666).
+func TestPreNCPSessionReceivesNoCipherOption(t *testing.T) {
+	_, network, err := net.ParseCIDR("10.45.8.0/24")
+	if err != nil {
+		t.Fatalf("parse network: %v", err)
+	}
+	key := testTLSCryptKey(t)
+
+	srv, serverPC, caPool, sessions := newCipherTracerServer(t, network, key)
+	defer serverPC.Close()
+	defer srv.Close()
+
+	client := dialOCCFallbackTestClient(t, key, serverPC.LocalAddr(), caPool, []byte("cipher AES-128-GCM"), nil)
+	defer client.Close()
+
+	if err := readTestServerKeyMethod2(client.tlsConn); err != nil {
+		t.Fatalf("read server Key Method 2: %v", err)
+	}
+	if err := writeControlString(client.tlsConn, pushRequestLiteral); err != nil {
+		t.Fatalf("write push request: %v", err)
+	}
+	reader := bufio.NewReader(client.tlsConn)
+	reply, err := readControlString(reader, maxControlStringLen)
+	if err != nil {
+		t.Fatalf("read push reply: %v", err)
+	}
+	if strings.Contains(reply, "cipher") {
+		t.Errorf("PUSH_REPLY = %q, want no cipher option for a pre-NCP peer", reply)
+	}
+
+	select {
+	case sess := <-sessions:
+		if got := sess.Cipher(); got != "AES-128-GCM" {
+			t.Errorf("sess.Cipher() = %q, want %q", got, "AES-128-GCM")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnSession was never called")
+	}
+}

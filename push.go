@@ -10,8 +10,13 @@
 //   - push.c:567,1089          client's "PUSH_REQUEST" literal
 //   - push.c:629-643           prepare_push_reply
 //   - push.c:663-666           cipher pushed only when peer signals NCP
-//     support (always true for a real 2.6 client — RESEARCH.md Assumption
-//     A2)
+//     support (tls_peer_supports_ncp, ssl_ncp.c:76-92) — implemented below
+//     via peerSupportsNCP (05-03-PLAN.md; formerly RESEARCH.md "Assumption
+//     A2", which is retired now that real IV_CIPHERS/IV_NCP parsing exists.
+//     The observable consequence for every real OpenVPN 2.6 client is nil:
+//     such a client always signals NCP support, so this gate is always
+//     true in practice — only a genuinely pre-NCP synthetic test client can
+//     ever observe the token omitted)
 //   - push.c:775-837           send_push_reply
 //   - helper.c:496-558         helper_keepalive: keepalive N M expands to
 //     local `ping N`/`ping-restart 2*M` and PUSHED `ping N`/`ping-restart
@@ -81,23 +86,27 @@ func durationToPushedSeconds(d time.Duration) int {
 }
 
 // buildPushReply assembles the server's PUSH_REPLY payload for clientIP
-// (drawn from network by the caller's ipPool), peerID, cipher, and the
-// server-authoritative ping/ping-restart values (seconds, already resolved
-// by the caller from Config.PingInterval/Config.ReapWindow — see
-// durationToPushedSeconds), in the exact option order and content a real
-// OpenVPN 2.6 server transmits (Pattern 6, D-03 "minimal reference
-// defaults only"): ifconfig under subnet topology, topology subnet,
-// peer-id, the data-channel cipher, and the keepalive helper's own pushed
-// expansion (ping N / ping-restart M — NOT the doubled local value of
-// 2*N, and NOT the literal "keepalive N M" token). Nothing else is
-// pushed: no route, no redirect-gateway, no dhcp-option, no compression
-// (D-03; routes are Phase 3). The returned slice ends with exactly one
-// 0x00 byte and is written to the wire unmodified — no length prefix
-// (Pattern 6).
-func buildPushReply(clientIP net.IP, network *net.IPNet, peerID uint32, cipher string, pingSeconds, pingRestartSeconds int) []byte {
-	if cipher == "" {
-		cipher = "AES-256-GCM"
-	}
+// (drawn from network by the caller's ipPool), peerID, cipher,
+// peerSupportsNCP, and the server-authoritative ping/ping-restart values
+// (seconds, already resolved by the caller from Config.PingInterval/
+// Config.ReapWindow — see durationToPushedSeconds), in the exact option
+// order and content a real OpenVPN 2.6 server transmits (Pattern 6, D-03
+// "minimal reference defaults only"): ifconfig under subnet topology,
+// topology subnet, peer-id, the data-channel cipher (only when
+// peerSupportsNCP — push.c:663-666), and the keepalive helper's own pushed
+// expansion (ping N / ping-restart M — NOT the doubled local value of 2*N,
+// and NOT the literal "keepalive N M" token). Nothing else is pushed: no
+// route, no redirect-gateway, no dhcp-option, no compression (D-03; routes
+// are Phase 3). The returned slice ends with exactly one 0x00 byte and is
+// written to the wire unmodified — no length prefix (Pattern 6).
+//
+// cipher is never defaulted here: by the time this function is reached,
+// the caller (performPushExchange) already holds a negotiated canonical
+// cipher name (T-05-05) — silently substituting "AES-256-GCM" for an empty
+// value would hide exactly the wiring bug an empty cipher represents,
+// rather than surfacing it. performPushExchange itself fails loudly before
+// ever calling this function if the session has no negotiated cipher.
+func buildPushReply(clientIP net.IP, network *net.IPNet, peerID uint32, cipher string, peerSupportsNCP bool, pingSeconds, pingRestartSeconds int) []byte {
 	netmask := net.IP(normalizeIPv4Mask(network.Mask)).String()
 
 	opts := []string{
@@ -105,7 +114,17 @@ func buildPushReply(clientIP net.IP, network *net.IPNet, peerID uint32, cipher s
 		fmt.Sprintf("ifconfig %s %s", clientIP.String(), netmask),
 		"topology subnet",
 		fmt.Sprintf("peer-id %d", peerID),
-		fmt.Sprintf("cipher %s", cipher),
+	}
+	if peerSupportsNCP {
+		// push.c:663-666: "We avoid pushing the cipher to clients not
+		// supporting NCP to avoid error messages in their logs." Every real
+		// OpenVPN 2.6 client always signals NCP support (peerSupportsNCP,
+		// cipher.go), so this branch is always taken in practice — only a
+		// genuinely pre-NCP synthetic test client can ever observe it
+		// skipped.
+		opts = append(opts, fmt.Sprintf("cipher %s", cipher))
+	}
+	opts = append(opts,
 		// pingSeconds/pingRestartSeconds are derived by the caller
 		// (performPushExchange) from the SAME Server.pingInterval/
 		// Server.reapWindow fields session.go's keepalive goroutine and
@@ -115,7 +134,7 @@ func buildPushReply(clientIP net.IP, network *net.IPNet, peerID uint32, cipher s
 		// to provide, now derived from Config instead of hardcoded.
 		fmt.Sprintf("ping %d", pingSeconds),
 		fmt.Sprintf("ping-restart %d", pingRestartSeconds),
-	}
+	)
 	reply := strings.Join(opts, ",")
 	return append([]byte(reply), 0)
 }
