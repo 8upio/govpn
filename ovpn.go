@@ -1282,11 +1282,27 @@ func (s *Server) runHandshake(sess *Session) {
 			// the OUTER handshakeWindow bound (60s default) still covers
 			// this path, with authFailedWindow (2s) as the tighter INNER
 			// bound on the read-then-drain sequence itself.
-			s.recordHandshakeOutcome(sess, &s.stats.authFailed)
+			//
+			// af.kind picks the counter AND the CloseReason together
+			// (Pitfall 3/T-05-18): a credential rejection (the zero value)
+			// keeps today's AuthFailed/CloseReasonAuthFailed; a
+			// cipher-negotiation rejection (CIPH-03) routes to its own
+			// CipherNegotiationFailed counter and CloseReasonUnknown — never
+			// CloseReasonAuthFailed, which would misreport a
+			// protocol-compatibility refusal as an authentication outcome
+			// on every embedder-visible surface (Config.OnSessionClosed,
+			// Session.CloseReason()).
+			counter := &s.stats.authFailed
+			closeReason := CloseReasonAuthFailed
+			if af.kind == authFailureCipherNegotiation {
+				counter = &s.stats.cipherNegotiationFailed
+				closeReason = CloseReasonUnknown
+			}
+			s.recordHandshakeOutcome(sess, counter)
 			s.rejectAuthAfterPushRequest(sess, tlsConn, af.clientReason)
 			sess.logger().Debug("auth failed sent to client", "has_client_reason", af.clientReason != "")
 			close(sess.doneCh)
-			_ = sess.closeWithReason(CloseReasonAuthFailed)
+			_ = sess.closeWithReason(closeReason)
 			return
 		}
 		s.recordHandshakeOutcome(sess, &s.stats.handshakesFailed)
@@ -1605,14 +1621,39 @@ func km2Credential(field []byte) (string, bool) {
 	return string(field), true
 }
 
-// authFailure is the typed error verifyUserPass/callAuthUserPass return for
-// any auth rejection: a too-long or empty credential, a hook error, or a
-// recovered hook panic. clientReason, if non-empty, is sent to the client
-// as AUTH_FAILED,<clientReason> (D-04); otherwise the plain AUTH_FAILED
-// form is sent. err carries the underlying (server-side-only) diagnostic.
+// authFailureKind discriminates WHY an *authFailure was returned, so
+// runHandshake's single errors.As(err, &af) branch can route the right
+// Server.Stats counter and CloseReason without a second branch or a new
+// error type (05-RESEARCH.md Pattern 2). authFailureCredential is the iota
+// zero value: every existing &authFailure{clientReason, err} literal in
+// verifyUserPass/callAuthUserPass keeps compiling and keeps today's exact
+// behaviour, since Go zero-values an omitted struct field.
+type authFailureKind int
+
+const (
+	authFailureCredential authFailureKind = iota
+	authFailureCipherNegotiation
+)
+
+// authFailure is the typed error verifyUserPass/callAuthUserPass/
+// performKeyMethod2Exchange return for any auth or cipher-negotiation
+// rejection: a too-long or empty credential, a hook error, a recovered hook
+// panic, or (CIPH-03) no shared data-channel cipher. clientReason, if
+// non-empty, is sent to the client as AUTH_FAILED,<clientReason> (D-04);
+// otherwise the plain AUTH_FAILED form is sent. err carries the underlying
+// (server-side-only) diagnostic — this is the ONLY place either the
+// server's allow-list or the client's advertised cipher list may ever
+// appear for a cipher-negotiation rejection (T-05-16). kind routes
+// runHandshake's shared rejection branch to the right Server.Stats counter
+// and CloseReason (Pitfall 3): authFailureCredential (the zero value) counts
+// AuthFailed and closes CloseReasonAuthFailed; authFailureCipherNegotiation
+// counts CipherNegotiationFailed and closes CloseReasonUnknown, since a
+// cipher refusal is a protocol-compatibility outcome, not an authentication
+// one (CONTEXT.md locked decision).
 type authFailure struct {
 	clientReason string
 	err          error
+	kind         authFailureKind
 }
 
 func (f *authFailure) Error() string {
@@ -1732,8 +1773,25 @@ type ServerStats struct {
 	// recovered hook panic). A renegotiation-time AuthUserPass rejection is
 	// already reported through Config.OnSessionClosed(CloseReasonAuthFailed)
 	// and is deliberately not counted here — counting it here too would
-	// double-report the same event through two different surfaces.
+	// double-report the same event through two different surfaces. It does
+	// NOT include a cipher-negotiation refusal (see CipherNegotiationFailed
+	// below) — the two counters partition rather than overlap (Pitfall 3),
+	// so an operator can tell "this client's credentials were rejected"
+	// apart from "this client had no data-channel cipher in common with
+	// this server".
 	AuthFailed uint64
+
+	// CipherNegotiationFailed counts every INITIAL-handshake refusal where
+	// the client and server had no data-channel cipher in common (CIPH-03):
+	// the client's advertised IV_CIPHERS/IV_NCP capability list, and its OCC
+	// cipher fallback for a genuinely pre-NCP client, shared no entry with
+	// the server's resolved Config.DataCiphers allow-list. It never
+	// increments AuthFailed for the same event, and never the reverse
+	// (Pitfall 3). A session refused for this reason never reaches
+	// Config.OnSession, so Config.OnSessionClosed does not fire for it
+	// either — the same non-published contract HandshakesFailed already
+	// documents.
+	CipherNegotiationFailed uint64
 
 	// AssignIPRejected counts every Config.AssignIP rejection: an invalid
 	// address (not IPv4, outside Config.Network, or the network/server/
@@ -1824,15 +1882,16 @@ func (s *Server) Sessions() []*Session {
 // consistency caveat.
 func (s *Server) Stats() ServerStats {
 	return ServerStats{
-		ActiveSessions:      len(s.Sessions()),
-		HandshakesStarted:   s.stats.handshakesStarted.Load(),
-		HandshakesCompleted: s.stats.handshakesCompleted.Load(),
-		HandshakesFailed:    s.stats.handshakesFailed.Load(),
-		HandshakesTimedOut:  s.stats.handshakesTimedOut.Load(),
-		AuthFailed:          s.stats.authFailed.Load(),
-		AssignIPRejected:    s.stats.assignIPRejected.Load(),
-		PoolExhausted:       s.stats.poolExhausted.Load(),
-		DatagramsRejected:   s.stats.datagramsRejected.Load(),
+		ActiveSessions:          len(s.Sessions()),
+		HandshakesStarted:       s.stats.handshakesStarted.Load(),
+		HandshakesCompleted:     s.stats.handshakesCompleted.Load(),
+		HandshakesFailed:        s.stats.handshakesFailed.Load(),
+		HandshakesTimedOut:      s.stats.handshakesTimedOut.Load(),
+		AuthFailed:              s.stats.authFailed.Load(),
+		CipherNegotiationFailed: s.stats.cipherNegotiationFailed.Load(),
+		AssignIPRejected:        s.stats.assignIPRejected.Load(),
+		PoolExhausted:           s.stats.poolExhausted.Load(),
+		DatagramsRejected:       s.stats.datagramsRejected.Load(),
 	}
 }
 
@@ -2118,14 +2177,25 @@ func (s *Server) writeServerKeyMethod2AndDeriveKeys(tlsConn *tls.Conn, clientKM 
 // the data-channel keys. It writes its results onto sess: sess.tlsReader
 // (D-15, so plan 02-02's PUSH_REQUEST continuation reads from the same
 // buffered stream rather than losing bytes to a second reader),
-// sess.dataKeys, sess.cipher, sess.clientKM, and sess.serverKM. The
-// renegotiation path (runRenegotiation) calls readClientKeyMethod2/
-// writeServerKeyMethod2AndDeriveKeys directly instead, reusing sess.Cipher()
-// rather than selecting again (CIPH-06), and never touches sess.tlsReader
-// (D-15's single-buffered-reader contract stays scoped to the initial
-// handshake).
+// sess.dataKeys, sess.cipher, sess.peerSupportsNCP, sess.clientKM, and
+// sess.serverKM. The renegotiation path (runRenegotiation) calls
+// readClientKeyMethod2/writeServerKeyMethod2AndDeriveKeys directly instead,
+// reusing sess.Cipher() rather than selecting again (CIPH-06), and never
+// touches sess.tlsReader (D-15's single-buffered-reader contract stays
+// scoped to the initial handshake).
 //
-// The existing publishes above happen UNCONDITIONALLY, before
+// sess.tlsReader is published the MOMENT the read succeeds — before cipher
+// selection, before the server's own Key Method 2 message is ever written —
+// because a cipher-negotiation refusal (CIPH-03, below) returns before this
+// function ever calls writeServerKeyMethod2AndDeriveKeys, and
+// runHandshake's shared rejectAuthAfterPushRequest still needs a live
+// sess.tlsReader to read the client's PUSH_REQUEST off (R4) before it can
+// reply. The old publish point (after the write) left sess.tlsReader nil on
+// exactly this new failure path, which would have panicked
+// rejectAuthAfterPushRequest's own readControlString call on a nil
+// *bufio.Reader — moving the publish earlier is required, not cosmetic.
+//
+// The remaining publishes happen UNCONDITIONALLY on the accept path, before
 // verifyUserPass ever runs (quick 260908-m4e key_links): the AUTH_FAILED
 // path in runHandshake must read the client's PUSH_REQUEST off
 // sess.tlsReader (R4), so the reader has to be positioned even when
@@ -2139,33 +2209,54 @@ func (s *Server) performKeyMethod2Exchange(sess *Session, tlsConn *tls.Conn) err
 	if err != nil {
 		return err
 	}
+	// See this function's own doc comment above (Rule 1 fix, 05-03-PLAN.md
+	// Task 1): published here, unconditionally, the instant the read
+	// succeeds — NOT after writeServerKeyMethod2AndDeriveKeys, which a
+	// cipher-negotiation refusal below never reaches.
+	sess.tlsReader = tlsReader
 
-	selected, err := selectCipher(s.dataCiphers, peerCipherList(clientOpts.PeerInfo), "")
+	peerCiphers := peerCipherList(clientOpts.PeerInfo)
+	occCipher := parseOCCCipher(clientOpts.Options)
+	if _, sentIVCiphers := peerInfoValue(clientOpts.PeerInfo, "IV_CIPHERS="); sentIVCiphers {
+		// ssl_ncp.c:262-268: a client that sent IV_CIPHERS= at all — even
+		// an empty one — cannot use its OCC cipher as a second bite at the
+		// apple; a modern client's own options-string cipher token can
+		// never rescue a failed IV_CIPHERS negotiation (T-05-15).
+		occCipher = ""
+	}
+	supportsNCP := peerSupportsNCP(clientOpts.PeerInfo)
+
+	selected, err := selectCipher(s.dataCiphers, peerCiphers, occCipher)
 	if err != nil {
-		// Wrapped for now, matching every other stage failure in this
-		// function's caller (runHandshake's non-authFailure branch): plan
-		// 05-03 converts this into the typed *authFailure rejection
-		// (AUTH_FAILED,<cipherNegotiationFailedReason>) and its own
-		// Server.Stats().CipherNegotiationFailed counter.
-		return fmt.Errorf("ovpn: cipher negotiation: %w", err)
+		// T-05-16: the allow-list and the client's own advertised list are
+		// server-side diagnostic detail ONLY — they go into this Warn
+		// record and the wrapped err below, never into clientReason, which
+		// is the reference's own fixed sentence and nothing more.
+		sess.logger().Warn("cipher negotiation rejected", "reason", "no-shared-cipher",
+			"allow_list", s.dataCiphers, "client_ciphers", peerCiphers, "occ_cipher", occCipher)
+		return &authFailure{
+			clientReason: cipherNegotiationFailedReason,
+			err:          fmt.Errorf("ovpn: no shared cipher: allow-list=%v client=%v occ=%q", s.dataCiphers, peerCiphers, occCipher),
+			kind:         authFailureCipherNegotiation,
+		}
 	}
 
 	dataKeys, serverKM, err := s.writeServerKeyMethod2AndDeriveKeys(tlsConn, clientKM, serverKM2Options(selected), sess.clientSessionID, sess.SessionID)
 	if err != nil {
 		return err
 	}
-	sess.tlsReader = tlsReader
 	// WR-01 (04-REVIEW.md): dataKeys is a sess.mu-guarded field (see mu's
 	// own doc comment) — this is its initial, single-writer publish, but
 	// DebugDataKeys can be called concurrently from an arbitrary goroutine
 	// at any time, so this write takes the same lock its reader does.
-	// sess.cipher is published in this SAME critical section (T-05-05):
-	// the Key Method 2 options string just written, the PUSH_REPLY cipher
-	// token, and the data-channel AEAD key length must all read the one
-	// value stored here, never re-derived separately.
+	// sess.cipher/sess.peerSupportsNCP are published in this SAME critical
+	// section (T-05-05): the Key Method 2 options string just written, the
+	// PUSH_REPLY cipher token/gate, and the data-channel AEAD key length
+	// must all read the one value stored here, never re-derived separately.
 	sess.mu.Lock()
 	sess.dataKeys = dataKeys
 	sess.cipher = selected
+	sess.peerSupportsNCP = supportsNCP
 	sess.mu.Unlock()
 	sess.clientKM = clientKM
 	sess.serverKM = serverKM

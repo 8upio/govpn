@@ -209,6 +209,16 @@ type Session struct {
 	// rewritten by runRenegotiation (CIPH-06). Guarded by mu.
 	cipher string
 
+	// peerSupportsNCP records whether this session's client signalled NCP
+	// support in its Key Method 2 peer_info (IV_NCP>=2 or IV_CIPHERS=
+	// present — peerSupportsNCP, cipher.go), captured at the same point and
+	// in the same sess.mu critical section as cipher above. push.go's
+	// buildPushReply reads this at push time (peer_info itself is long gone
+	// by then) to decide whether to push a `cipher` token at all
+	// (push.c:663-666: the reference never pushes one to a peer that never
+	// asked, "to avoid error messages in their logs"). Guarded by mu.
+	peerSupportsNCP bool
+
 	// clientKM is the client's own Key Method 2 pre_master/random1/random2,
 	// retained only for diagnostics after DeriveKeys has consumed it.
 	clientKM *keyderiv.KeySource
@@ -290,11 +300,12 @@ type Session struct {
 
 	// mu guards assignedIP, peerID, primary, lameDuck, pendingReneg,
 	// pendingRenegKeyID, lastRenegAccepted, lastAuthTraffic, dataKeys,
-	// cipher, and establishedAt below (WR-03, extended by 04-01-PLAN.md Task 1 from
-	// the single dataWrapper field it originally guarded to this phase's
-	// two-slot key state, by 04-02-PLAN.md Task 2 to lastAuthTraffic, by
-	// 04-REVIEW.md WR-01 to dataKeys, by the Welle-1 SessionStats plan
-	// to establishedAt, and by 05-01-PLAN.md to cipher — no new mutex):
+	// cipher, peerSupportsNCP, and establishedAt below (WR-03, extended by
+	// 04-01-PLAN.md Task 1 from the single dataWrapper field it originally
+	// guarded to this phase's two-slot key state, by 04-02-PLAN.md Task 2 to
+	// lastAuthTraffic, by 04-REVIEW.md WR-01 to dataKeys, by the Welle-1
+	// SessionStats plan to establishedAt, by 05-01-PLAN.md to cipher, and by
+	// 05-03-PLAN.md to peerSupportsNCP — no new mutex):
 	// ovpn.go's performPushExchange and
 	// runRenegotiation (running on this session's own goroutines) write
 	// them, while Close — which enforceHandshakeWindow's timeout goroutine

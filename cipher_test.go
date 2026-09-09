@@ -909,3 +909,192 @@ func TestTwoConcurrentSessionsNegotiateDifferentCiphers(t *testing.T) {
 		t.Fatalf("negotiated ciphers %q/%q are not both members of the server's allow-list %v", results[0].sess.Cipher(), results[1].sess.Cipher(), srv.dataCiphers)
 	}
 }
+
+// dialOCCFallbackTestClient drives client through hard reset and TLS
+// handshake, then writes a Key Method 2 message carrying options and
+// peerInfo EXACTLY as given — a nil peerInfo produces a genuinely pre-NCP
+// client (writeTestClientKeyMethod2Raw's own doc comment, ovpn_test.go).
+// Unlike tunnelUpCipherTestClient, this does NOT read the server's own Key
+// Method 2 reply: a cipher-negotiation refusal (CIPH-03) never sends one —
+// performKeyMethod2Exchange returns its typed *authFailure before ever
+// calling writeServerKeyMethod2AndDeriveKeys — so a caller testing the
+// refusal path writes PUSH_REQUEST and reads AUTH_FAILED directly off
+// client.tlsConn, exactly like auth_test.go's own TestAuthUserPassRejects
+// OnHookError does for a credential rejection. A caller testing the accept
+// path reads the server's Key Method 2 reply itself (readTestServerKeyMethod2)
+// before proceeding.
+func dialOCCFallbackTestClient(t testing.TB, key []byte, serverAddr net.Addr, caPool *x509.CertPool, options, peerInfo []byte) *testPushClient {
+	t.Helper()
+
+	client := newTestPushClient(t, key, serverAddr, caPool)
+	if err := client.conn.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
+		t.Fatalf("set client deadline: %v", err)
+	}
+	if err := client.tlsConn.Handshake(); err != nil {
+		t.Fatalf("client handshake: %v", err)
+	}
+	encode := func(s string) []byte { return append([]byte(s), 0) }
+	if err := writeTestClientKeyMethod2Raw(client.tlsConn, options, encode(testPlaceholderUsername), encode(testPlaceholderPassword), peerInfo); err != nil {
+		t.Fatalf("write client Key Method 2: %v", err)
+	}
+	return client
+}
+
+// assertNoCipherNameLeaked fails the test if reply contains any of the
+// server's allow-list cipher names, beyond the fixed reference sentence
+// itself (T-05-16: the client-visible AUTH_FAILED reason must carry no
+// server-side diagnostic detail).
+func assertNoCipherNameLeaked(t *testing.T, reply string) {
+	t.Helper()
+	for _, name := range []string{"AES-256-GCM", "AES-128-GCM", "BF-CBC"} {
+		if strings.Contains(reply, name) {
+			t.Errorf("reply %q leaks cipher name %q — the client-visible reason must carry no server-side diagnostic detail", reply, name)
+		}
+	}
+	if strings.HasPrefix(reply, "PUSH_REPLY") {
+		t.Errorf("reply %q begins with PUSH_REPLY — a cipher-negotiation refusal must never write a PUSH_REPLY payload", reply)
+	}
+}
+
+// TestPreNCPClientWithAllowedOCCCipherConnects is CIPH-03's accept path: a
+// genuinely pre-NCP client (nil peer_info) whose options string names a
+// cipher the server's allow-list contains connects normally and negotiates
+// that cipher via the OCC fallback (ncp_get_best_cipher, ssl_ncp.c:247-290).
+func TestPreNCPClientWithAllowedOCCCipherConnects(t *testing.T) {
+	_, network, err := net.ParseCIDR("10.45.4.0/24")
+	if err != nil {
+		t.Fatalf("parse network: %v", err)
+	}
+	key := testTLSCryptKey(t)
+
+	srv, serverPC, caPool, sessions := newCipherTracerServer(t, network, key)
+	defer serverPC.Close()
+	defer srv.Close()
+
+	client := dialOCCFallbackTestClient(t, key, serverPC.LocalAddr(), caPool, []byte("cipher AES-128-GCM"), nil)
+	defer client.Close()
+
+	if err := readTestServerKeyMethod2(client.tlsConn); err != nil {
+		t.Fatalf("read server Key Method 2: %v", err)
+	}
+	if err := writeControlString(client.tlsConn, pushRequestLiteral); err != nil {
+		t.Fatalf("write push request: %v", err)
+	}
+	reader := bufio.NewReader(client.tlsConn)
+	if _, err := readControlString(reader, maxControlStringLen); err != nil {
+		t.Fatalf("read push reply: %v", err)
+	}
+
+	var sess *Session
+	select {
+	case sess = <-sessions:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnSession was never called")
+	}
+	if got := sess.Cipher(); got != "AES-128-GCM" {
+		t.Errorf("sess.Cipher() = %q, want %q", got, "AES-128-GCM")
+	}
+}
+
+// TestPreNCPClientWithDisallowedOCCCipherRefused is CIPH-03's refuse path:
+// a genuinely pre-NCP client whose OCC cipher is NOT in the server's
+// allow-list is refused with the reference's own client-visible sentence,
+// leaking neither the server's allow-list nor the client's own token, and
+// without ever writing a PUSH_REPLY.
+func TestPreNCPClientWithDisallowedOCCCipherRefused(t *testing.T) {
+	_, network, err := net.ParseCIDR("10.45.5.0/24")
+	if err != nil {
+		t.Fatalf("parse network: %v", err)
+	}
+	key := testTLSCryptKey(t)
+
+	srv, serverPC, caPool, _ := newCipherTracerServer(t, network, key)
+	defer serverPC.Close()
+	defer srv.Close()
+
+	client := dialOCCFallbackTestClient(t, key, serverPC.LocalAddr(), caPool, []byte("cipher BF-CBC"), nil)
+	defer client.Close()
+
+	if err := writeControlString(client.tlsConn, pushRequestLiteral); err != nil {
+		t.Fatalf("write push request: %v", err)
+	}
+	reader := bufio.NewReader(client.tlsConn)
+	reply, err := readControlString(reader, maxControlStringLen)
+	if err != nil {
+		t.Fatalf("read AUTH_FAILED: %v", err)
+	}
+	want := authFailedLiteral + "," + cipherNegotiationFailedReason
+	if reply != want {
+		t.Errorf("reply = %q, want %q", reply, want)
+	}
+	assertNoCipherNameLeaked(t, reply)
+}
+
+// TestClientWithNoCipherTokenRefused is CIPH-03's empty-edge case: a
+// genuinely pre-NCP client whose options string names no cipher at all
+// yields both an empty client capability list and an empty OCC cipher, and
+// is refused with the same reference sentence — not silently accepted, not
+// a distinct error.
+func TestClientWithNoCipherTokenRefused(t *testing.T) {
+	_, network, err := net.ParseCIDR("10.45.6.0/24")
+	if err != nil {
+		t.Fatalf("parse network: %v", err)
+	}
+	key := testTLSCryptKey(t)
+
+	srv, serverPC, caPool, _ := newCipherTracerServer(t, network, key)
+	defer serverPC.Close()
+	defer srv.Close()
+
+	client := dialOCCFallbackTestClient(t, key, serverPC.LocalAddr(), caPool, nil, nil)
+	defer client.Close()
+
+	if err := writeControlString(client.tlsConn, pushRequestLiteral); err != nil {
+		t.Fatalf("write push request: %v", err)
+	}
+	reader := bufio.NewReader(client.tlsConn)
+	reply, err := readControlString(reader, maxControlStringLen)
+	if err != nil {
+		t.Fatalf("read AUTH_FAILED: %v", err)
+	}
+	want := authFailedLiteral + "," + cipherNegotiationFailedReason
+	if reply != want {
+		t.Errorf("reply = %q, want %q", reply, want)
+	}
+	assertNoCipherNameLeaked(t, reply)
+}
+
+// TestIVCiphersPresentSuppressesOCCFallback is ssl_ncp.c:262-268's own
+// zeroing rule (T-05-15): a client that sends an IV_CIPHERS line the server
+// cannot use, ALONGSIDE an OCC cipher token the server otherwise would
+// accept, is still refused — the OCC token can never rescue a failed
+// IV_CIPHERS negotiation once the peer has signalled IV_CIPHERS at all.
+func TestIVCiphersPresentSuppressesOCCFallback(t *testing.T) {
+	_, network, err := net.ParseCIDR("10.45.7.0/24")
+	if err != nil {
+		t.Fatalf("parse network: %v", err)
+	}
+	key := testTLSCryptKey(t)
+
+	srv, serverPC, caPool, _ := newCipherTracerServer(t, network, key)
+	defer serverPC.Close()
+	defer srv.Close()
+
+	client := dialOCCFallbackTestClient(t, key, serverPC.LocalAddr(), caPool,
+		[]byte("cipher AES-256-GCM"), []byte("IV_CIPHERS=BF-CBC\n"))
+	defer client.Close()
+
+	if err := writeControlString(client.tlsConn, pushRequestLiteral); err != nil {
+		t.Fatalf("write push request: %v", err)
+	}
+	reader := bufio.NewReader(client.tlsConn)
+	reply, err := readControlString(reader, maxControlStringLen)
+	if err != nil {
+		t.Fatalf("read AUTH_FAILED: %v", err)
+	}
+	want := authFailedLiteral + "," + cipherNegotiationFailedReason
+	if reply != want {
+		t.Errorf("reply = %q, want %q (the OCC cipher AES-256-GCM must NOT rescue the failed IV_CIPHERS negotiation)", reply, want)
+	}
+	assertNoCipherNameLeaked(t, reply)
+}

@@ -7,6 +7,7 @@
 package ovpn
 
 import (
+	"bufio"
 	"crypto/tls"
 	"net"
 	"testing"
@@ -279,6 +280,87 @@ func TestHandshakeCountersPartitionOutcomes(t *testing.T) {
 			t.Errorf("Stats() = %+v, want only AuthFailed set", stats)
 		}
 		assertPartition(t, srv)
+	})
+}
+
+// TestCipherNegotiationFailedCounterDoesNotTouchAuthFailed is Pitfall 3's
+// own regression test: a cipher-negotiation refusal increments
+// CipherNegotiationFailed and leaves AuthFailed at 0, and a credential
+// rejection does the exact reverse — the two counters partition, they never
+// double-count the same event.
+func TestCipherNegotiationFailedCounterDoesNotTouchAuthFailed(t *testing.T) {
+	key := testTLSCryptKey(t)
+
+	t.Run("cipher negotiation failure", func(t *testing.T) {
+		_, network, err := net.ParseCIDR("10.65.8.0/24")
+		if err != nil {
+			t.Fatalf("parse network: %v", err)
+		}
+		serverPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("server listen: %v", err)
+		}
+		defer serverPC.Close()
+		tlsCfg, caPool := testHandshakeTLSConfig(t)
+		srv := NewServer(Config{
+			TLSCryptKey:  key,
+			TLSConfig:    tlsCfg,
+			Network:      network,
+			AuthUserPass: testPermissiveAuthUserPass,
+			DataCiphers:  []string{"AES-256-GCM", "AES-128-GCM"},
+		})
+		go func() { _ = srv.Serve(serverPC) }()
+		defer srv.Close()
+
+		// Pre-NCP client (nil peer_info) whose OCC cipher (BF-CBC) is not
+		// in the server's allow-list: CIPH-03's refusal path.
+		client := dialOCCFallbackTestClient(t, key, serverPC.LocalAddr(), caPool, []byte("cipher BF-CBC"), nil)
+		defer client.Close()
+		if err := writeControlString(client.tlsConn, pushRequestLiteral); err != nil {
+			t.Fatalf("write push request: %v", err)
+		}
+		reader := bufio.NewReader(client.tlsConn)
+		if _, err := readControlString(reader, maxControlStringLen); err != nil {
+			t.Fatalf("read AUTH_FAILED: %v", err)
+		}
+
+		waitForCondition(t, 2*time.Second, "CipherNegotiationFailed never reached 1", func() bool {
+			return srv.Stats().CipherNegotiationFailed == 1
+		})
+		stats := srv.Stats()
+		if stats.AuthFailed != 0 {
+			t.Errorf("AuthFailed = %d, want 0 after a cipher-negotiation refusal (stats: %+v)", stats.AuthFailed, stats)
+		}
+	})
+
+	t.Run("credential rejection", func(t *testing.T) {
+		srv, serverPC, caPool := newAssignIPTestServer(t, "10.65.9.0/24", Config{
+			AuthUserPass: func(username, password string, cs tls.ConnectionState) error {
+				return errAssignIPTestHookError
+			},
+		})
+		defer serverPC.Close()
+		defer srv.Close()
+
+		client := newTestPushClient(t, srv.cfg.TLSCryptKey, serverPC.LocalAddr(), caPool)
+		defer client.Close()
+		if err := client.conn.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
+			t.Fatalf("set deadline: %v", err)
+		}
+		if err := client.tlsConn.Handshake(); err != nil {
+			t.Fatalf("client handshake: %v", err)
+		}
+		if err := writeTestClientKeyMethod2Creds(client.tlsConn, testPlaceholderUsername, testPlaceholderPassword); err != nil {
+			t.Fatalf("write client Key Method 2: %v", err)
+		}
+
+		waitForCondition(t, 2*time.Second, "AuthFailed never reached 1", func() bool {
+			return srv.Stats().AuthFailed == 1
+		})
+		stats := srv.Stats()
+		if stats.CipherNegotiationFailed != 0 {
+			t.Errorf("CipherNegotiationFailed = %d, want 0 after a credential rejection (stats: %+v)", stats.CipherNegotiationFailed, stats)
+		}
 	})
 }
 
