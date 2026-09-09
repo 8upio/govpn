@@ -335,3 +335,161 @@ func TestAES256GCMPathUnchanged(t *testing.T) {
 		t.Errorf("DebugDataKeys().CipherKeyLen = %d, want 32", keys.CipherKeyLen)
 	}
 }
+
+// stringSlicesEqual compares two []string by content and order (nil and an
+// empty non-nil slice are NOT equal — several behaviour-table rows below
+// depend on exactly that distinction).
+func stringSlicesEqual(a, b []string) bool {
+	if (a == nil) != (b == nil) {
+		return false
+	}
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestResolveDataCiphers is 05-02-PLAN.md Task 1's table-driven coverage of
+// resolveDataCiphers's full behaviour table: the empty/nil-cipher default,
+// the Config.Cipher one-element shorthand, canonicalization, duplicate
+// rejection (including a case-only duplicate), and near-miss rejection with
+// no repair attempt.
+func TestResolveDataCiphers(t *testing.T) {
+	tests := []struct {
+		name        string
+		dataCiphers []string
+		cipher      string
+		want        []string
+		wantErr     bool
+		errContains string
+	}{
+		{
+			name:        "nil dataCiphers, empty cipher resolves to the default pair",
+			dataCiphers: nil,
+			cipher:      "",
+			want:        []string{"AES-256-GCM", "AES-128-GCM"},
+		},
+		{
+			name:        "nil dataCiphers, cipher set resolves to the one-element shorthand",
+			dataCiphers: nil,
+			cipher:      "AES-256-GCM",
+			want:        []string{"AES-256-GCM"},
+		},
+		{
+			name:        "allocated empty slice behaves exactly like nil",
+			dataCiphers: []string{},
+			cipher:      "AES-128-GCM",
+			want:        []string{"AES-128-GCM"},
+		},
+		{
+			name:        "lower-case single entry is canonicalized",
+			dataCiphers: []string{"aes-128-gcm"},
+			cipher:      "",
+			want:        []string{"AES-128-GCM"},
+		},
+		{
+			name:        "duplicate differing only in case errors, naming the duplicate",
+			dataCiphers: []string{"AES-128-GCM", "aes-128-gcm"},
+			cipher:      "",
+			wantErr:     true,
+			errContains: "AES-128-GCM",
+		},
+		{
+			name:        "near-miss spelling errors with no repair attempted",
+			dataCiphers: []string{"AES128GCM"},
+			cipher:      "",
+			wantErr:     true,
+			errContains: "AES128GCM",
+		},
+		{
+			name:        "given two-entry order preserved, Config.Cipher ignored",
+			dataCiphers: []string{"AES-128-GCM", "AES-256-GCM"},
+			cipher:      "AES-256-GCM",
+			want:        []string{"AES-128-GCM", "AES-256-GCM"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := resolveDataCiphers(tt.dataCiphers, tt.cipher)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("resolveDataCiphers(%v, %q) = %v, nil; want an error", tt.dataCiphers, tt.cipher, got)
+				}
+				if !strings.Contains(err.Error(), tt.errContains) {
+					t.Errorf("resolveDataCiphers(%v, %q) error = %q, want it to contain %q", tt.dataCiphers, tt.cipher, err.Error(), tt.errContains)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveDataCiphers(%v, %q) unexpected error: %v", tt.dataCiphers, tt.cipher, err)
+			}
+			if !stringSlicesEqual(got, tt.want) {
+				t.Errorf("resolveDataCiphers(%v, %q) = %v, want %v", tt.dataCiphers, tt.cipher, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestResolveDataCiphersDoesNotAliasCallerSlice proves the returned slice
+// never aliases the caller's own backing array: mutating the caller's slice
+// after the call must not change the resolved allow-list.
+func TestResolveDataCiphersDoesNotAliasCallerSlice(t *testing.T) {
+	input := []string{"AES-128-GCM", "AES-256-GCM"}
+	got, err := resolveDataCiphers(input, "")
+	if err != nil {
+		t.Fatalf("resolveDataCiphers: %v", err)
+	}
+	input[0] = "MUTATED"
+	if got[0] != "AES-128-GCM" {
+		t.Errorf("resolved slice changed after mutating the caller's input: got[0] = %q, want %q", got[0], "AES-128-GCM")
+	}
+}
+
+// TestServeRejectsInvalidDataCiphers drives Serve itself (not just
+// resolveDataCiphers directly) with a duplicate and with a near-miss
+// Config.DataCiphers, asserting a non-nil error naming Config.DataCiphers
+// and that no listener was ever published (s.pc stays nil).
+func TestServeRejectsInvalidDataCiphers(t *testing.T) {
+	tests := []struct {
+		name        string
+		dataCiphers []string
+	}{
+		{name: "duplicate entries", dataCiphers: []string{"AES-256-GCM", "aes-256-gcm"}},
+		{name: "near-miss spelling", dataCiphers: []string{"AES256GCM"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			key := testTLSCryptKey(t)
+			pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("listen: %v", err)
+			}
+			defer pc.Close()
+
+			srv := NewServer(Config{
+				TLSCryptKey:  key,
+				TLSConfig:    testTLSConfig(t),
+				AuthUserPass: testPermissiveAuthUserPass,
+				DataCiphers:  tt.dataCiphers,
+			})
+			err = srv.Serve(pc)
+			if err == nil {
+				t.Fatal("Serve returned nil error for an invalid Config.DataCiphers")
+			}
+			if !strings.Contains(err.Error(), "Config.DataCiphers") {
+				t.Errorf("Serve error = %q, want it to contain %q", err.Error(), "Config.DataCiphers")
+			}
+			srv.mu.Lock()
+			published := srv.pc != nil
+			srv.mu.Unlock()
+			if published {
+				t.Error("Serve published its packet connection despite a validation error")
+			}
+		})
+	}
+}
