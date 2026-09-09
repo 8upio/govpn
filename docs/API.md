@@ -33,7 +33,7 @@ srv := ovpn.NewServer(ovpn.Config{
     TLSConfig:   tlsCfg,        // mutual cert auth: ClientCAs, Certificates, MinVersion
     TLSCryptKey: tlsCryptKey,   // from ovpn.ParseStaticKeyV1
     Network:     tunnelNetwork, // *net.IPNet, e.g. 10.8.0.0/24 (topology subnet)
-    Cipher:      "AES-256-GCM",
+    DataCiphers: []string{"AES-256-GCM", "AES-128-GCM"}, // server's own preference order
     OnSession: func(sess *ovpn.Session) {
         // sess is an io.ReadWriteCloser of raw, decrypted IP packets.
         // sess.AssignedIP() is already populated here.
@@ -57,6 +57,7 @@ type Config struct {
     TLSCryptKey         []byte
     Network             *net.IPNet
     Cipher              string
+    DataCiphers         []string
     OnSession           func(*Session)
     OnSessionPanic      func(sess *Session, recovered any, stack []byte)
     RenegSec            time.Duration
@@ -224,26 +225,28 @@ Safe to call concurrently with handshakes and teardowns.
 func (s *Server) Stats() ServerStats
 
 type ServerStats struct {
-    ActiveSessions       int
-    HandshakesStarted    uint64
-    HandshakesCompleted  uint64
-    HandshakesFailed     uint64
-    HandshakesTimedOut   uint64
-    AuthFailed           uint64
-    AssignIPRejected     uint64
-    PoolExhausted        uint64
-    DatagramsRejected    uint64
+    ActiveSessions          int
+    HandshakesStarted       uint64
+    HandshakesCompleted     uint64
+    HandshakesFailed        uint64
+    HandshakesTimedOut      uint64
+    AuthFailed              uint64
+    CipherNegotiationFailed uint64
+    AssignIPRejected        uint64
+    PoolExhausted           uint64
+    DatagramsRejected       uint64
 }
 ```
 
 A point-in-time snapshot of session inventory and handshake/dispatch
 counters. `ActiveSessions` is `len(Server.Sessions())` — the only gauge;
-every other field is monotonic since server construction. The four
+every other field is monotonic since server construction. The five
 handshake-outcome counters (`HandshakesCompleted`/`HandshakesFailed`/
-`HandshakesTimedOut`/`AuthFailed`) partition every settled initial
-handshake: `HandshakesStarted == HandshakesCompleted + HandshakesFailed +
-HandshakesTimedOut + AuthFailed`, except for a handshake still in flight
-when `Server.Close` runs, which records no outcome at all.
+`HandshakesTimedOut`/`AuthFailed`/`CipherNegotiationFailed`) partition every
+settled initial handshake: `HandshakesStarted == HandshakesCompleted +
+HandshakesFailed + HandshakesTimedOut + AuthFailed +
+CipherNegotiationFailed`, except for a handshake still in flight when
+`Server.Close` runs, which records no outcome at all.
 
 | Field | Counts |
 |---|---|
@@ -252,7 +255,8 @@ when `Server.Close` runs, which records no outcome at all.
 | `HandshakesCompleted` | Every initial handshake that reached "session established". |
 | `HandshakesFailed` | Every initial handshake that failed at the TLS, Key Method 2, or push stage, or was already closing during bring-up. |
 | `HandshakesTimedOut` | Every initial handshake torn down by the handshake-window timeout. |
-| `AuthFailed` | Every **initial-handshake** `Config.AuthUserPass` rejection. A renegotiation-time rejection is reported through `OnSessionClosed(CloseReasonAuthFailed)` instead, not counted here. |
+| `AuthFailed` | Every **initial-handshake** `Config.AuthUserPass` rejection. A renegotiation-time rejection is reported through `OnSessionClosed(CloseReasonAuthFailed)` instead, not counted here. Does NOT include a cipher-negotiation refusal (see `CipherNegotiationFailed`) — the two counters partition rather than overlap. |
+| `CipherNegotiationFailed` | Every **initial-handshake** refusal where the client and server had no data-channel cipher in common: the client's advertised `IV_CIPHERS`/`IV_NCP` capability list (or its OCC `cipher` fallback for a pre-NCP client) shared no entry with the server's resolved `Config.DataCiphers` allow-list. Never also increments `AuthFailed` for the same event, and never the reverse. A session refused this way never reaches `Config.OnSession`, so `Config.OnSessionClosed` does not fire for it either. |
 | `AssignIPRejected` | Every `Config.AssignIP` rejection: invalid address, hook error, hook panic, or an unresolved replace-path conflict. |
 | `PoolExhausted` | Every `ErrPoolExhausted` observed, from the dynamic pool or from `AssignIP`'s own reservation retry. |
 | `DatagramsRejected` | Every datagram dropped before dispatch to a session's own routing (bad length/opcode, unknown session, tls-crypt/parse failure, session-closing, queue-full, unsupported/short data, unknown peer-id). |
@@ -410,6 +414,7 @@ func (s *Session) PushRequestSeen() bool
 func (s *Session) RenegotiationCount() uint32
 func (s *Session) ConnectionState() tls.ConnectionState
 func (s *Session) RemoteAddress() net.Addr
+func (s *Session) Cipher() string
 func (s *Session) Stats() SessionStats
 ```
 
@@ -434,6 +439,12 @@ func (s *Session) Stats() SessionStats
   exported `RemoteAddr` field already holds, exposed as an accessor so a
   future storage-representation change doesn't break embedders using the
   method form (a method named `RemoteAddr` would collide with the field).
+- **`Cipher`** — this session's negotiated data-channel cipher's canonical
+  upper-case name (e.g. `"AES-128-GCM"`), chosen from `Config.DataCiphers`
+  against the client's advertised capabilities (see
+  [CONFIGURATION.md#dataciphers](CONFIGURATION.md#dataciphers)). `""`
+  before the Key Method 2 exchange completes; never changes afterward,
+  including across a renegotiation.
 - **`Stats`** — a point-in-time snapshot of this session's traffic counters
   (`SessionStats`, below). Independently-sampled, not a consistent instant
   across every field — cheap enough to call from any goroutine at any time
@@ -445,6 +456,7 @@ type SessionStats struct {
     PacketsIn, PacketsOut         uint64
     KeepalivesIn                  uint64
     InboundQueueDropped           uint64
+    Cipher                        string
     Renegotiations                uint32
     EstablishedAt, LastAuthTrafficAt time.Time
 }
@@ -463,6 +475,8 @@ type SessionStats struct {
 - **`InboundQueueDropped`** — decrypted IP packets dropped because the
   session's inbound queue (`Config.SessionInboundQueue`) was full: a slow
   embedder falling behind `Read`.
+- **`Cipher`** — the same value `Session.Cipher()` returns, included here so
+  a caller that only wants `Stats()` doesn't need a second accessor call.
 - **`Renegotiations`** — the same value `RenegotiationCount()` returns.
 - **`EstablishedAt`** — when this session's data channel went live (the
   same publish point `OnSession` fires from); zero before that.
@@ -497,7 +511,7 @@ srv := ovpn.NewServer(ovpn.Config{
     TLSConfig:   tlsCfg,
     TLSCryptKey: tlsCryptKey,
     Network:     tunnelNetwork,
-    Cipher:      "AES-256-GCM",
+    DataCiphers: []string{"AES-256-GCM", "AES-128-GCM"},
     OnSession: func(sess *ovpn.Session) {
         // The embedder attaches; nothing in ovpn.Config knows the netstack
         // exists.

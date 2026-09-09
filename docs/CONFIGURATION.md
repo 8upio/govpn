@@ -26,6 +26,7 @@ type Config struct {
     TLSCryptKey         []byte
     Network             *net.IPNet
     Cipher              string
+    DataCiphers         []string
     OnSession           func(*Session)
     OnSessionPanic      func(sess *Session, recovered any, stack []byte)
     RenegSec            time.Duration
@@ -44,7 +45,8 @@ type Config struct {
 | `TLSConfig` | `*tls.Config` | Yes — `Serve` returns an error if nil | none |
 | `TLSCryptKey` | `[]byte` | Yes — `Serve` returns an error if invalid | none |
 | `Network` | `*net.IPNet` | No to start `Serve`; effectively required for any session to reach the data channel | sessions fail during `PUSH_REQUEST`/`PUSH_REPLY` if unset |
-| `Cipher` | `string` | No | `"AES-256-GCM"` |
+| `Cipher` | `string` | No | `"AES-256-GCM"` — **deprecated**, see [`DataCiphers`](#dataciphers) |
+| `DataCiphers` | `[]string` | No | nil resolves to `[Cipher]` when `Cipher` is set, otherwise `["AES-256-GCM", "AES-128-GCM"]` |
 | `OnSession` | `func(*Session)` | No (but a server with no callback can't do anything useful with connected sessions) | no-op |
 | `OnSessionPanic` | `func(sess *Session, recovered any, stack []byte)` | No | panic is not recovered — a panic inside `OnSession`/`OnSessionClosed` propagates normally |
 | `RenegSec` | `time.Duration` | No | `3600 * time.Second` (matches the OpenVPN reference's own `--reneg-sec` default, `options.c:878`) |
@@ -385,25 +387,54 @@ point-to-point peer address). The matching client-side directives are
 and no server-side `ifconfig-pool`/`server` directive equivalent needs to be
 set by hand on the client; addresses are pushed automatically.
 
+### `DataCiphers`
+
+The server's own ordered data-channel cipher allow-list. The server iterates
+this list in its OWN order against each connecting client's advertised
+capabilities (`IV_CIPHERS`, or the `IV_NCP>=2` implied `AES-256-GCM:AES-128-GCM`
+pair, or a pre-NCP client's OCC `cipher` fallback) and picks that session's
+cipher: the first entry in `DataCiphers` also present in the client's list
+wins — **the server's preference order always decides a tie, never the
+client's.** The cipher is negotiated once per session, at connect time, and
+never changes across a renegotiation.
+
+```go
+cfg := ovpn.Config{
+    DataCiphers: []string{"AES-256-GCM", "AES-128-GCM"}, // server's own preference order
+}
+```
+
+- **Supported names:** `"AES-256-GCM"` and `"AES-128-GCM"` (case-insensitive
+  on input, always canonicalized to upper case internally and in every log
+  record/pushed option).
+- **Nil `DataCiphers`** resolves to the one-element list `[Cipher]` when the
+  deprecated `Cipher` field is non-empty, or to the default
+  `["AES-256-GCM", "AES-128-GCM"]` otherwise — an empty `DataCiphers`
+  therefore reproduces the exact pre-Phase-5 fixed-AES-256-GCM behavior only
+  if `Cipher` is also left unset.
+- **Validation:** `Serve` rejects a duplicate entry or a name outside the
+  supported set with an error — the server never starts with a silently
+  narrower or wider allow-list than configured, and a misspelled cipher name
+  is never "normalized" into something else.
+- **No shared cipher:** if a connecting client's capabilities share no entry
+  with the server's resolved `DataCiphers`, the server refuses the client
+  with `AUTH_FAILED,Data channel cipher negotiation failed (no shared
+  cipher)` before `PUSH_REPLY`, logs a `Warn` record with both lists, and
+  increments `ServerStats.CipherNegotiationFailed` (never `AuthFailed` — see
+  [API.md](API.md)).
+
+The matching client-side directive is `data-ciphers <name>[:<name>...]`
+(OpenVPN 2.6's NCP cipher-negotiation directive); a client's own list order
+never overrides the server's.
+
 ### `Cipher`
 
-The name pushed to clients as the `cipher <name>` option in `PUSH_REPLY` and
-in the Key Method 2 options string (e.g. `cipher AES-256-GCM`). Defaults to
-`"AES-256-GCM"` when left empty.
-
-**This field only changes what string is negotiated/pushed — it does not
-change what cipher is actually used.** The data-channel crypto implementation
-(`internal/datachan`) hard-codes AES-256-GCM: encryption, decryption, and
-nonce construction are all AES-256-GCM regardless of this field's value.
-Setting `Cipher` to anything other than `"AES-256-GCM"` will advertise a
-cipher name the server does not actually implement, which a real OpenVPN 2.6
-client with NCP (cipher negotiation) enabled will accept at face value —
-leave this field unset (or explicitly `"AES-256-GCM"`) unless you have
-verified the client-side behavior you're relying on.
-
-The matching client-side directive is `cipher AES-256-GCM` (also the default
-a modern OpenVPN 2.6 client negotiates via NCP even without an explicit
-`cipher` line).
+**Deprecated:** a one-element shorthand for [`DataCiphers`](#dataciphers) —
+setting `Cipher` while leaving `DataCiphers` nil is exactly equivalent to
+setting `DataCiphers: []string{Cipher}`. It remains a live, working field
+(no existing embedder's configuration breaks), but new code should prefer
+`DataCiphers` directly. Defaults to `"AES-256-GCM"` when both fields are
+left empty.
 
 ### `OnSession`
 
@@ -573,10 +604,15 @@ would.
 **Attribute vocabulary** (use `reason`/`stage` to distinguish *why*, never
 the message string): `addr`, `remote`, `session_id`, `client_session_id`,
 `peer_cn`, `peer_id`, `ip`, `key_id`, `opcode`, `reason`, `stage`, `err`,
-`username`, `bytes`, `network`, `cipher`, `ping`, `reap`, `reneg_sec`,
-`window`, `idle`, `duration`, `sessions`, `dropped`, `callback`, `panic`,
-`initiator`, `renegotiations`, `has_client_reason`, `published`,
-`auth_user_pass`. Session IDs are rendered as hex.
+`username`, `bytes`, `network`, `cipher`, `data_ciphers`, `ping`, `reap`,
+`reneg_sec`, `window`, `idle`, `duration`, `sessions`, `dropped`,
+`callback`, `panic`, `initiator`, `renegotiations`, `has_client_reason`,
+`published`, `auth_user_pass`. Session IDs are rendered as hex.
+`cipher` names the negotiated cipher for one session (e.g. the "session
+established" record); `data_ciphers` names the resolved server-wide
+allow-list, colon-joined in server preference order (the "server
+listening" record) — two different observability questions, never
+conflated into one attribute.
 
 **Never logged, ever:** passwords, the `TLSCryptKey` bytes, derived
 data-channel key material, packet payload bytes, or panic stack traces (a
@@ -591,7 +627,14 @@ field may itself be the username.
 `govpn`'s `PUSH_REPLY` (`push.go`) only ever sends: `ifconfig`,
 `topology subnet`, `peer-id`, `cipher`, `ping`, and `ping-restart` — the
 last two now derived from `Config.PingInterval`/`Config.ReapWindow` rather
-than fixed (see above). There is currently no `Config` field for pushing
+than fixed (see above). The `cipher` option is sent only to a client that
+signalled NCP support (`IV_NCP>=2` or an `IV_CIPHERS` peer_info line) —
+matching the reference's own `tls_peer_supports_ncp` gate
+(`push.c:663-666`, "We avoid pushing the cipher to clients not supporting
+NCP to avoid error messages in their logs"). Every real OpenVPN 2.6 client
+signals NCP support, so this omission is unobservable for the fleet this
+project targets; it only changes `PUSH_REPLY`'s wire bytes for a
+genuinely pre-NCP client. There is currently no `Config` field for pushing
 routes, DNS (`dhcp-option`), or compression — these are simply not sent,
 matching no equivalent server-side directive. A connecting OpenVPN client
 should not expect `redirect-gateway`, `route`, or `dhcp-option` behavior

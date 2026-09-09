@@ -62,6 +62,8 @@ make golden
 
 which runs `go test -tags interop -count=1 -timeout 900s ./test/interop/ -run TestInteropScenarios -update-golden -v`.
 
+Regeneration draws from TWO source scenarios in that one run and writes a single merged `manifest.json`: `clean-large` still anchors the control-channel corpus and the AES-256-GCM data-channel vectors, and `cipher-128` contributes the AES-128-GCM data-channel vectors under their own key file (`testdata/golden/data-channel-aes128.key`). `-update-golden` refuses to write anything unless BOTH scenarios passed on that run, naming whichever one did not — a half-regenerated corpus that silently drops one cipher's vectors is never committed as if it were complete. Every data-channel manifest entry names the cipher its own vectors were captured under (`manifest.json`'s `cipher` field); an absent value means `AES-256-GCM`, the implicit meaning of every entry committed before this corpus carried the field at all.
+
 ### Standing prohibition gates
 
 `gates_test.go` (root package, no build tag) turns this project's own declared prohibitions — its `must_haves.prohibitions` entries — into executable assertions, so a regression fails a normal `go test` run instead of sitting undetected in a planning document. It walks the repository with `go/parser`/`go/ast` (not raw text matching) to check for forbidden constructs, such as use of `tls.ConnectionState().ExportKeyingMaterial()` for data-channel key derivation (see `CLAUDE.md`'s "What NOT to Use" table) or non-stdlib imports in the core library. Run it directly with:
@@ -98,6 +100,8 @@ which:
 | `lossy-large` | large | Yes (`docker-compose.lossy.yml`, `tc`/netem) | Retransmission and reliability-layer behavior under packet loss |
 | `reneg` | small | No | `docker-compose.reneg.yml` overlay; short `reneg-sec 15` forces multiple renegotiations across 5 probe rounds, plus `explicit-exit-notify 2` graceful-disconnect verification |
 | `auth-user-pass` | small | No | `docker-compose.auth.yml` overlay; `-no-client-cert -auth-user-pass voxio:s3cr3t` proves `Config.AuthUserPass` and certificate-less operation against a real client (no `cert`/`key` directives in `client.conf`, matching `-no-client-cert`/`-credentials` flags on `cmd/gentestpki`) |
+| `cipher-128` | small | No | `docker-compose.cipher-128.yml` overlay (server `-data-ciphers AES-128-GCM`); client `data-ciphers AES-128-GCM` (its sole entry) proves a one-entry server allow-list negotiates AES-128-GCM against a real client, asserted on both the client's own `Data Channel: cipher 'AES-128-GCM'` log line and the server's PASS-line `data_cipher=` field |
+| `cipher-order` | small | No | `docker-compose.cipher-order.yml` overlay (server `-data-ciphers AES-256-GCM:AES-128-GCM`); client deliberately configured with the REVERSE order (`data-ciphers AES-128-GCM:AES-256-GCM`) proves the server's preference order wins a tie, never the client's — expected outcome is the server's first entry, AES-256-GCM |
 
 A separate, non-default `TestSoak` (see below) exercises long-running connection lifecycle behavior and is not part of this table.
 

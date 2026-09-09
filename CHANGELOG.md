@@ -6,6 +6,39 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project does not yet follow Semantic Versioning strictly (pre-1.0), but
 version numbers below still increase monotonically with each release.
 
+## [Unreleased]
+
+### Added
+
+- Negotiated data-channel cipher: the server now chooses a per-client
+  data-channel cipher from `Config.DataCiphers` (an ordered allow-list, in
+  server preference order) against the client's advertised capabilities
+  (`IV_CIPHERS`/`IV_NCP`, or a pre-NCP client's OCC `cipher` fallback),
+  instead of a single fixed cipher. `AES-128-GCM` is now supported
+  end-to-end alongside the existing `AES-256-GCM`, verified byte-exact
+  against golden vectors captured from a real OpenVPN 2.6 client and live
+  against that same client via the Docker interop harness.
+- `Session.Cipher()` and `SessionStats.Cipher` — the negotiated
+  data-channel cipher's canonical name for an established session.
+- `ServerStats.CipherNegotiationFailed` — counts an initial-handshake
+  refusal where the client and server had no data-channel cipher in
+  common, partitioned from `AuthFailed` (never double-counted with it).
+
+### Changed
+
+- The `server listening` log record now reports the resolved cipher
+  allow-list under a `data_ciphers` attribute (colon-joined, in server
+  preference order) instead of a single fixed `cipher` attribute.
+- `PUSH_REPLY` now omits the `cipher` option for a peer that never
+  signalled NCP support (matching the reference's own
+  `tls_peer_supports_ncp` gate) — every real OpenVPN 2.6 client signals NCP
+  support, so this is unobservable for that fleet; it only changes wire
+  bytes for a genuinely pre-NCP client.
+
+`Config.Cipher` continues to work unchanged as a deprecated one-element
+shorthand for `Config.DataCiphers` — no existing embedder's configuration
+changes behavior as a result of this release.
+
 ## [0.2.2] - 2026-09-09
 
 ### Fixed

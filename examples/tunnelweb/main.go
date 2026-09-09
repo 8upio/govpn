@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -35,6 +36,16 @@ import (
 	"github.com/8upio/govpn/examples/tunnelweb/site"
 	"github.com/8upio/govpn/netstack"
 )
+
+// tunnelwebDataCiphers is the server's own data-channel cipher allow-list,
+// in server preference order — the library's own default pair, named
+// explicitly here so this example demonstrates Config.DataCiphers (docs/
+// CONFIGURATION.md's recommended field, 05-05-PLAN.md Task 3) rather than
+// the deprecated single-cipher Config.Cipher shorthand. site.Options.Cipher
+// (a display-only field of a different struct, the status page's own) is
+// derived from this same slice below, so the page never claims a cipher
+// this server isn't actually willing to negotiate.
+var tunnelwebDataCiphers = []string{"AES-256-GCM", "AES-128-GCM"}
 
 // tunnelwebLogger builds this example's own ovpn.Config.Logger (quick
 // 260908-na1): plain text to stderr at Info by default, or Debug (every
@@ -111,7 +122,7 @@ func run(pkiDir, listenAddr, networkCIDR string, httpPort uint16) error {
 	}
 
 	httpSrv := newHardenedHTTPServer(site.Handler(site.Options{
-		Cipher:    "AES-256-GCM",
+		Cipher:    strings.Join(tunnelwebDataCiphers, ":"),
 		StartedAt: time.Now(),
 	}))
 	httpDone := make(chan error, 1)
@@ -126,7 +137,7 @@ func run(pkiDir, listenAddr, networkCIDR string, httpPort uint16) error {
 		TLSConfig:   tlsCfg,
 		TLSCryptKey: tlsCryptKey,
 		Network:     tunnelNetwork,
-		Cipher:      "AES-256-GCM",
+		DataCiphers: tunnelwebDataCiphers,
 		// Logger is all an embedder has to set to get library-level logs —
 		// handshake progress, session lifecycle, and every dropped
 		// datagram — alongside this example's own log.Printf output
