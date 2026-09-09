@@ -21,7 +21,7 @@ test: gates
 # regressions like B3's TestGateServeDispatchesDataInline) — it runs here
 # too, in the fast tier, rather than only under the full `go test ./...`.
 gates:
-	go test -race -run 'TestPhase2|TestPhase3|TestPhase4|TestGate' -v ./
+	go test -race -run 'TestPhase2|TestPhase3|TestPhase4|TestPhase5|TestGate' -v ./
 
 # Full interop tier: generates a fresh test PKI in Go (large profile, so
 # the certificate-fragmentation assertions have something to fragment —

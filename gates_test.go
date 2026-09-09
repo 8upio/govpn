@@ -573,6 +573,63 @@ func TestPhase4RenegotiationNeverRepeatsPushExchange(t *testing.T) {
 	}
 }
 
+// TestPhase5RenegotiationNeverReselectsCipher asserts runRenegotiation's
+// body contains no call to any of the cipher-selection entry points
+// (selectCipher, peerCipherList, peerInfoValue, peerSupportsNCP,
+// parseOCCCipher, resolveDataCiphers) — CIPH-06's own architectural
+// invariant: a renegotiation must reuse sess.Cipher(), never re-derive it
+// from the renegotiating client's peer_info (05-RESEARCH.md Pitfall 4).
+// Both bare-identifier callees (these are package-level functions in
+// cipher.go, unlike Phase 4's own gate above, which walks selector
+// expressions) and selector-expression callees are checked, so a later
+// refactor that moves any of them behind a receiver is still caught.
+func TestPhase5RenegotiationNeverReselectsCipher(t *testing.T) {
+	disallowed := map[string]bool{
+		"selectCipher":       true,
+		"peerCipherList":     true,
+		"peerInfoValue":      true,
+		"peerSupportsNCP":    true,
+		"parseOCCCipher":     true,
+		"resolveDataCiphers": true,
+	}
+
+	file, fset := parseGoFile(t, "ovpn.go")
+	found := false
+	for _, decl := range file.Decls {
+		fd, ok := decl.(*ast.FuncDecl)
+		if !ok || fd.Name.Name != "runRenegotiation" || fd.Body == nil {
+			continue
+		}
+		found = true
+		ast.Inspect(fd.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			var name string
+			switch fn := call.Fun.(type) {
+			case *ast.Ident:
+				name = fn.Name
+			case *ast.SelectorExpr:
+				name = fn.Sel.Name
+			default:
+				return true
+			}
+			if disallowed[name] {
+				pos := fset.Position(call.Pos())
+				t.Errorf(
+					"%s:%d: runRenegotiation calls %s — a renegotiation must never re-select the data-channel cipher; it must reuse sess.Cipher() (CIPH-06, 05-RESEARCH.md Pitfall 4)",
+					pos.Filename, pos.Line, name,
+				)
+			}
+			return true
+		})
+	}
+	if !found {
+		t.Fatal("ovpn.go declares no runRenegotiation function to check")
+	}
+}
+
 // TestPhase4RenegotiationReusesSessionTLSCryptWrapper asserts ovpn.go
 // constructs a tls-crypt Wrapper (tlscrypt.NewWrapper) in exactly two
 // functions — Serve's fail-fast validation and handleDatagram's

@@ -1528,3 +1528,112 @@ func TestRunRenegotiationClearsPendingRenegOnWrapperFailure(t *testing.T) {
 		t.Fatal("runRenegotiation's datachan.NewWrapper failure branch no longer clears sess.pendingReneg (WR-03 regression) — every subsequent renegotiation attempt would be refused forever by startRenegotiation's in-flight guard")
 	}
 }
+
+// TestPhase5RenegotiationKeepsNegotiatedCipher is 05-01-PLAN.md Task 2's
+// behavioural proof of CIPH-06, the counterpart to gates_test.go's
+// TestPhase5RenegotiationNeverReselectsCipher AST gate: a session that
+// negotiated AES-128-GCM at connect still reports AES-128-GCM after a
+// completed renegotiation whose client presented IV_CIPHERS=AES-256-GCM.
+// The contrast against the client's changed advertisement is the whole
+// point: without it this test would pass even if the cipher were
+// re-derived, because the client would have asked for the same thing
+// twice.
+func TestPhase5RenegotiationKeepsNegotiatedCipher(t *testing.T) {
+	_, network, err := net.ParseCIDR("10.45.3.0/24")
+	if err != nil {
+		t.Fatalf("parse network: %v", err)
+	}
+	key := testTLSCryptKey(t)
+
+	srv, serverPC, caPool, sessions := newCipherTracerServer(t, network, key)
+	defer serverPC.Close()
+	defer srv.Close()
+
+	client, replyReader, _ := tunnelUpCipherTestClient(t, key, serverPC.LocalAddr(), caPool, "IV_CIPHERS=AES-128-GCM")
+	defer client.Close()
+
+	if err := writeControlString(client.tlsConn, pushRequestLiteral); err != nil {
+		t.Fatalf("write push request: %v", err)
+	}
+	if _, err := readControlString(replyReader, maxControlStringLen); err != nil {
+		t.Fatalf("read push reply: %v", err)
+	}
+
+	var sess *Session
+	select {
+	case sess = <-sessions:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnSession was never called")
+	}
+
+	wantCipher := sess.Cipher()
+	if wantCipher != "AES-128-GCM" {
+		t.Fatalf("sess.Cipher() before renegotiation = %q, want %q", wantCipher, "AES-128-GCM")
+	}
+	beforeKeys, ok := sess.DebugDataKeys()
+	if !ok || beforeKeys.CipherKeyLen != 16 {
+		t.Fatalf("DebugDataKeys() before renegotiation: ok=%v CipherKeyLen=%d, want ok=true CipherKeyLen=16", ok, beforeKeys.CipherKeyLen)
+	}
+
+	// Renegotiate to key-id 1, with the client now advertising a
+	// DIFFERENT cipher (AES-256-GCM) — CIPH-06 requires the server to
+	// ignore this and keep the connect-time cipher.
+	newConn := client.renegotiate(t, serverPC.LocalAddr(), 1)
+	if err := newConn.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
+		t.Fatalf("set reneg deadline: %v", err)
+	}
+	renegTLSConn := tls.Client(newConn, &tls.Config{
+		RootCAs:    caPool,
+		ServerName: testHandshakeServerCN,
+		MinVersion: tls.VersionTLS12,
+	})
+	if err := renegTLSConn.Handshake(); err != nil {
+		t.Fatalf("reneg client handshake: %v", err)
+	}
+	if err := writeTestClientKeyMethod2WithPeerInfo(renegTLSConn, []byte("IV_CIPHERS=AES-256-GCM\n")); err != nil {
+		t.Fatalf("write client Key Method 2 (reneg): %v", err)
+	}
+	if err := readTestServerKeyMethod2(renegTLSConn); err != nil {
+		t.Fatalf("read server Key Method 2 (reneg): %v", err)
+	}
+	if err := newConn.SetDeadline(time.Time{}); err != nil {
+		t.Fatalf("clear reneg deadline: %v", err)
+	}
+
+	waitForPrimaryKeyID(t, sess, 1)
+
+	if got := sess.Cipher(); got != wantCipher {
+		t.Errorf("sess.Cipher() after renegotiation = %q, want unchanged %q (the renegotiating client advertised IV_CIPHERS=AES-256-GCM)", got, wantCipher)
+	}
+
+	afterKeys, ok := sess.DebugDataKeys()
+	if !ok {
+		t.Fatal("DebugDataKeys() not ok after renegotiation")
+	}
+	if afterKeys.CipherKeyLen != 16 {
+		t.Errorf("DebugDataKeys().CipherKeyLen after renegotiation = %d, want 16 (unchanged)", afterKeys.CipherKeyLen)
+	}
+
+	// A data packet sealed under the NEW key-id opens on the server —
+	// proving the new slot's Wrapper was built with the SAME (16-byte)
+	// key length, not silently upgraded to 32.
+	clientWrapper, err := datachan.NewWrapper(mirrorDataKeys(afterKeys), sess.PeerID(), 1)
+	if err != nil {
+		t.Fatalf("build new-key client wrapper: %v", err)
+	}
+	payload := bytes.Repeat([]byte{0x33}, 40)
+	sealed, err := clientWrapper.Seal(nil, payload)
+	if err != nil {
+		t.Fatalf("client Seal: %v", err)
+	}
+	sess.handleDataPacket(sealed)
+
+	buf := make([]byte, 2048)
+	n, err := sess.Read(buf)
+	if err != nil {
+		t.Fatalf("Session.Read after new-key packet: %v", err)
+	}
+	if !bytes.Equal(buf[:n], payload) {
+		t.Fatalf("Session.Read = %x, want %x", buf[:n], payload)
+	}
+}
